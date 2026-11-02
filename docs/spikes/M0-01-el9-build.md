@@ -1,8 +1,13 @@
 # M0-01 — Phobos в контейнере EL9
 
-**Статус: сборка и запуск подтверждены; последняя миля (выделение места под dir-носитель)
-не решена.** Phobos `2e3311f` (pkg 3.4.1), Rocky Linux 9, Postgres 13.23, Docker
-`--privileged`.
+**Статус: закрыт.** Phobos `2e3311f` (pkg 3.4.1) собирается в EL9 без патчей и делает
+put/get/delete на семействе `dir`. Первая половина проверялась в контейнере Rocky
+Linux 9 (Docker `--privileged`, Postgres 13.23), последняя миля — на реальной
+AlmaLinux 9.8. Разница оказалась не в ОС, а в двух пропущенных командах; см. раздел
+«Что не решено в контейнере».
+
+Пошаговая воспроизводимость настройки машины — в
+[docs/ops/test-server.md](../ops/test-server.md).
 
 ## Что проверяли
 
@@ -114,51 +119,69 @@ tlc delete del locate get getmd mput put rename undelete undel`. Настрой�
 выдача одна, с `-p simple` — другая, и `phobos get` флаг `-p` не принимает вообще
 («unrecognized arguments»). Это надо учитывать в обряде развёртывания.
 
-### Что не решено
+### Что не решено в контейнере — решено на реальной ОС
 
-Выделение места под dir-носитель не работает:
+В контейнере выделение места под dir-носитель не работало: `media.fs_status`
+оставался `blank`, `stats->phys_spc_free` — нул, а PUT отвечал `No space left on
+device`. Я перепробовал overlayfs, отдельный loop-mount ext4 и ручную правку
+строки `media` — демон пересчитывал и возвращал ноль.
 
-```
-<ERROR> No compatible device found for write alloc: No such device (19)
-```
+Причина оказалась не в ОС и не в конфигурации, а в **двух пропущенных шагах**,
+которые в контейнере я не сделал:
 
-а после того, как в профиле указана `library`, ошибка меняется на
-
-```
-<ERROR> Error while sending response to layout for encoder 0: No space left on device
-```
-
-При этом устройство в БД есть и выглядит живым:
-
-```
-| adm_status | unlocked | device | /var/lib/phobos | library | dirlib | media | /var/lib/phobos |
+```bash
+phobos dir format /var/lib/phobos
+phobos dir unlock /var/lib/phobos
 ```
 
-Корень в том, что `media.fs_status` остаётся `blank`, а `stats->phys_spc_free` —
-нулевым. Пробовал:
+`dir format` пишет в каталог файл-метку `.phobos_dir_label`
+(`src/ldm-modules/ldm_fs_posix.c:102`) и заполняет структуру свободного места.
+Пока метки нет, `dir_present()` возвращает `-ENOENT` («dir is present but we
+can't get any label»), носитель остаётся `blank` и аллокатор его не видит.
 
-- `/var/lib/phobos` на overlayfs корня контейнера — `blank`, free 0;
-- отдельный loop-mount ext4 (`/mnt/phodir`, 907 MiB свободно по `df`) — тоже
-  `blank`, free 0;
-- вручную `update media set fs_status='empty', stats=...phys_spc_free=1e11` —
-  демон пересчитывает и возвращает ноль, ошибка та же.
+После форматирования носитель **залочен**, а запрос аллокатора требует
+`adm_status = unlocked` — отсюда и был `ENOSPC`. Полное состояние после двух
+шагов:
 
-То есть демон не заполняет статистику свободного места dir-носителя. Чего-то в
-конфиге не хватает — предположительно из `[family]` (`dir_full_threshold` по
-умолчанию 1) или из связки LRS/HSM, — но за отведённое время я это не нашёл.
+```
+dir | unlocked | t | empty | dirlib | phys_spc_free = 71201673216
+```
 
-**Это не блокер для tapegw**, потому что dir-семейство нам нужно только как
-тренировочный стенд без ленты, а не как продакшн-путь. Но спайк на этом не закрыт.
+Ключ к разгадке дал не CLI, а `/tmp/phobosd.log`: демон печатает весь
+DSS-запрос-критерий целиком,
+
+```
+No medium found matching query: {"$AND":[{"DSS::MDA::family":"dir"},
+{"DSS::MDA::put":"t"},{"DSS::MDA::adm_status":"unlocked"},
+{"$OR":[{"DSS::MDA::fs_status":"used"},{"DSS::MDA::fs_status":"empty"}]},
+{"DSS::MDA::library":"dirlib"}]}
+```
+
+тогда как со стороны CLI видно только `No space left on device`. **Вывод для
+диагностики: при проблемах с выделением места смотреть лог демона, а не вывод
+CLI.**
+
+Полный цикл на AlmaLinux 9.8 работает:
+
+```
+PUT  oid/big (64 MiB случайных данных)   -> succeeded
+GET  oid/big                              -> md5 совпал
+DELETE oid/big                            -> succeeded, GET после него отдаёт ENOENT
+```
+
+Так что **спайк 1 закрыт**: Phobos 3.4.1 собирается в EL9 без патчей и делает
+put/get/delete на семействе `dir`. Пошаговая воспроизводимость — в
+[docs/ops/test-server.md](../ops/test-server.md).
 
 ## Что дальше
 
-1. Спросить у авторов Phobos / посмотреть их CI, чем заполняется `phys_spc_free` у
-   dir-носителя. Скорее всего есть пропущенный шаг «отформатировать/смонтировать
-   носитель», который в тестовом наборе Phobos делает отдельный скрипт.
-2. Как только dir заработает — закрыть спайк 2 (минимальная cgo-программа через
-   `libphobos_store`), потому что библиотека уже собрана и лежит в `/usr/lib64`.
-3. Образ со всей этой последовательностью стоит оформить как `ci-dir` из плана M0,
-   иначе каждый будет наступать на `btree_gin` и `cmocka`.
+1. Спайк 2 — минимальная cgo-программа через `libphobos_store`: библиотека уже
+   собрана и установлена на тестовом сервере.
+2. Оформить образ `ci-dir` из плана M0 по мотивам
+   [docs/ops/test-server.md](../ops/test-server.md), иначе каждый будет наступать
+   на `btree_gin`, `cmocka` и `dir format`.
+3. Помнить про вывод из спайка 4: если решение «не линкуемся с libphobos» принято,
+   спайк 2 теряет смысл и вместо него проверяем только TLC-протокол и LTFS.
 
 ## Побочный результат: mhVTL (спайк 7)
 
