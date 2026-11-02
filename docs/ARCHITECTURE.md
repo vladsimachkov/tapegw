@@ -191,7 +191,74 @@ CREATE TABLE upload_parts (
 
 - Только meta DB, лента не трогается. Листинг: префикс, delimiter, `CommonPrefixes`, `max-keys`, `continuation-token` / `marker`, порядок `COLLATE "C"`.
 - Storage class: **всегда `GLACIER`**, независимо от состояния объекта (ADR-0003). Отклонение «`STANDARD` до архивации» убрано: оно заставляло клиента видеть смену класса без его действий.
-- `x-amz-restore` для архивных объектов: нет записи и нет дисковой копии — заголовка нет; `requested`/`in_progress` — `ongoing-request="true"`; `restored` — `ongoing-request="false", expiry-date="<expires_at>"`; объект ещё не заархивирован (`pending`/`archiving`) — `ongoing-request="false", expiry-date="Fri, 2 Dec 2050 00:00:00 GMT"`, страховочная дата в стиле scoutfs: в этом окне диск — единственный носитель, и обещание держится корректностью, а не политикой.
+- `x-amz-restore` отдаётся по колонке `objects.online_until` (ADR-0003): есть дисковая копия (`landing=true` или `restores` в `restored`) — `ongoing-request="false", expiry-date="<online_until>"`; `requested`/`in_progress` — `ongoing-request="true"`; копии нет — заголовка нет. `online_until` ставится при PUT как `now() + spool.landing_min_retention`, при переходе в `archived` продлевается до `max(online_until, archived_at + landing_min_retention)`, при RestoreObject — до `max(online_until, now() + days)`. Показанная дата никогда не бывает раньше реального удаления файла: фиктивная дата 2050 из первой редакции ADR ломала это, потому что объект архивировался и вытеснялся, а обещание оставалось.
+- janitor вытесняет дисковую копию (landing или cache) только при `state = 'archived' AND online_until < now()`. Отсюда следует, что `pending` и `archiving` с диска не удаляются ни при каком watermark: у них `online_until` в будущем по построению, а их удаление было бы безвозвратной потерью данных, за которые клиент уже получил 200.
+- Входящий `x-amz-storage-class` принимается только как «на ленту»: пусто, `GLACIER`, `DEEP_ARCHIVE`, плюс алиасы из `s3.accept_as_glacier`. Остальное — `NotImplemented` (ADR-0003).
+- Файлы на диске адресуются только по UUID: `landing/<2 hex>/<uuid>`, `cache/<2 hex>/<uuid>`, `mpu/<upload_id>/<part>`. Путь не хранится в БД, он вычисляется.
+- В Phobos объект пишется с атрибутами `bucket`, `key`, `etag`, `size`, `content_type`, `created_at`, `user_meta` (JSON). Этого достаточно, чтобы восстановить схему `tapegw` с лент.
+
+## Конечный автомат объекта и restore
+
+У объекта два независимых автомата: основной (`objects.state`) ведёт его на ленту и к удалению, второй (`restores`) существует только для `archived` и отвечает за временную копию в кэше.
+
+&#91;embedded content: состояния объекта и restore\]
+
+Каждый переход выполняется одним `UPDATE … WHERE state = <ожидаемое>` в транзакции. Ноль затронутых строк означает, что состояние уже изменил кто-то другой, и воркер молча пропускает объект.
+
+| Из | В | Кто | Условие |
+| --- | --- | --- | --- |
+| pending | archiving | migrator | объект взят в батч |
+| archiving | archived | migrator | `xt_rc = 0` |
+| archiving | pending | migrator, старт процесса | ошибка и `attempts < max`; или при старте объект не найден в Phobos |
+| archiving | failed | migrator | `attempts = max` |
+| failed | pending | оператор | `tapegw admin retry` |
+| pending, archiving, archived, failed | deleting | backend | DELETE или перезапись ключа; migrator, закончив put, не переведёт `deleting` в `archived` из-за условия `WHERE state='archiving'`, и объект удалит deleter |
+| deleting | deleted | deleter | `phobos_delete` успешен или объекта в Phobos нет; файлы удалены |
+| нет записи | requested | backend | RestoreObject для `archived` |
+| requested | in\_progress | recaller | взят в батч, место в кэше есть |
+| in\_progress | restored | recaller | файл в cache, размер и ETag сверены |
+| in\_progress | requested | recaller | ошибка и `attempts < max` |
+| in\_progress | failed | recaller | `attempts = max` |
+| restored | restored | backend | повторный RestoreObject продлевает `expires_at` |
+| restored | нет записи | janitor | `expires_at < now()`, файл удалён |
+| любое | нет записи | backend | объект ушёл в `deleting`: строка `restores` удаляется в той же транзакции, иначе recaller вечно видит restore у удалённого объекта, а метрики очередей врут |
+
+## Потоки запросов
+
+Каждый поток ниже — контракт для реализации и для e2e-тестов. Где поведение AWS неоднозначно, в скобках указано, что проверить в коде versitygw.
+
+**PutObject**
+
+1. Проверить бакет и ключ (`ValidateObjectKey`-логика как в posix-бэкенде).
+2. Писать тело в `landing/tmp/<uuid>` через `O_TMPFILE` или временное имя, параллельно считая MD5 и запрошенные `x-amz-checksum-*`.
+3. Сверить `Content-MD5` и checksum, если клиент их прислал; при расхождении удалить файл и вернуть `BadDigest`.
+4. `fsync` файла, `rename` в `landing/<2 hex>/<uuid>`, `fsync` каталога.
+5. Транзакция: вставить строку `pending`, старую текущую версию ключа перевести в `deleting`. Только после commit вернуть 200 с ETag.
+
+Сбой между шагами 4 и 5 оставляет файл без строки; его подберёт janitor (orphan GC).
+
+**Multipart**
+
+- `CreateMultipartUpload` — строка в `uploads`, каталог `mpu/<upload_id>/`.
+- `UploadPart` — запись части как в PutObject (fsync + rename), upsert в `upload_parts`.
+- `CompleteMultipartUpload` — проверить список частей и их ETag, собрать итоговый файл в landing через reflink (`FICLONERANGE`; landing и mpu обязаны быть на одной XFS), с fallback на копирование. ETag = md5 от конкатенации бинарных md5 частей + `-N`. Дальше шаг 5 из PutObject, затем удалить каталог части.
+- `AbortMultipartUpload`, `ListParts`, `ListMultipartUploads` — по таблицам. Незавершённые загрузки старше `mpu.ttl` удаляет janitor.
+
+**Архивация (migrator)**
+
+1. Взять батч: `SELECT … WHERE state='pending' AND next_try_at<=now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT n`, ограничение по суммарному размеру `batch.max_bytes`. Батч закрывается по числу, по объёму или по таймеру `batch.max_wait`.
+2. Перевести строки в `archiving`, commit.
+3. Один вызов `phobos_put` на весь батч: по xfer на объект, `xt_objid=uuid`, `xt_fd` открытого landing-файла, `xt_size`, атрибуты из раздела «Модель данных», family `tape`, layout и tags из конфига.
+4. По `xt_rc` каждого объекта: успех → `archived`, `phobos_ver`, `archived_at`; ошибка → обратно в `pending`, `attempts+1`, экспоненциальный `next_try_at`; после `max_attempts` → `failed` и алерт.
+5. Landing-копию не удалять сразу: её вытесняет janitor по watermark, начиная с давно архивированных.
+
+Восстановление после падения: строки в `archiving` при старте проверяются через `phobos_getmd(uuid)`. Объект найден → `archived`, не найден → `pending`. Незавершённые копии чистит `phobos_delete_incomplete_copy`.
+
+**HeadObject / ListObjects (v1, v2)**
+
+- Только meta DB, лента не трогается. Листинг: префикс, delimiter, `CommonPrefixes`, `max-keys`, `continuation-token` / `marker`, порядок `COLLATE "C"`.
+- Storage class: **всегда `GLACIER`**, независимо от состояния объекта (ADR-0003). Отклонение «`STANDARD` до архивации» убрано: оно заставляло клиента видеть смену класса без его действий.
+- `x-amz-restore` — по колонке `objects.online_until` (см. «Модель данных» и ADR-0003): дисковая копия есть → `ongoing-request="false", expiry-date="<online_until>"`; `requested`/`in_progress` → `ongoing-request="true"`; копии нет → заголовка нет.
 - `x-amz-restore` для архивных объектов: нет записи — заголовка нет; `requested`/`in_progress` — `ongoing-request="true"`; `restored` — `ongoing-request="false", expiry-date="…"`.
 
 **RestoreObject**
@@ -456,6 +523,8 @@ AGENTS.md            краткие правила ниже + команды с�
 10. Один PR — один пункт плана из раздела «План разработки». В описании PR: что сделано, как проверено, отступления от документа со ссылкой на ADR.
 11. Миграции БД — только вперёд, одна миграция на PR, без правки уже слитых.
 12. Лицензия репозитория — Apache-2.0 (как у versitygw); файлы, взятые из Phobos, сохраняют LGPL-заголовок.
+
+13. Ни одна транзакция Postgres не открыта во время вызова Phobos. Воркер коммитит переход состояния (например `pending → archiving`), отпускает транзакцию и лок, и только потом вызывает `phobos_put`; результат пишется новой транзакцией. Иначе лента держит строки и advisory-локи ключей: `phobos_put` батчем на 200 GiB может идти минуты, а параллельный PUT тех же ключей в это время упрётся в `lock_timeout`. Таймаут лока оставляем как вторую линию защиты, а не как замену правилу.
 
 ## План разработки
 

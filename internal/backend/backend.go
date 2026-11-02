@@ -93,21 +93,20 @@ func (t *TapeGW) ListBuckets(ctx context.Context, input s3response.ListBucketsIn
 	}
 
 	res := s3response.ListAllMyBucketsResult{
-		Owner:             s3response.CanonicalUser{ID: ownerFilter, DisplayName: ownerFilter},
-		Prefix:            input.Prefix,
-		ContinuationToken: input.ContinuationToken,
+		Owner:  s3response.CanonicalUser{ID: ownerFilter, DisplayName: ownerFilter},
+		Prefix: input.Prefix,
+		// В ListAllMyBucketsResult versitygw нет отдельного поля NextContinuationToken:
+		// по соглашению самих бэкендов (см. backend/azure) следующим токеном служит
+		// то же поле ContinuationToken, и оно **пустое, если следующей страницы нет**.
+		// Экхо входного токена зацикливает пагинатор: на последней странице клиент
+		// получил бы обратно свой же токен и запросил бы её же снова.
+		ContinuationToken: next,
 	}
 	for _, b := range buckets {
 		res.Buckets.Bucket = append(res.Buckets.Bucket, s3response.ListAllMyBucketsEntry{
 			Name:         b.Name,
 			CreationDate: b.CreatedAt,
 		})
-	}
-	// В ListAllMyBucketsResult versitygw нет отдельного поля NextContinuationToken:
-	// по соглашению самих бэкендов (см. backend/azure) следующим токеном служит
-	// то же поле ContinuationToken.
-	if next != "" {
-		res.ContinuationToken = next
 	}
 	return res, nil
 }

@@ -46,6 +46,8 @@ spool:
   orphan_grace: 24h
   slowdown_headroom: 5             # на сколько % выше high ещё принимаем PUT (только запись!)
   evict_retries: 2                 # сколько раз GET перечитает состояние при ENOENT (ADR-0004)
+  landing_min_retention: 24h       # минимальный срок доступности дисковой копии;
+                                   # она же expiry-date в x-amz-restore (ADR-0003)
 
 phobos:
   family: tape                     # dir — для CI и разработки без лент

@@ -133,7 +133,7 @@ func TestBucketNameReusableAfterDelete(t *testing.T) {
 }
 
 // Префикс и max-buckets должны фильтроваться в SQL, а не в Go.
-func TestListBucketsPrefixAndPaging(t *testing.T) {
+func TestListBucketsPrefix(t *testing.T) {
 	be, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
@@ -143,44 +143,92 @@ func TestListBucketsPrefixAndPaging(t *testing.T) {
 		}
 	}
 
-	page1, err := be.ListBuckets(ctx, s3response.ListBucketsInput{Owner: "alice", MaxBuckets: 2})
-	if err != nil {
-		t.Fatalf("ListBuckets: %v", err)
-	}
-	if len(page1.Buckets.Bucket) != 2 {
-		t.Fatalf("страница 1 вернула %d бакетов, ожидали 2", len(page1.Buckets.Bucket))
-	}
-	if page1.ContinuationToken == "" {
-		t.Fatal("при обрезке по max-buckets должен вернуться токен продолжения")
-	}
-
-	page2, err := be.ListBuckets(ctx, s3response.ListBucketsInput{
-		Owner: "alice", MaxBuckets: 2, ContinuationToken: page1.ContinuationToken,
-	})
-	if err != nil {
-		t.Fatalf("ListBuckets page 2: %v", err)
-	}
-	if len(page2.Buckets.Bucket) != 2 {
-		t.Errorf("страница 2 вернула %d бакетов, ожидали 2", len(page2.Buckets.Bucket))
-	}
-
-	// Токен не должен пересекаться с первой страницей.
-	seen := map[string]bool{}
-	for _, b := range page1.Buckets.Bucket {
-		seen[b.Name] = true
-	}
-	for _, b := range page2.Buckets.Bucket {
-		if seen[b.Name] {
-			t.Errorf("бакет %s попал на обе страницы", b.Name)
-		}
-	}
-
 	filtered, err := be.ListBuckets(ctx, s3response.ListBucketsInput{Owner: "alice", Prefix: "aa-"})
 	if err != nil {
 		t.Fatalf("ListBuckets prefix: %v", err)
 	}
 	if len(filtered.Buckets.Bucket) != 3 {
 		t.Errorf("по префиксу aa- получили %d, ожидали 3", len(filtered.Buckets.Bucket))
+	}
+}
+
+// Пагинация обязана завершаться. Это не придирка к форме ответа: в
+// ListAllMyBucketsResult versitygw нет отдельного NextContinuationToken, и
+// если эхом вернуть входной токен, пагинатор SDK и `aws s3 ls` будут
+// запрашивать последнюю страницу вечно.
+func TestListBucketsPaginationTerminates(t *testing.T) {
+	be, _ := newBackend(t)
+	ctx := ownerCtx("alice")
+
+	want := []string{"bkt-1", "bkt-2", "bkt-3", "bkt-4", "bkt-5"}
+	for _, name := range want {
+		if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr(name)}, nil); err != nil {
+			t.Fatalf("CreateBucket %s: %v", name, err)
+		}
+	}
+
+	// Разные Max, чтобы поймать и «ровно последняя страница», и «обрезали посередине».
+	for _, maxBuckets := range []int32{1, 2, 3, 5, 7} {
+		got := []string{}
+		token := ""
+		// Потолок заведомо больше числа бакетов: если цикл не завершается,
+		// тест должен упасть, а не висеть.
+		for page := 0; ; page++ {
+			if page > len(want)+2 {
+				t.Fatalf("MaxBuckets=%d: пагинация не завершилась за %d страниц, собрано %v",
+					maxBuckets, page, got)
+			}
+			out, err := be.ListBuckets(ctx, s3response.ListBucketsInput{
+				Owner: "alice", MaxBuckets: maxBuckets, ContinuationToken: token,
+			})
+			if err != nil {
+				t.Fatalf("MaxBuckets=%d страница %d: %v", maxBuckets, page, err)
+			}
+			for _, b := range out.Buckets.Bucket {
+				got = append(got, b.Name)
+			}
+			token = out.ContinuationToken
+			if token == "" {
+				break
+			}
+		}
+
+		if len(got) != len(want) {
+			t.Errorf("MaxBuckets=%d: собрано %d бакетов (%v), ожидали %d",
+				maxBuckets, len(got), got, len(want))
+			continue
+		}
+		seen := map[string]bool{}
+		for _, name := range got {
+			if seen[name] {
+				t.Errorf("MaxBuckets=%d: %s попал в выдачу дважды: %v", maxBuckets, name, got)
+			}
+			seen[name] = true
+		}
+	}
+}
+
+// На последней странице токен обязан быть пустым — иначе пагинатор не остановится.
+func TestListBucketsLastPageHasNoToken(t *testing.T) {
+	be, _ := newBackend(t)
+	ctx := ownerCtx("alice")
+
+	for _, name := range []string{"one", "two"} {
+		if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr(name)}, nil); err != nil {
+			t.Fatalf("CreateBucket %s: %v", name, err)
+		}
+	}
+
+	// Ровно столько же, сколько есть: дублировать «последнюю» страницу не за чем.
+	out, err := be.ListBuckets(ctx, s3response.ListBucketsInput{Owner: "alice", MaxBuckets: 2})
+	if err != nil {
+		t.Fatalf("ListBuckets: %v", err)
+	}
+	if len(out.Buckets.Bucket) != 2 {
+		t.Fatalf("вернулось %d бакетов", len(out.Buckets.Bucket))
+	}
+	if out.ContinuationToken != "" {
+		t.Errorf("на странице, которой всё покрыто, токен = %q, ожидали пусто", out.ContinuationToken)
 	}
 }
 

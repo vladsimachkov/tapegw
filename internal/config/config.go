@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"strconv"
@@ -89,6 +90,14 @@ type Spool struct {
 	// EvictRetries — сколько раз GET перечитывает состояние, если файл спула
 	// исчез между решением и open (ADR-0004).
 	EvictRetries int `yaml:"evict_retries"`
+	// LandingMinRetention — минимальный срок, на который дисковая копия
+	// гарантированно остаётся доступной. Он же — значение online_until при PUT
+	// и шаг продления при архивации (ADR-0003).
+	//
+	// Это не «политика кэша», а обещание клиенту: HEAD показывает
+	// x-amz-restore expiry-date = online_until, и вытеснить раньше нельзя,
+	// иначе обещание окажется ложным.
+	LandingMinRetention time.Duration `yaml:"landing_min_retention"`
 }
 
 // Watermark — пороги вытеснения в процентах занятого объёма тома.
@@ -239,6 +248,9 @@ func Default() *Config {
 			OrphanGrace:      24 * time.Hour,
 			SlowDownHeadroom: 5,
 			EvictRetries:     2,
+			// 24 часа: клиент, записавший объект и ушедший домой, утром
+			// застанет его читаемым без RestoreObject.
+			LandingMinRetention: 24 * time.Hour,
 		},
 		Phobos: Phobos{
 			Family:       "tape",
@@ -281,7 +293,14 @@ func Load(path string) (*Config, error) {
 		dec := yaml.NewDecoder(bytes.NewReader(data))
 		dec.KnownFields(true)
 		if err := dec.Decode(cfg); err != nil {
-			return nil, fmt.Errorf("parse config %v: %w", path, err)
+			// Пустой (или состоящий только из комментариев) файл — не ошибка:
+			// это способ сказать «всё из окружения». Без этой ветки
+			// `tapegw -config empty.yaml` падал с «parse config: EOF».
+			if errors.Is(err, io.EOF) {
+				err = nil
+			} else {
+				return nil, fmt.Errorf("parse config %v: %w", path, err)
+			}
 		}
 	}
 
@@ -483,6 +502,10 @@ func (c *Config) Validate() error {
 	}
 	if c.Spool.EvictRetries < 0 {
 		add("spool.evict_retries: %d, должно быть >= 0", c.Spool.EvictRetries)
+	}
+	if c.Spool.LandingMinRetention <= 0 {
+		add("spool.landing_min_retention: %v, должно быть > 0 — это обещание клиенту в x-amz-restore",
+			c.Spool.LandingMinRetention)
 	}
 	if c.DB.AdvisoryLockTimeout <= 0 {
 		add("db.advisory_lock_timeout: %v, должно быть > 0", c.DB.AdvisoryLockTimeout)

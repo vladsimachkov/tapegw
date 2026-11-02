@@ -17,6 +17,7 @@ package testdb
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -41,7 +42,10 @@ func Connect(t *testing.T) *meta.Meta {
 		t.Skipf("%s не задан — пропускаем тест, которому нужен Postgres", DSNEnv)
 	}
 
-	dsn = withSchema(dsn, packageSchema(t))
+	dsn, err := withSchema(dsn, packageSchema(t))
+	if err != nil {
+		t.Fatalf("%s: %v", DSNEnv, err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
@@ -84,15 +88,16 @@ func packageSchema(t *testing.T) string {
 
 var nonIdent = regexp.MustCompile(`[^a-z0-9_]`)
 
-// withSchema подменяет search_path в DSN. Ошибку парсинга не прячем: кривой
-// DSN в тесте должен быть виден сразу.
-func withSchema(dsn, schema string) string {
+// withSchema подменяет search_path в DSN. Ошибку возвращаем наружу: кривой DSN
+// в тесте должен быть виден сразу, а не превращаться в «тест работает не с той
+// схемой».
+func withSchema(dsn, schema string) (string, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return dsn
+		return "", fmt.Errorf("parse %s: %w", DSNEnv, err)
 	}
 	q := u.Query()
 	q.Set("search_path", schema)
 	u.RawQuery = q.Encode()
-	return u.String()
+	return u.String(), nil
 }

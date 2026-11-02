@@ -258,3 +258,26 @@ func TestIsGlacierClass(t *testing.T) {
 		}
 	}
 }
+
+// Пустой файл конфига — штатный способ сказать «всё приехало из TAPEGW_*».
+// Без обработки io.EOF yaml.Decoder возвращает EOF, и tapegw -config empty.yaml
+// падал на старте.
+func TestLoadEmptyFileIsNotAnError(t *testing.T) {
+	t.Setenv("TAPEGW_ROOT_ACCESS", "acc")
+	t.Setenv("TAPEGW_ROOT_SECRET", "sec")
+
+	for name, body := range map[string]string{
+		"совсем пустой":      "",
+		"только комментарии": "# конфигурация из окружения\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, body))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.S3.Region != Default().S3.Region {
+				t.Errorf("дефолты не применились: region=%q", cfg.S3.Region)
+			}
+		})
+	}
+}

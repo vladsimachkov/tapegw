@@ -40,7 +40,20 @@ type ListBucketsOpt struct {
 // Теги передаются здесь же, а не отдельным запросом: иначе между вставкой и
 // тегами падение процесса оставляет бакет без тегов, и клиент получит 200 с
 // неполными метаданными.
-func (m *Meta) CreateBucket(ctx context.Context, name, owner string, acl []byte, tags map[string]string) (existing bool, err error) {
+//
+// Вставка и разбор конфликта — не одна операция, поэтому между ними бакет
+// могут успеть удалить (мягко). Тогда повторный SELECT не находит строки и
+// возвращает ErrNoRows: это не ошибка клиента, а редкая гонка, поэтому
+// вставку повторяем один раз.
+func (m *Meta) CreateBucket(ctx context.Context, name, owner string, acl []byte, tags map[string]string) (bool, error) {
+	existing, err := m.insertBucket(ctx, name, owner, acl, tags)
+	if !errors.Is(err, ErrNotFound) {
+		return existing, err
+	}
+	return m.insertBucket(ctx, name, owner, acl, tags)
+}
+
+func (m *Meta) insertBucket(ctx context.Context, name, owner string, acl []byte, tags map[string]string) (existing bool, err error) {
 	var tagsRaw []byte
 	if len(tags) > 0 {
 		if tagsRaw, err = json.Marshal(tags); err != nil {
@@ -63,8 +76,13 @@ func (m *Meta) CreateBucket(ctx context.Context, name, owner string, acl []byte,
 	}
 
 	var got string
-	if err := m.Pool.QueryRow(ctx,
-		`SELECT owner FROM buckets WHERE name = $1 AND deleted_at IS NULL`, name).Scan(&got); err != nil {
+	err = m.Pool.QueryRow(ctx,
+		`SELECT owner FROM buckets WHERE name = $1 AND deleted_at IS NULL`, name).Scan(&got)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Бакет успели удалить между INSERT и SELECT.
+		return false, ErrNotFound
+	}
+	if err != nil {
 		return false, fmt.Errorf("lookup bucket %q: %w", name, err)
 	}
 	if got != owner {
@@ -122,8 +140,14 @@ func (m *Meta) ListBuckets(ctx context.Context, opt ListBucketsOpt) ([]Bucket, s
 		add(`name > $%d COLLATE "C"`, opt.After)
 	}
 	q += ` ORDER BY name COLLATE "C"`
+	// Просим на одну строку больше, чем отдаём: только так можно отличить
+	// «ровно последняя страница» от «обрезали по лимиту, впереди ещё есть».
+	// Без этого при len(out) == Max токен отдаётся и на последней странице,
+	// и клиент получает лишнюю пустую выдачу.
+	limit := 0
 	if opt.Max > 0 {
-		args = append(args, opt.Max)
+		limit = opt.Max
+		args = append(args, opt.Max+1)
 		q += fmt.Sprintf(` LIMIT $%d`, len(args))
 	}
 
@@ -145,9 +169,11 @@ func (m *Meta) ListBuckets(ctx context.Context, opt ListBucketsOpt) ([]Bucket, s
 		return nil, "", err
 	}
 
-	// Токен продолжения отдаём только если реально отрезали по лимиту.
+	// Токен продолжения — только если реально впереди есть строки: мы выбрали
+	// limit+1, значит «есть» означает «пришло больше limit».
 	next := ""
-	if opt.Max > 0 && len(out) == opt.Max && len(out) > 0 {
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 		next = EncodeToken(out[len(out)-1].Name)
 	}
 	return out, next, nil
