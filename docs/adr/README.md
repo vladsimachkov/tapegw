@@ -13,3 +13,4 @@ Architectural Decision Records. Порядок задан в `docs/ARCHITECTURE.
 | [0003](0003-standard-storage-class.md) | Классы хранения: входящие отвергаем, исходящие всегда GLACIER | принято |
 | [0004](0004-landing-eviction-race.md) | Гонка GET и вытеснения landing-копии | принято |
 | [0005](0005-key-rewrite-advisory-lock.md) | Перезапись ключа: advisory-лок вместо ретрая | принято |
+| [0006](0006-libphobos-linkage.md) | Линковка с libphobos_store, вызовы сериализованы | принято |
