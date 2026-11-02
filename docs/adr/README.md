@@ -14,3 +14,5 @@ Architectural Decision Records. Порядок задан в `docs/ARCHITECTURE.
 | [0004](0004-landing-eviction-race.md) | Гонка GET и вытеснения landing-копии | принято |
 | [0005](0005-key-rewrite-advisory-lock.md) | Перезапись ключа: advisory-лок вместо ретрая | принято |
 | [0006](0006-libphobos-linkage.md) | Линковка с libphobos_store, вызовы сериализованы | принято |
+| [0007](0007-mover-worker.md) | Вызовы Phobos в отдельном бинаре tapegw-mover | принято |
+| [0008](0008-object-medium.md) | Носитель объекта: узнаём при архивации, храним у себя | принято |
