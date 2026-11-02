@@ -131,6 +131,20 @@ func schemaFromDSN(dsn string) (string, error) {
 	return strings.Trim(strings.TrimSpace(first), `"`), nil
 }
 
+// inTx — транзакция с commit при успехе и rollback при любой ошибке.
+// В pgxpool v5 нет BeginFunc, поэтому обёртка своя.
+func (m *Meta) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := m.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op после commit
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ErrNotFound — объект или бакет не найден. Отличаем от реальной ошибки БД,
 // чтобы воркеры не ретраили «нет такой строки».
 var ErrNotFound = errors.New("meta: not found")

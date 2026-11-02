@@ -38,8 +38,10 @@ jobs:
         run: go vet ./...
 
       - name: staticcheck
+        # Версия закреплена: @latest может принести новые проверки в любой день,
+        # и тогда CI краснеет без изменений в коде. v0.8.2 понимает Go 1.26.
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
           staticcheck ./...
 
       - name: go mod tidy не оставил изменений

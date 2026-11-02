@@ -35,6 +35,7 @@ db:
   max_conns: 20
   connect_timeout: 10s
   migrate_on_start: true
+  advisory_lock_timeout: 30s       # ожидание pg_advisory_xact_lock на ключе (ADR-0005)
 
 spool:
   landing: /srv/tapegw/landing     # mpu/ лежит здесь же, на той же XFS с reflink=1
@@ -43,7 +44,10 @@ spool:
   cache_watermark: {high: 85, low: 70}
   mpu_ttl: 168h
   orphan_grace: 24h
-  slowdown_headroom: 5             # на сколько % выше high ещё принимаем PUT
+  slowdown_headroom: 5             # на сколько % выше high ещё принимаем PUT (только запись!)
+  evict_retries: 2                 # сколько раз GET перечитает состояние при ENOENT (ADR-0004)
+  landing_min_retention: 24h       # минимальный срок доступности дисковой копии;
+                                   # она же expiry-date в x-amz-restore (ADR-0003)
 
 phobos:
   family: tape                     # dir — для CI и разработки без лент

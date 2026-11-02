@@ -74,17 +74,25 @@ func TestBucketLifecycle(t *testing.T) {
 	}
 }
 
-// Повторный CreateBucket тем же владельцем в AWS — 200, а не ошибка: на это
-// опираются `aws s3 mb --region ...` в скриптах и идемпотентные повторные
-// попытки клиента.
-func TestCreateBucketIdempotentForSameOwner(t *testing.T) {
+// Коды при повторном CreateBucket берём один в один из posix-бэкенда
+// versitygw (backend/posix/posix.go): свой бакет — BucketAlreadyOwnedByYou,
+// чужой — BucketAlreadyExists. Оба 409, но разные: по коду клиент решает,
+// повторять ли попытку.
+
+func TestCreateBucketAlreadyOwnedByYou(t *testing.T) {
 	be, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
-	for i := range 3 {
-		if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("dup")}, nil); err != nil {
-			t.Fatalf("CreateBucket #%d: %v", i+1, err)
-		}
+	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("dup")}, nil); err != nil {
+		t.Fatalf("первый CreateBucket: %v", err)
+	}
+
+	err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("dup")}, nil)
+	if err == nil {
+		t.Fatal("повторный CreateBucket своего бакета должен ошибаться, как в AWS")
+	}
+	if !isS3Code(err, s3err.ErrBucketAlreadyOwnedByYou) {
+		t.Errorf("ожидали BucketAlreadyOwnedByYou, получили %v", err)
 	}
 }
 
@@ -99,8 +107,128 @@ func TestCreateBucketOtherOwner(t *testing.T) {
 	if err == nil {
 		t.Fatal("чужой бакет должен быть ошибкой")
 	}
-	if !isS3Code(err, s3err.ErrBucketAlreadyOwnedByYou) {
-		t.Errorf("ожидали BucketAlreadyOwnedByYou, получили %v", err)
+	if !isS3Code(err, s3err.ErrBucketAlreadyExists) {
+		t.Errorf("ожидали BucketAlreadyExists, получили %v", err)
+	}
+}
+
+// Мягкое удаление освобождает имя: rb -> mb должно работать, хотя строка
+// бакета остаётся в таблице, потому что на неё ссылаются objects.
+func TestBucketNameReusableAfterDelete(t *testing.T) {
+	be, _ := newBackend(t)
+	ctx := ownerCtx("alice")
+
+	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("reuse")}, nil); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	if err := be.DeleteBucket(ctx, "reuse"); err != nil {
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+	if _, err := be.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: ptr("reuse")}); err == nil {
+		t.Fatal("удалённый бакет не должен отвечать на HEAD")
+	}
+	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("reuse")}, nil); err != nil {
+		t.Fatalf("повторный CreateBucket после удаления: %v", err)
+	}
+}
+
+// Префикс и max-buckets должны фильтроваться в SQL, а не в Go.
+func TestListBucketsPrefix(t *testing.T) {
+	be, _ := newBackend(t)
+	ctx := ownerCtx("alice")
+
+	for _, name := range []string{"aa-1", "aa-2", "aa-3", "bb-1"} {
+		if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr(name)}, nil); err != nil {
+			t.Fatalf("CreateBucket %s: %v", name, err)
+		}
+	}
+
+	filtered, err := be.ListBuckets(ctx, s3response.ListBucketsInput{Owner: "alice", Prefix: "aa-"})
+	if err != nil {
+		t.Fatalf("ListBuckets prefix: %v", err)
+	}
+	if len(filtered.Buckets.Bucket) != 3 {
+		t.Errorf("по префиксу aa- получили %d, ожидали 3", len(filtered.Buckets.Bucket))
+	}
+}
+
+// Пагинация обязана завершаться. Это не придирка к форме ответа: в
+// ListAllMyBucketsResult versitygw нет отдельного NextContinuationToken, и
+// если эхом вернуть входной токен, пагинатор SDK и `aws s3 ls` будут
+// запрашивать последнюю страницу вечно.
+func TestListBucketsPaginationTerminates(t *testing.T) {
+	be, _ := newBackend(t)
+	ctx := ownerCtx("alice")
+
+	want := []string{"bkt-1", "bkt-2", "bkt-3", "bkt-4", "bkt-5"}
+	for _, name := range want {
+		if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr(name)}, nil); err != nil {
+			t.Fatalf("CreateBucket %s: %v", name, err)
+		}
+	}
+
+	// Разные Max, чтобы поймать и «ровно последняя страница», и «обрезали посередине».
+	for _, maxBuckets := range []int32{1, 2, 3, 5, 7} {
+		got := []string{}
+		token := ""
+		// Потолок заведомо больше числа бакетов: если цикл не завершается,
+		// тест должен упасть, а не висеть.
+		for page := 0; ; page++ {
+			if page > len(want)+2 {
+				t.Fatalf("MaxBuckets=%d: пагинация не завершилась за %d страниц, собрано %v",
+					maxBuckets, page, got)
+			}
+			out, err := be.ListBuckets(ctx, s3response.ListBucketsInput{
+				Owner: "alice", MaxBuckets: maxBuckets, ContinuationToken: token,
+			})
+			if err != nil {
+				t.Fatalf("MaxBuckets=%d страница %d: %v", maxBuckets, page, err)
+			}
+			for _, b := range out.Buckets.Bucket {
+				got = append(got, b.Name)
+			}
+			token = out.ContinuationToken
+			if token == "" {
+				break
+			}
+		}
+
+		if len(got) != len(want) {
+			t.Errorf("MaxBuckets=%d: собрано %d бакетов (%v), ожидали %d",
+				maxBuckets, len(got), got, len(want))
+			continue
+		}
+		seen := map[string]bool{}
+		for _, name := range got {
+			if seen[name] {
+				t.Errorf("MaxBuckets=%d: %s попал в выдачу дважды: %v", maxBuckets, name, got)
+			}
+			seen[name] = true
+		}
+	}
+}
+
+// На последней странице токен обязан быть пустым — иначе пагинатор не остановится.
+func TestListBucketsLastPageHasNoToken(t *testing.T) {
+	be, _ := newBackend(t)
+	ctx := ownerCtx("alice")
+
+	for _, name := range []string{"one", "two"} {
+		if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr(name)}, nil); err != nil {
+			t.Fatalf("CreateBucket %s: %v", name, err)
+		}
+	}
+
+	// Ровно столько же, сколько есть: дублировать «последнюю» страницу не за чем.
+	out, err := be.ListBuckets(ctx, s3response.ListBucketsInput{Owner: "alice", MaxBuckets: 2})
+	if err != nil {
+		t.Fatalf("ListBuckets: %v", err)
+	}
+	if len(out.Buckets.Bucket) != 2 {
+		t.Fatalf("вернулось %d бакетов", len(out.Buckets.Bucket))
+	}
+	if out.ContinuationToken != "" {
+		t.Errorf("на странице, которой всё покрыто, токен = %q, ожидали пусто", out.ContinuationToken)
 	}
 }
 
