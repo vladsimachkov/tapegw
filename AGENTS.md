@@ -20,8 +20,32 @@ go build -tags phobos ./...
 # Миграции применяются при старте tapegw, отдельно запускать не нужно
 ```
 
-Тесты, которым нужен Postgres, поднимают его через testcontainers и пропускаются сами,
-если Docker недоступен. Такие тесты помечают себя `t.Skip`.
+Тесты, которым нужен Postgres, пропускаются сами, если `TAPEGW_TEST_DSN` не задан.
+Чтобы они всё-таки прогнаться:
+
+```bash
+docker run -d --name tapegw-pg -p 55432:5432 \
+  -e POSTGRES_USER=tapegw -e POSTGRES_PASSWORD=tapegw -e POSTGRES_DB=phobos \
+  postgres:16-alpine
+
+TAPEGW_TEST_DSN='postgres://tapegw:tapegw@localhost:55432/phobos?search_path=tapegw_test' \
+  go test -race -count=1 ./...
+```
+
+E2E-тесты (`test/e2e`) пропускаются без `TAPEGW_E2E_ENDPOINT`. Полный прогон:
+
+```bash
+# 1. поднять tapegw (см. readme.md «Быстрый старт»)
+# 2
+go build -o /tmp/tapegw ./cmd/tapegw && /tmp/tapegw -config /tmp/tapegw.yaml &
+# 3
+TAPEGW_E2E_ENDPOINT=http://127.0.0.1:7070 \
+TAPEGW_E2E_ACCESS=testaccess TAPEGW_E2E_SECRET=testsecret \
+  go test -count=1 ./test/e2e -v
+```
+
+Оба набора с DSN и endpoint гоняет CI (`.github/workflows/ci.yml`) — локально
+прогонять их не обязательно, но перед PR по очередям и транзакциям стоит.
 
 ## Железные правила
 

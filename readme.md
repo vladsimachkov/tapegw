@@ -33,15 +33,47 @@ S3-протокол снаружи, асинхронная архивация н
 | Этап | О чём | Статус |
 | --- | --- | --- |
 | M0 | Спайки: cgo Phobos, протокол TLC, стенд ci-dir | не начат |
-| M1 | Скелет: конфиг, embedgw, миграции, бакеты | не начат |
+| M1 | Скелет: конфиг, embedgw, миграции, бакеты | **сделан** |
 | M2 | Онлайн-путь без ленты: PUT/GET/LIST/DELETE | не начат |
 | M3 | Multipart | не начат |
 | M4 | Архивация на ленту | не начат |
 | M5 | Restore — полный Glacier-цикл | не начат |
 | M6 | Удаление и сборка мусора | не начат |
-| M7 | klipper-tlc на mhVTL | не начат |
+| M7 | klipper-tlc на mhVTL | каркас CLI |
 | M8 | Реальный манипулятор | не начат |
 | M9 | Эксплуатация: метрики, DR, runbook | не начат |
+
+M1 закрыт в объёме критерия готовности: `CreateBucket` / `HeadBucket` /
+`ListBuckets` / `DeleteBucket`, ACL и tagging бакетов работают против живого
+tapegw — это проверяет `test/e2e`. Джоб CI со сборкой `-tags phobos` отложен до
+M0: он требует контейнер EL9 с Phobos и до M0 был бы вечно красный.
+
+## Быстрый старт
+
+Нужен Postgres и Go: тулчейн 1.26 подтянется сам через `GOTOOLCHAIN`.
+
+```bash
+docker run -d --name tapegw-pg -p 55432:5432 \
+  -e POSTGRES_USER=tapegw -e POSTGRES_PASSWORD=tapegw -e POSTGRES_DB=phobos \
+  postgres:16-alpine
+
+cat > /tmp/tapegw.yaml <<'YAML'
+s3:
+  listen: [":7070"]
+db:
+  dsn: postgres://tapegw:tapegw@localhost:55432/phobos?search_path=tapegw
+root:
+  access: testaccess
+  secret: testsecret
+YAML
+
+go run ./cmd/tapegw -config /tmp/tapegw.yaml
+# миграции применяются на старте, схема tapegw создаётся автоматически
+curl -s localhost:7070/health   # OK
+```
+
+Без подписи S3 отвечает `403 AccessDenied` — это правильно, SigV4 проверяется
+штатным кодом versitygw.
 
 ## Разработка
 

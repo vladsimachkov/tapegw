@@ -1,0 +1,76 @@
+# Пример конфигурации tapegw.
+#
+# Любое поле переопределяется переменной TAPEGW_<ПУТЬ_В_ YAML В ВЕРХНЕМ РЕГИСТРЕ>:
+#   s3.region                    -> TAPEGW_S3_REGION
+#   migrator.batch_max_bytes     -> TAPEGW_MIGRATOR_BATCH_MAX_BYTES
+#   db.migrate_on_start          -> TAPEGW_DB_MIGRATE_ON_START
+#
+# Числа ниже — стартовые значения для настройки на стенде, не требования.
+# Источник истины по смыслу каждого поля — docs/ARCHITECTURE.md.
+
+s3:
+  listen:
+    - ":7070"
+  region: us-east-1
+  tls:
+    cert: ""          # пусто = HTTP. Для продакшена обязателен: SigV4 в открытом виде
+    key: ""
+  iam_dir: /etc/tapegw/iam
+  default_storage_class: GLACIER
+  health_path: /health
+  max_connections: 50000
+  max_requests: 50000
+  multipart_max_parts: 10000
+
+# Ключи root-аккаунта. В продакшене задавайте не файлом, а переменной окружения
+# в systemd-юните (TAPEGW_ROOT_ACCESS / TAPEGW_ROOT_SECRET), чтобы секреты
+# не попали в git и в бэкап /etc.
+root:
+  access: ""
+  secret: ""
+
+db:
+  # search_path обязателен: схема tapegw создаётся миграциями автоматически.
+  dsn: postgres://tapegw@localhost/phobos?search_path=tapegw
+  max_conns: 20
+  connect_timeout: 10s
+  migrate_on_start: true
+
+spool:
+  landing: /srv/tapegw/landing     # mpu/ лежит здесь же, на той же XFS с reflink=1
+  cache: /srv/tapegw/cache         # отдельный том; cache/tmp обязан быть на той же ФС
+  landing_watermark: {high: 80, low: 60}
+  cache_watermark: {high: 85, low: 70}
+  mpu_ttl: 168h
+  orphan_grace: 24h
+  slowdown_headroom: 5             # на сколько % выше high ещё принимаем PUT
+
+phobos:
+  family: tape                     # dir — для CI и разработки без лент
+  layout: raid1
+  layout_params: {repl_count: "1"}
+  tags: []
+  max_inflight: 1                  # до подтверждения потокобезопасности libphobos (спайк M0-3)
+
+migrator:
+  batch_max_objects: 1000
+  batch_max_bytes: 200GiB
+  batch_max_wait: 15m              # это же RPO: всё, что не ушло на ленту, живёт только на диске
+  max_attempts: 10
+
+recaller:
+  batch_max_objects: 500
+  batch_max_bytes: 0               # 0 = не ограничивать по байтам
+  batch_max_wait: 5m
+  max_attempts: 10
+
+metrics:
+  listen: ":9464"                  # свой Prometheus-экспортёр, см. ADR-0002
+
+admin:
+  listen: ""                       # пусто = админ-API на S3-порту под path_prefix
+  path_prefix: /admin
+
+logging:
+  level: info                      # debug | info | warn | error
+  format: json                     # json | text

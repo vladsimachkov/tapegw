@@ -1,0 +1,57 @@
+# systemd-юнит tapegw.
+#
+# Порядок запуска задаётся After=/Requires=: tapegw стартует только когда
+# доступны Postgres и phobosd. Одного порядка, впрочем, недостаточно —
+# «юнит запущен» не значит «база принимает запросы», поэтому сам tapegw
+# дополнительно ретраит подключение с бэкоффом.
+#
+# Ключи root-аккаунта держим в /etc/tapegw/tapegw.env, а не в YAML-конфиге:
+#   TAPEGW_ROOT_ACCESS=...
+#   TAPEGW_ROOT_SECRET=...
+# Файл с правами 0600, владелец root.
+
+[Unit]
+Description=tapegw S3 to tape gateway
+Documentation=file:/usr/share/doc/tapegw/ARCHITECTURE.md
+After=network-online.target postgresql.service phobosd.service
+Requires=network-online.target postgresql.service phobosd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tapegw -config /etc/tapegw/tapegw.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+EnvironmentFile=-/etc/tapegw/tapegw.env
+
+User=tapegw
+Group=tapegw
+
+# Останавливаемся gracefully: воркеры дожидаются текущего батча, потому что
+# отмена ctx не прерывает идущий вызов libphobos.
+KillSignal=SIGTERM
+TimeoutStopSec=10min
+
+Restart=on-failure
+RestartSec=5s
+
+# Лог — JSON в stderr, его забирает journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tapegw
+
+# Ограничения. Ленточные воркеры не должны сожрать память фронта.
+LimitNOFILE=65536
+MemoryHigh=8G
+MemoryMax=12G
+
+# Песочница. Разрешаем запись только в spool-каталоги.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/tapegw
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
