@@ -141,7 +141,7 @@ CREATE TABLE upload_parts (
 | Из | В | Кто | Условие |
 | --- | --- | --- | --- |
 | pending | archiving | migrator | объект взят в батч |
-| archiving | archived | migrator | `xt_rc = 0` |
+| archiving | archived | migrator | `getmd` + `copy_status = complete` |
 | archiving | pending | migrator, старт процесса | ошибка и `attempts < max`; или при старте объект не найден в Phobos |
 | archiving | failed | migrator | `attempts = max` |
 | failed | pending | оператор | `tapegw admin retry` |
@@ -182,7 +182,7 @@ CREATE TABLE upload_parts (
 1. Взять батч: `SELECT … WHERE state='pending' AND next_try_at<=now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT n`, ограничение по суммарному размеру `batch.max_bytes`. Батч закрывается по числу, по объёму или по таймеру `batch.max_wait`.
 2. Перевести строки в `archiving`, commit.
 3. Один вызов `phobos_put` на весь батч: по xfer на объект, `xt_objid=uuid`, `xt_fd` открытого landing-файла, `xt_size`, атрибуты из раздела «Модель данных», family `tape`, layout и tags из конфига.
-4. По `xt_rc` каждого объекта: успех → `archived`, `phobos_ver`, `archived_at`; ошибка → обратно в `pending`, `attempts+1`, экспоненциальный `next_try_at`; после `max_attempts` → `failed` и алерт.
+4. Разбор итога батча. Полагаться на `xt_rc` нельзя (см. спайк M0-02): при ошибке он остаётся нулевым у всех целей. Поэтому после батча — и обязательно после любого сбоя — для каждого объекта проверяем `phobos_getmd` на наличие **и** `copy_status = complete`. Найден и полон → `archived`, `phobos_ver`, `archived_at`, плюс `phobos_medium` из одного запроса `phobos extent list` на весь батч (ADR-0008). Иначе → обратно в `pending`, `attempts+1`, экспоненциальный `next_try_at`; после `max_attempts` → `failed` и алерт. На повторе уже подтверждённые объекты исключаем, иначе батч снова упрётся в EEXIST.
 5. Landing-копию не удалять сразу: её вытесняет janitor по watermark, начиная с давно архивированных.
 
 Восстановление после падения: строки в `archiving` при старте проверяются через `phobos_getmd(uuid)`. Объект найден → `archived`, не найден → `pending`. Незавершённые копии чистит `phobos_delete_incomplete_copy`.
@@ -208,7 +208,7 @@ CREATE TABLE upload_parts (
 | Из | В | Кто | Условие |
 | --- | --- | --- | --- |
 | pending | archiving | migrator | объект взят в батч |
-| archiving | archived | migrator | `xt_rc = 0` |
+| archiving | archived | migrator | `getmd` + `copy_status = complete` |
 | archiving | pending | migrator, старт процесса | ошибка и `attempts < max`; или при старте объект не найден в Phobos |
 | archiving | failed | migrator | `attempts = max` |
 | failed | pending | оператор | `tapegw admin retry` |
@@ -249,7 +249,7 @@ CREATE TABLE upload_parts (
 1. Взять батч: `SELECT … WHERE state='pending' AND next_try_at<=now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT n`, ограничение по суммарному размеру `batch.max_bytes`. Батч закрывается по числу, по объёму или по таймеру `batch.max_wait`.
 2. Перевести строки в `archiving`, commit.
 3. Один вызов `phobos_put` на весь батч: по xfer на объект, `xt_objid=uuid`, `xt_fd` открытого landing-файла, `xt_size`, атрибуты из раздела «Модель данных», family `tape`, layout и tags из конфига.
-4. По `xt_rc` каждого объекта: успех → `archived`, `phobos_ver`, `archived_at`; ошибка → обратно в `pending`, `attempts+1`, экспоненциальный `next_try_at`; после `max_attempts` → `failed` и алерт.
+4. Разбор итога батча. Полагаться на `xt_rc` нельзя (см. спайк M0-02): при ошибке он остаётся нулевым у всех целей. Поэтому после батча — и обязательно после любого сбоя — для каждого объекта проверяем `phobos_getmd` на наличие **и** `copy_status = complete`. Найден и полон → `archived`, `phobos_ver`, `archived_at`, плюс `phobos_medium` из одного запроса `phobos extent list` на весь батч (ADR-0008). Иначе → обратно в `pending`, `attempts+1`, экспоненциальный `next_try_at`; после `max_attempts` → `failed` и алерт. На повторе уже подтверждённые объекты исключаем, иначе батч снова упрётся в EEXIST.
 5. Landing-копию не удалять сразу: её вытесняет janitor по watermark, начиная с давно архивированных.
 
 Восстановление после падения: строки в `archiving` при старте проверяются через `phobos_getmd(uuid)`. Объект найден → `archived`, не найден → `pending`. Незавершённые копии чистит `phobos_delete_incomplete_copy`.
@@ -335,7 +335,9 @@ type Store interface {
 Правила для cgo-слоя:
 
 - `phobos_init()` один раз при старте, `phobos_fini()` при остановке.
-- Вызовы `phobos_put` / `phobos_get` блокирующие: запускать их в пуле из `phobos.max_inflight` горутин, отдельно для migrator и recaller, чтобы restore не ждал архивацию. Колбэк завершения в MVP не используется (`cb=NULL`), результат читается из `xt_rc` каждого target.
+- Вызовы `phobos_put` / `phobos_get` блокирующие и вынесены в отдельный бинарь `tapegw-mover` (ADR-0007): один процесс mover = один `phobos_init` = одна операция за раз. Пулы задаются числом процессов — `phobos.movers.migrator` и `phobos.movers.recaller`, сумма не больше числа драйвов, recaller минимум один, чтобы restore не ждал архивацию.
+- **`xt_rc` не заполняется** (спайк M0-02): при ошибке батча все `xt_rc` остаются нулевыми, а возвращаемое значение несёт первую ошибку на всём батче. Результат проверяется отдельно: `phobos_getmd` на наличие **и** статус копии (`complete`, а не `incomplete`) — иначе прерванная запись будет принята за архивную. Колбэк завершения в MVP не используется (`cb=NULL`).
+- Носитель объекта узнаётся один раз при архивации и кладётся в `objects.phobos_medium` (ADR-0008); recaller группирует по этой колонке и в DSS не обращается.
 - Пока потокобезопасность libphobos не подтверждена спайком, пул ограничен одной горутиной. Это требование, а не оптимизация.
 - `os.File` держать живым до возврата (`runtime.KeepAlive`), C-строки освобождать в `defer`, структуры — через `pho_xfer_desc_clean`.
 - Отрицательный `errno` превращать в типизированные ошибки: `ErrNotFound`, `ErrNoSpace`, `ErrBusy` (ретраить), прочие считать фатальными для этого объекта.
@@ -426,7 +428,12 @@ phobos:
   layout: raid1
   layout_params: {repl_count: "1"}
   tags: []
-  max_inflight: 1                       # до подтверждения потокобезопасности
+  movers:
+    migrator: 1                         # процессов mover на архивацию
+    recaller: 1                         # и на restore; сумма <= числа драйвов
+  family: dir                           # API не читает профиль, см. ADR-0007
+  library: dirlib
+  layout: raid1
 migrator:
   batch_max_objects: 1000
   batch_max_bytes: 200GiB
@@ -540,7 +547,7 @@ M5 — первый полный Glacier-цикл без железа; M8 пер
 
 - [ ] Собрать Phobos (зафиксированный тег) и LTFS из исходников в контейнере EL9; `phobos put/get/delete` через CLI на family `dir`.
 - [ ] Минимальная cgo-программа: `phobos_init`, `phobos_put` батчем из 3 объектов по fd с атрибутами, `phobos_getmd`, `phobos_get`, `phobos_delete`.
-- [ ] Потокобезопасность: два одновременных `phobos_put` из разных потоков — работает или нет; итог задаёт значение `max_inflight`.
+- [x] Потокобезопасность: libphobos однопоточна, один `phobos_put` пишет на один носитель — см. [M0-02](spikes/M0-02-libphobos-api.md) и [ADR-0007](adr/0007-mover-worker.md); вместо `max_inflight` два пула процессов-воркеров.
 - [ ] Есть ли в API способ узнать ленту и смещение объекта (для сортировки restore).
 - [ ] Кто выгружает ленту из драйва перед unload в штатном потоке TLC.
 - [ ] Может ли бэкенд versitygw влиять на код ответа RestoreObject (200 / 202 / 409).

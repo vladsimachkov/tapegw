@@ -18,7 +18,7 @@ tapegw»: это то, что влияет на `config`, план и огран
 | № | Вопрос из M0 | Файл | Статус |
 | --- | --- | --- | --- |
 | 1 | Phobos + LTFS в контейнере EL9, `phobos put/get/delete` на family `dir` | [M0-01](M0-01-el9-build.md) | **закрыт** |
-| 2 | Минимальная cgo-программа: `phobos_init/put/getmd/get/delete` | — | не начат |
+| 2 | Минимальная cgo-программа: `phobos_init/put/getmd/get/delete` | [M0-02](M0-02-libphobos-api.md) | **закрыт** |
 | 3 | Потокобезопасность libphobos → значение `phobos.max_inflight` | [M0-03](M0-03-thread-safety.md) | вывод по коду, стенд не пройден |
 | 4 | Есть ли API для ленты и смещения объекта (сортировка restore) | [M0-04](M0-04-locate-api.md) | **закрыт** |
 | 5 | Кто выгружает ленту из драйва перед unload в штатном потоке TLC | [M0-05](M0-05-eject-before-unload.md) | **закрыт** |
