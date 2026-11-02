@@ -1,0 +1,28 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Generated protobuf code is committed on purpose (see docs/ARCHITECTURE.md,
+# internal/tlc/proto). Anything else generated at build time is not.
+*.pb.go.tmp
+
+# Local editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local runtime state
+*.log
+/local/
+/dev/
+.env
+.env.*
+!.env.example
+
+# Spikes are developed outside the main tree (docs/ARCHITECTURE.md, M0)
+/spikes/
