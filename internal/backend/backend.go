@@ -12,9 +12,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/versity/versitygw/auth"
 	vbackend "github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
@@ -54,8 +54,13 @@ func (t *TapeGW) String() string { return "tapegw" }
 // через meta.Close, здесь только то, что принадлежит бэкенду.
 func (t *TapeGW) Shutdown() {}
 
-// owner извлекает аккаунт запроса. versitygw кладёт его в контекст под ключом
-// "bucket-owner" — тот же приём, что использует posix-бэкенд.
+// owner извлекает аккаунт запроса. Кладёт его в контекст сам versitygw под
+// ключом "bucket-owner" (s3api/internal/httpctx: ContextKeyBucketOwner).
+//
+// Типизированный доступ utils.ContextKeyBucketOwner.Get требует fiber.Ctx,
+// а в бэкенд приходит обычный context.Context (versitygw сам делает
+// ctx.RequestCtx()), поэтому остаётся строковый ключ — тот же приём, что у
+// posix-бэкенда.
 func owner(ctx context.Context) string {
 	if acct, ok := ctx.Value("bucket-owner").(auth.Account); ok && acct.Access != "" {
 		return acct.Access
@@ -64,29 +69,45 @@ func owner(ctx context.Context) string {
 }
 
 // ListBuckets — ListObjects для бакетов. В режиме администратора versitygw
-// просит все бакеты (Owner пустой).
+// просит все бакеты (Owner пустой). Префикс, max-buckets и continuation token
+// обрабатывает SQL — см. meta.ListBuckets.
 func (t *TapeGW) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
 	ownerFilter := input.Owner
 	if input.IsAdmin {
 		ownerFilter = ""
 	}
 
-	buckets, err := t.meta.ListBuckets(ctx, ownerFilter)
+	after, err := meta.DecodeToken(input.ContinuationToken)
+	if err != nil {
+		return s3response.ListAllMyBucketsResult{}, s3err.GetAPIError(s3err.ErrInvalidToken)
+	}
+
+	buckets, next, err := t.meta.ListBuckets(ctx, meta.ListBucketsOpt{
+		Owner:  ownerFilter,
+		Prefix: input.Prefix,
+		Max:    int(input.MaxBuckets),
+		After:  after,
+	})
 	if err != nil {
 		return s3response.ListAllMyBucketsResult{}, mapMetaErr(err, "")
 	}
 
 	res := s3response.ListAllMyBucketsResult{
-		Owner: s3response.CanonicalUser{ID: ownerFilter, DisplayName: ownerFilter},
+		Owner:             s3response.CanonicalUser{ID: ownerFilter, DisplayName: ownerFilter},
+		Prefix:            input.Prefix,
+		ContinuationToken: input.ContinuationToken,
 	}
 	for _, b := range buckets {
-		if input.Prefix != "" && !strings.HasPrefix(b.Name, input.Prefix) {
-			continue
-		}
 		res.Buckets.Bucket = append(res.Buckets.Bucket, s3response.ListAllMyBucketsEntry{
 			Name:         b.Name,
 			CreationDate: b.CreatedAt,
 		})
+	}
+	// В ListAllMyBucketsResult versitygw нет отдельного поля NextContinuationToken:
+	// по соглашению самих бэкендов (см. backend/azure) следующим токеном служит
+	// то же поле ContinuationToken.
+	if next != "" {
+		res.ContinuationToken = next
 	}
 	return res, nil
 }
@@ -104,29 +125,33 @@ func (t *TapeGW) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, 
 		return err
 	}
 
-	tags, err := parseBucketTags(input)
+	// Разбор тегов берём из versitygw: там уже есть лимит в 50 тегов и нужные
+	// коды ошибок (правило 5).
+	var rawTags []types.Tag
+	if input.CreateBucketConfiguration != nil {
+		rawTags = input.CreateBucketConfiguration.Tags
+	}
+	tags, err := vbackend.ParseCreateBucketTags(rawTags)
 	if err != nil {
 		return err
 	}
 
-	existing, err := t.meta.CreateBucket(ctx, name, owner(ctx), defaultACL)
-	if err != nil {
-		if errors.Is(err, meta.ErrBucketOwnedByOther) {
-			return s3err.GetBucketErr(s3err.ErrBucketAlreadyOwnedByYou, name)
-		}
+	// Теги пишутся тем же INSERT, что и бакет: отдельным запросом они бы
+	// потерялись при падении между запросами, а клиент получил бы 200.
+	existing, err := t.meta.CreateBucket(ctx, name, owner(ctx), defaultACL, tags)
+	switch {
+	case err == nil && existing:
+		// Имя занято нашим же бакетом. В AWS это 409 BucketAlreadyOwnedByYou,
+		// а не 200 — см. backend/posix/posix.go.
+		return s3err.GetBucketErr(s3err.ErrBucketAlreadyOwnedByYou, name)
+	case err == nil:
+		return nil
+	case errors.Is(err, meta.ErrBucketOwnedByOther):
+		// Имя занято чужим бакетом.
+		return s3err.GetBucketErr(s3err.ErrBucketAlreadyExists, name)
+	default:
 		return mapMetaErr(err, name)
 	}
-	if existing {
-		// Повторный CreateBucket тем же владельцем в AWS завершается 200.
-		return nil
-	}
-
-	if len(tags) > 0 {
-		if err := t.meta.SetBucketTags(ctx, name, tags); err != nil {
-			return mapMetaErr(err, name)
-		}
-	}
-	return nil
 }
 
 func (t *TapeGW) DeleteBucket(ctx context.Context, bucket string) error {
@@ -191,21 +216,6 @@ func (t *TapeGW) DeleteBucketTagging(ctx context.Context, bucket string) error {
 // InternalError не надо — это делает ProcessController в versitygw.
 func mapMetaErr(err error, bucket string) error {
 	return tapegwerr.FromMeta(err, bucket)
-}
-
-func parseBucketTags(input *s3.CreateBucketInput) (map[string]string, error) {
-	if input.CreateBucketConfiguration == nil ||
-		input.CreateBucketConfiguration.Tags == nil {
-		return nil, nil
-	}
-	out := make(map[string]string, len(input.CreateBucketConfiguration.Tags))
-	for _, tag := range input.CreateBucketConfiguration.Tags {
-		if tag.Key == nil || tag.Value == nil {
-			return nil, s3err.GetAPIError(s3err.ErrInvalidTagKey)
-		}
-		out[*tag.Key] = *tag.Value
-	}
-	return out, nil
 }
 
 // validateBucketName — быстрая проверка до обращения к БД. Полные правила

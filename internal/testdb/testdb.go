@@ -2,18 +2,26 @@
 //
 // Тесты, которым нужна база, помечаются пропуском, если база недоступна:
 // правило 2 из AGENTS.md требует, чтобы `go test ./...` проходило на любом
-// Linux. Запускать так:
+// Linux. Запуск:
 //
 //	docker run -d --name tapegw-pg -p 55432:5432 \
 //	  -e POSTGRES_USER=tapegw -e POSTGRES_PASSWORD=tapegw -e POSTGRES_DB=phobos \
 //	  postgres:16-alpine
 //	TAPEGW_TEST_DSN='postgres://tapegw:tapegw@localhost:55432/phobos?search_path=tapegw_test' \
 //	  go test ./...
+//
+// Каждый тестовый пакет получает собственную схему. Пакеты гоняются
+// параллельно и делят один сервер, а TRUNCATE общей схемы у одного пакета
+// превратился бы в случайные падения у другого.
 package testdb
 
 import (
 	"context"
+	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +41,8 @@ func Connect(t *testing.T) *meta.Meta {
 		t.Skipf("%s не задан — пропускаем тест, которому нужен Postgres", DSNEnv)
 	}
 
+	dsn = withSchema(dsn, packageSchema(t))
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 
@@ -50,7 +60,7 @@ func Connect(t *testing.T) *meta.Meta {
 }
 
 // Clean удаляет данные из таблиц, чтобы тесты не зависели от порядка запуска.
-// Схему не дропаем: параллельные тесты в одном пакете делят одну базу.
+// Схема своя на пакет, поэтому TRUNCATE безопасен.
 func Clean(t *testing.T, m *meta.Meta) {
 	t.Helper()
 	_, err := m.Pool.Exec(context.Background(), `
@@ -58,4 +68,31 @@ func Clean(t *testing.T, m *meta.Meta) {
 	if err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
+}
+
+// packageSchema даёт схеме имя по имени тестового бинаря: backend.test →
+// tapegw_test_backend. Детерминированно, поэтому схему можно почистить руками.
+func packageSchema(t *testing.T) string {
+	t.Helper()
+	base := strings.TrimSuffix(filepath.Base(os.Args[0]), ".test")
+	base = nonIdent.ReplaceAllString(base, "_")
+	if base == "" {
+		base = "default"
+	}
+	return "tapegw_test_" + base
+}
+
+var nonIdent = regexp.MustCompile(`[^a-z0-9_]`)
+
+// withSchema подменяет search_path в DSN. Ошибку парсинга не прячем: кривой
+// DSN в тесте должен быть виден сразу.
+func withSchema(dsn, schema string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return dsn
+	}
+	q := u.Query()
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+	return u.String()
 }

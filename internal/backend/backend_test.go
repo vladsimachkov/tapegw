@@ -74,17 +74,25 @@ func TestBucketLifecycle(t *testing.T) {
 	}
 }
 
-// Повторный CreateBucket тем же владельцем в AWS — 200, а не ошибка: на это
-// опираются `aws s3 mb --region ...` в скриптах и идемпотентные повторные
-// попытки клиента.
-func TestCreateBucketIdempotentForSameOwner(t *testing.T) {
+// Коды при повторном CreateBucket берём один в один из posix-бэкенда
+// versitygw (backend/posix/posix.go): свой бакет — BucketAlreadyOwnedByYou,
+// чужой — BucketAlreadyExists. Оба 409, но разные: по коду клиент решает,
+// повторять ли попытку.
+
+func TestCreateBucketAlreadyOwnedByYou(t *testing.T) {
 	be, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
-	for i := range 3 {
-		if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("dup")}, nil); err != nil {
-			t.Fatalf("CreateBucket #%d: %v", i+1, err)
-		}
+	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("dup")}, nil); err != nil {
+		t.Fatalf("первый CreateBucket: %v", err)
+	}
+
+	err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("dup")}, nil)
+	if err == nil {
+		t.Fatal("повторный CreateBucket своего бакета должен ошибаться, как в AWS")
+	}
+	if !isS3Code(err, s3err.ErrBucketAlreadyOwnedByYou) {
+		t.Errorf("ожидали BucketAlreadyOwnedByYou, получили %v", err)
 	}
 }
 
@@ -99,8 +107,80 @@ func TestCreateBucketOtherOwner(t *testing.T) {
 	if err == nil {
 		t.Fatal("чужой бакет должен быть ошибкой")
 	}
-	if !isS3Code(err, s3err.ErrBucketAlreadyOwnedByYou) {
-		t.Errorf("ожидали BucketAlreadyOwnedByYou, получили %v", err)
+	if !isS3Code(err, s3err.ErrBucketAlreadyExists) {
+		t.Errorf("ожидали BucketAlreadyExists, получили %v", err)
+	}
+}
+
+// Мягкое удаление освобождает имя: rb -> mb должно работать, хотя строка
+// бакета остаётся в таблице, потому что на неё ссылаются objects.
+func TestBucketNameReusableAfterDelete(t *testing.T) {
+	be, _ := newBackend(t)
+	ctx := ownerCtx("alice")
+
+	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("reuse")}, nil); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	if err := be.DeleteBucket(ctx, "reuse"); err != nil {
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+	if _, err := be.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: ptr("reuse")}); err == nil {
+		t.Fatal("удалённый бакет не должен отвечать на HEAD")
+	}
+	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("reuse")}, nil); err != nil {
+		t.Fatalf("повторный CreateBucket после удаления: %v", err)
+	}
+}
+
+// Префикс и max-buckets должны фильтроваться в SQL, а не в Go.
+func TestListBucketsPrefixAndPaging(t *testing.T) {
+	be, _ := newBackend(t)
+	ctx := ownerCtx("alice")
+
+	for _, name := range []string{"aa-1", "aa-2", "aa-3", "bb-1"} {
+		if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr(name)}, nil); err != nil {
+			t.Fatalf("CreateBucket %s: %v", name, err)
+		}
+	}
+
+	page1, err := be.ListBuckets(ctx, s3response.ListBucketsInput{Owner: "alice", MaxBuckets: 2})
+	if err != nil {
+		t.Fatalf("ListBuckets: %v", err)
+	}
+	if len(page1.Buckets.Bucket) != 2 {
+		t.Fatalf("страница 1 вернула %d бакетов, ожидали 2", len(page1.Buckets.Bucket))
+	}
+	if page1.ContinuationToken == "" {
+		t.Fatal("при обрезке по max-buckets должен вернуться токен продолжения")
+	}
+
+	page2, err := be.ListBuckets(ctx, s3response.ListBucketsInput{
+		Owner: "alice", MaxBuckets: 2, ContinuationToken: page1.ContinuationToken,
+	})
+	if err != nil {
+		t.Fatalf("ListBuckets page 2: %v", err)
+	}
+	if len(page2.Buckets.Bucket) != 2 {
+		t.Errorf("страница 2 вернула %d бакетов, ожидали 2", len(page2.Buckets.Bucket))
+	}
+
+	// Токен не должен пересекаться с первой страницей.
+	seen := map[string]bool{}
+	for _, b := range page1.Buckets.Bucket {
+		seen[b.Name] = true
+	}
+	for _, b := range page2.Buckets.Bucket {
+		if seen[b.Name] {
+			t.Errorf("бакет %s попал на обе страницы", b.Name)
+		}
+	}
+
+	filtered, err := be.ListBuckets(ctx, s3response.ListBucketsInput{Owner: "alice", Prefix: "aa-"})
+	if err != nil {
+		t.Fatalf("ListBuckets prefix: %v", err)
+	}
+	if len(filtered.Buckets.Bucket) != 3 {
+		t.Errorf("по префиксу aa- получили %d, ожидали 3", len(filtered.Buckets.Bucket))
 	}
 }
 

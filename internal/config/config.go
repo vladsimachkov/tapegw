@@ -6,6 +6,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -36,47 +37,58 @@ type Config struct {
 // Root — учётная запись администратора S3. versitygw требует непустые access/secret,
 // поэтому значения обязательны.
 type Root struct {
-	Access string `yaml:"access" env:"ROOT_ACCESS"`
-	Secret string `yaml:"secret" env:"ROOT_SECRET"`
+	Access string `yaml:"access"`
+	Secret string `yaml:"secret"`
 }
 
 type S3 struct {
-	Listen              []string `yaml:"listen" env:"S3_LISTEN"`
-	Region              string   `yaml:"region" env:"S3_REGION"`
-	TLS                 TLS      `yaml:"tls"`
-	IAMDir              string   `yaml:"iam_dir" env:"S3_IAM_DIR"`
-	DefaultStorageClass string   `yaml:"default_storage_class" env:"S3_DEFAULT_STORAGE_CLASS"`
+	Listen []string `yaml:"listen"`
+	Region string   `yaml:"region"`
+	TLS    TLS      `yaml:"tls"`
+	IAMDir string   `yaml:"iam_dir"`
+	// AcceptAsGlacier — дополнительные значения x-amz-storage-class, которые
+	// принимаем как GLACIER. Нужен бэкап-софту, жёстко прошитому на STANDARD.
+	// Пусто = принимаем только GLACIER и DEEP_ARCHIVE. См. ADR-0003.
+	AcceptAsGlacier []string `yaml:"accept_as_glacier"`
 	// HealthPath — путь health-эндпоинта на S3-порту. Пусто — эндпоинт выключен.
-	HealthPath string `yaml:"health_path" env:"S3_HEALTH_PATH"`
+	HealthPath string `yaml:"health_path"`
 	// MaxConnections и MaxRequests прокидываются в лимитер versitygw.
-	MaxConnections    int `yaml:"max_connections" env:"S3_MAX_CONNECTIONS"`
-	MaxRequests       int `yaml:"max_requests" env:"S3_MAX_REQUESTS"`
-	MultipartMaxParts int `yaml:"multipart_max_parts" env:"S3_MULTIPART_MAX_PARTS"`
+	MaxConnections    int `yaml:"max_connections"`
+	MaxRequests       int `yaml:"max_requests"`
+	MultipartMaxParts int `yaml:"multipart_max_parts"`
 }
 
 type TLS struct {
-	Cert string `yaml:"cert" env:"S3_TLS_CERT"`
-	Key  string `yaml:"key" env:"S3_TLS_KEY"`
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
 }
 
 type DB struct {
-	DSN            string        `yaml:"dsn" env:"DB_DSN"`
-	MaxConns       int32         `yaml:"max_conns" env:"DB_MAX_CONNS"`
-	ConnectTimeout time.Duration `yaml:"connect_timeout" env:"DB_CONNECT_TIMEOUT"`
+	DSN            string        `yaml:"dsn"`
+	MaxConns       int32         `yaml:"max_conns"`
+	ConnectTimeout time.Duration `yaml:"connect_timeout"`
 	// MigrateOnStart — применять миграции при старте. По умолчанию да.
-	MigrateOnStart *bool `yaml:"migrate_on_start" env:"DB_MIGRATE_ON_START"`
+	MigrateOnStart *bool `yaml:"migrate_on_start"`
+	// AdvisoryLockTimeout — сколько ждём pg_advisory_xact_lock на ключе перед
+	// отказом (ADR-0005). Зависший PUT хуже отказа: лок может держать транзакция,
+	// которая ждёт ленту.
+	AdvisoryLockTimeout time.Duration `yaml:"advisory_lock_timeout"`
 }
 
 type Spool struct {
-	Landing          string        `yaml:"landing" env:"SPOOL_LANDING"`
-	Cache            string        `yaml:"cache" env:"SPOOL_CACHE"`
+	Landing          string        `yaml:"landing"`
+	Cache            string        `yaml:"cache"`
 	LandingWatermark Watermark     `yaml:"landing_watermark"`
 	CacheWatermark   Watermark     `yaml:"cache_watermark"`
-	MPUTTL           time.Duration `yaml:"mpu_ttl" env:"SPOOL_MPU_TTL"`
-	OrphanGrace      time.Duration `yaml:"orphan_grace" env:"SPOOL_ORPHAN_GRACE"`
+	MPUTTL           time.Duration `yaml:"mpu_ttl"`
+	OrphanGrace      time.Duration `yaml:"orphan_grace"`
 	// SlowDownHeadroom — на сколько процентов выше high watermark ещё можно
-	// принимать PUT. См. ADR про SlowDown.
-	SlowDownHeadroom int `yaml:"slowdown_headroom" env:"SPOOL_SLOWDOWN_HEADROOM"`
+	// принимать PUT. Только операции записи: DeleteObject блокировать нельзя,
+	// он диск и освобождает (ADR-0002).
+	SlowDownHeadroom int `yaml:"slowdown_headroom"`
+	// EvictRetries — сколько раз GET перечитывает состояние, если файл спула
+	// исчез между решением и open (ADR-0004).
+	EvictRetries int `yaml:"evict_retries"`
 }
 
 // Watermark — пороги вытеснения в процентах занятого объёма тома.
@@ -86,13 +98,13 @@ type Watermark struct {
 }
 
 type Phobos struct {
-	Family       string            `yaml:"family" env:"PHOBOS_FAMILY"`
-	Layout       string            `yaml:"layout" env:"PHOBOS_LAYOUT"`
+	Family       string            `yaml:"family"`
+	Layout       string            `yaml:"layout"`
 	LayoutParams map[string]string `yaml:"layout_params"`
 	Tags         []string          `yaml:"tags"`
 	// MaxInflight — размер пула горутин, имеющих право вызывать libphobos.
 	// До подтверждения потокобезопасности (спайк M0-3) держим 1.
-	MaxInflight int `yaml:"max_inflight" env:"PHOBOS_MAX_INFLIGHT"`
+	MaxInflight int `yaml:"max_inflight"`
 }
 
 // Worker — настройки одного фоновыего воркера (migrator или recaller).
@@ -104,17 +116,17 @@ type Worker struct {
 }
 
 type Metrics struct {
-	Listen string `yaml:"listen" env:"METRICS_LISTEN"`
+	Listen string `yaml:"listen"`
 }
 
 type Admin struct {
-	Listen     string `yaml:"listen" env:"ADMIN_LISTEN"`
-	PathPrefix string `yaml:"path_prefix" env:"ADMIN_PATH_PREFIX"`
+	Listen     string `yaml:"listen"`
+	PathPrefix string `yaml:"path_prefix"`
 }
 
 type Logging struct {
-	Level  string `yaml:"level" env:"LOG_LEVEL"`
-	Format string `yaml:"format" env:"LOG_FORMAT"`
+	Level  string `yaml:"level"`
+	Format string `yaml:"format"`
 }
 
 // Version — заполняется сборкой через -ldflags, не из конфига.
@@ -203,19 +215,20 @@ func Default() *Config {
 	yes := true
 	return &Config{
 		S3: S3{
-			Listen:              []string{":7070"},
-			Region:              "us-east-1",
-			DefaultStorageClass: "GLACIER",
-			HealthPath:          "/health",
-			MaxConnections:      50000,
-			MaxRequests:         50000,
-			MultipartMaxParts:   10000,
+			Listen:            []string{":7070"},
+			Region:            "us-east-1",
+			AcceptAsGlacier:   nil,
+			HealthPath:        "/health",
+			MaxConnections:    50000,
+			MaxRequests:       50000,
+			MultipartMaxParts: 10000,
 		},
 		DB: DB{
-			DSN:            "postgres://tapegw@localhost/phobos?search_path=tapegw",
-			MaxConns:       20,
-			ConnectTimeout: 10 * time.Second,
-			MigrateOnStart: &yes,
+			DSN:                 "postgres://tapegw@localhost/phobos?search_path=tapegw",
+			MaxConns:            20,
+			ConnectTimeout:      10 * time.Second,
+			MigrateOnStart:      &yes,
+			AdvisoryLockTimeout: 30 * time.Second,
 		},
 		Spool: Spool{
 			Landing:          "/srv/tapegw/landing",
@@ -225,6 +238,7 @@ func Default() *Config {
 			MPUTTL:           168 * time.Hour,
 			OrphanGrace:      24 * time.Hour,
 			SlowDownHeadroom: 5,
+			EvictRetries:     2,
 		},
 		Phobos: Phobos{
 			Family:       "tape",
@@ -262,7 +276,11 @@ func Load(path string) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
-		if err := yaml.Unmarshal(data, cfg); err != nil {
+		// Строгий режим: опечатка в имени поля должна быть ошибкой запуска,
+		// а не молчаливым «поле не применилось».
+		dec := yaml.NewDecoder(bytes.NewReader(data))
+		dec.KnownFields(true)
+		if err := dec.Decode(cfg); err != nil {
 			return nil, fmt.Errorf("parse config %v: %w", path, err)
 		}
 	}
@@ -404,10 +422,13 @@ func (c *Config) Validate() error {
 	if len(c.S3.Listen) == 0 {
 		add("s3.listen: нужен хотя бы один адрес")
 	}
-	switch strings.ToLower(c.S3.DefaultStorageClass) {
-	case "glacier", "standard":
-	default:
-		add("s3.default_storage_class: %q, ожидаются GLACIER или STANDARD", c.S3.DefaultStorageClass)
+	for _, alias := range c.S3.AcceptAsGlacier {
+		if strings.TrimSpace(alias) == "" {
+			add("s3.accept_as_glacier: пустая строка в списке")
+		}
+		if IsGlacierClass(alias) {
+			add("s3.accept_as_glacier: %q уже является glacier-классом, дублировать не нужно", alias)
+		}
 	}
 	if (c.S3.TLS.Cert == "") != (c.S3.TLS.Key == "") {
 		add("s3.tls: cert и key задаются парой")
@@ -419,27 +440,32 @@ func (c *Config) Validate() error {
 		add("db.max_conns: %d, должно быть >= 1", c.DB.MaxConns)
 	}
 
-	for name, w := range map[string]Worker{"migrator": c.Migrator, "recaller": c.Recaller} {
-		if w.BatchMaxObjects < 1 {
-			add("%s.batch_max_objects: %d, должно быть >= 1", name, w.BatchMaxObjects)
+	// Порядок проверок фиксирован: map в Go обходится в случайном порядке,
+	// а текст ошибки конфигурации должен быть предсказуемым.
+	for _, w := range []struct {
+		name string
+		w    Worker
+	}{{"migrator", c.Migrator}, {"recaller", c.Recaller}} {
+		if w.w.BatchMaxObjects < 1 {
+			add("%s.batch_max_objects: %d, должно быть >= 1", w.name, w.w.BatchMaxObjects)
 		}
-		if w.MaxAttempts < 1 {
-			add("%s.max_attempts: %d, должно быть >= 1", name, w.MaxAttempts)
+		if w.w.MaxAttempts < 1 {
+			add("%s.max_attempts: %d, должно быть >= 1", w.name, w.w.MaxAttempts)
 		}
-		if w.BatchMaxWait < 0 {
-			add("%s.batch_max_wait: %v, не может быть отрицательным", name, w.BatchMaxWait)
+		if w.w.BatchMaxWait < 0 {
+			add("%s.batch_max_wait: %v, не может быть отрицательным", w.name, w.w.BatchMaxWait)
 		}
 	}
 
-	for name, wm := range map[string]Watermark{
-		"spool.landing_watermark": c.Spool.LandingWatermark,
-		"spool.cache_watermark":   c.Spool.CacheWatermark,
-	} {
-		if wm.High < 1 || wm.High > 100 {
-			add("%s.high: %d, ожидается 1..100", name, wm.High)
+	for _, wm := range []struct {
+		name string
+		wm   Watermark
+	}{{"spool.landing_watermark", c.Spool.LandingWatermark}, {"spool.cache_watermark", c.Spool.CacheWatermark}} {
+		if wm.wm.High < 1 || wm.wm.High > 100 {
+			add("%s.high: %d, ожидается 1..100", wm.name, wm.wm.High)
 		}
-		if wm.Low < 1 || wm.Low >= wm.High {
-			add("%s.low: %d, должно быть 1..high-1 (high=%d)", name, wm.Low, wm.High)
+		if wm.wm.Low < 1 || wm.wm.Low >= wm.wm.High {
+			add("%s.low: %d, должно быть 1..high-1 (high=%d)", wm.name, wm.wm.Low, wm.wm.High)
 		}
 	}
 	if c.Spool.SlowDownHeadroom < 0 || c.Spool.SlowDownHeadroom > 100-c.Spool.LandingWatermark.High {
@@ -454,6 +480,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Spool.OrphanGrace <= 0 {
 		add("spool.orphan_grace: %v, должно быть > 0", c.Spool.OrphanGrace)
+	}
+	if c.Spool.EvictRetries < 0 {
+		add("spool.evict_retries: %d, должно быть >= 0", c.Spool.EvictRetries)
+	}
+	if c.DB.AdvisoryLockTimeout <= 0 {
+		add("db.advisory_lock_timeout: %v, должно быть > 0", c.DB.AdvisoryLockTimeout)
 	}
 
 	if c.Phobos.MaxInflight < 1 {
@@ -477,4 +509,44 @@ func (c *Config) Validate() error {
 // MigrateOnStartValue безопаснее, чем разыменовывать *bool напрямую.
 func (c *Config) MigrateOnStartValue() bool {
 	return c.DB.MigrateOnStart != nil && *c.DB.MigrateOnStart
+}
+
+// GlacierClass — единственный класс хранения, который tapegw реально даёт.
+const GlacierClass = "GLACIER"
+
+// DeepArchiveClass принимается как синоним GLACIER: клиент, написанный под
+// Glacier Deep Archive, получает то же поведение ленты. Отказывать ему смысла
+// нет — разница с Glacier у нас только в SLA, которого в MVP нет.
+const DeepArchiveClass = "DEEP_ARCHIVE"
+
+// IsGlacierClass — нужно ли архивировать объект с таким storage class.
+// Пустой заголовок трактуется как GLACIER: клиент не выразил намерение,
+// и мы применяем default_storage_class (ADR-0003).
+func IsGlacierClass(class string) bool {
+	switch strings.ToUpper(strings.TrimSpace(class)) {
+	case "", GlacierClass, DeepArchiveClass:
+		return true
+	}
+	return false
+}
+
+// StorageClassAction решает, что делать с входящим x-amz-storage-class
+// (ADR-0003). Возвращает канонический класс, который запишем в метаданные,
+// либо ошибку — тогда бэкенд отвечает NotImplemented.
+//
+// Пустой заголовок = клиент намерение не выражал = наш класс по умолчанию.
+// Алиасы из s3.accept_as_glacier нужны бэкап-софту, жёстко прошитому на
+// STANDARD: молча проигнорировать чужой класс хуже, чем отказаться, потому что
+// клиент решит, что у него быстрый класс, а читать он будет с ленты.
+func (c *Config) StorageClassAction(class string) (string, error) {
+	norm := strings.ToUpper(strings.TrimSpace(class))
+	if IsGlacierClass(norm) {
+		return GlacierClass, nil
+	}
+	for _, alias := range c.S3.AcceptAsGlacier {
+		if strings.EqualFold(strings.TrimSpace(alias), norm) {
+			return GlacierClass, nil
+		}
+	}
+	return "", fmt.Errorf("storage class %q не поддерживается: tapegw хранит всё на ленте", class)
 }

@@ -177,7 +177,8 @@ func TestValidateRejectsBadWatermarks(t *testing.T) {
 		{"headroom за пределами", func(c *Config) { c.Spool.SlowDownHeadroom = 50 }},
 		{"bad family", func(c *Config) { c.Phobos.Family = "floppy" }},
 		{"max_inflight 0", func(c *Config) { c.Phobos.MaxInflight = 0 }},
-		{"bad storage class", func(c *Config) { c.S3.DefaultStorageClass = "DEEP" }},
+		{"пустой алиас в accept_as_glacier", func(c *Config) { c.S3.AcceptAsGlacier = []string{"STANDARD", " "} }},
+		{"алиас, который и так glacier", func(c *Config) { c.S3.AcceptAsGlacier = []string{"GLACIER"} }},
 		{"bad log format", func(c *Config) { c.Logging.Format = "yaml" }},
 		{"нет listen", func(c *Config) { c.S3.Listen = nil }},
 	}
@@ -232,5 +233,28 @@ func TestLoadEmptyPathIsEnvOnly(t *testing.T) {
 	}
 	if cfg.Root.Access != "acc" || cfg.Root.Secret != "sec" {
 		t.Errorf("root из окружения не подхвачен: %+v", cfg.Root)
+	}
+}
+
+func TestStrictYAMLRejectsUnknownFields(t *testing.T) {
+	// Опечатка в имени поля должна быть ошибкой запуска. Молча проигнорированное
+	// поле — самый противный класс отказов: сервис стартует и работает «не так».
+	_, err := Load(writeConfig(t, "s3:\n  regin: typo\n"))
+	if err == nil {
+		t.Fatal("ожидали ошибку на неизвестном поле regin")
+	}
+}
+
+func TestIsGlacierClass(t *testing.T) {
+	// Пустой заголовок = клиент не выразил намерения = наш класс по умолчанию.
+	for _, in := range []string{"", "GLACIER", "glacier", " DEEP_ARCHIVE ", "Deep_Archive"} {
+		if !IsGlacierClass(in) {
+			t.Errorf("IsGlacierClass(%q) = false", in)
+		}
+	}
+	for _, in := range []string{"STANDARD", "REDUCED_REDUNDANCY", "INTELLIGENT_TIERING", "GLACIER_IR"} {
+		if IsGlacierClass(in) {
+			t.Errorf("IsGlacierClass(%q) = true, а этот класс надо отвергать или объявлять алиасом", in)
+		}
 	}
 }

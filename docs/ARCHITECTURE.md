@@ -124,7 +124,9 @@ CREATE TABLE upload_parts (
 Правила:
 
 - Перезапись ключа = новая строка `objects` с новым UUID; в той же транзакции старая получает `is_current=false, state='deleting'`. Клиент, читающий параллельно, видит либо старую, либо новую версию.
+- Транзакции, меняющие текущую версию ключа, **сериализуются advisory-локом** `pg_advisory_xact_lock(hashtextextended(bucket || '/' || key, 0))`, взятым до чтения состояния (ADR-0005). Без него два параллельных PUT одного ключа сталкиваются в `unique_violation` по индексу `objects_current`, а на первой записи ключа текущей строки нет вообще и ретраить нечего. `DeleteObjects` берёт локи в детерминированном порядке, иначе два батча с пересечением ключей взаимоблокируются.
 - Объект «онлайн» (GET без restore), если `landing=true` или в `restores` состояние `restored`.
+- Входящий `x-amz-storage-class` принимается только как «на ленту»: пусто, `GLACIER`, `DEEP_ARCHIVE`, плюс алиасы из `s3.accept_as_glacier`. Остальное — `NotImplemented` (ADR-0003).
 - Файлы на диске адресуются только по UUID: `landing/<2 hex>/<uuid>`, `cache/<2 hex>/<uuid>`, `mpu/<upload_id>/<part>`. Путь не хранится в БД, он вычисляется.
 - В Phobos объект пишется с атрибутами `bucket`, `key`, `etag`, `size`, `content_type`, `created_at`, `user_meta` (JSON). Этого достаточно, чтобы восстановить схему `tapegw` с лент.
 
@@ -152,7 +154,7 @@ CREATE TABLE upload_parts (
 | in\_progress | failed | recaller | `attempts = max` |
 | restored | restored | backend | повторный RestoreObject продлевает `expires_at` |
 | restored | нет записи | janitor | `expires_at < now()`, файл удалён |
-| любое | нет записи | backend | объект ушёл в `deleting` |
+| любое | нет записи | backend | объект ушёл в `deleting`: строка `restores` удаляется в той же транзакции, иначе recaller вечно видит restore у удалённого объекта, а метрики очередей врут |
 
 ## Потоки запросов
 
@@ -188,7 +190,8 @@ CREATE TABLE upload_parts (
 **HeadObject / ListObjects (v1, v2)**
 
 - Только meta DB, лента не трогается. Листинг: префикс, delimiter, `CommonPrefixes`, `max-keys`, `continuation-token` / `marker`, порядок `COLLATE "C"`.
-- Storage class: `STANDARD`, пока объект `pending`/`archiving`; `GLACIER` (значение из `storage_class`) после `archived`.
+- Storage class: **всегда `GLACIER`**, независимо от состояния объекта (ADR-0003). Отклонение «`STANDARD` до архивации» убрано: оно заставляло клиента видеть смену класса без его действий.
+- `x-amz-restore` для архивных объектов: нет записи и нет дисковой копии — заголовка нет; `requested`/`in_progress` — `ongoing-request="true"`; `restored` — `ongoing-request="false", expiry-date="<expires_at>"`; объект ещё не заархивирован (`pending`/`archiving`) — `ongoing-request="false", expiry-date="Fri, 2 Dec 2050 00:00:00 GMT"`, страховочная дата в стиле scoutfs: в этом окне диск — единственный носитель, и обещание держится корректностью, а не политикой.
 - `x-amz-restore` для архивных объектов: нет записи — заголовка нет; `requested`/`in_progress` — `ongoing-request="true"`; `restored` — `ongoing-request="false", expiry-date="…"`.
 
 **RestoreObject**
@@ -197,7 +200,7 @@ CREATE TABLE upload_parts (
 - Нет записи в `restores` → вставить `requested` с `days`, `tier`; ответ 202.
 - Уже `restored` → продлить `expires_at = now() + days`; ответ 200.
 - `requested` / `in_progress` → `RestoreAlreadyInProgress` (409).
-- Проверить, может ли бэкенд versitygw влиять на код ответа 200/202, или контроллер всегда возвращает один код (спайк M0).
+- Код успеха задать нельзя: `backend.Backend.RestoreObject` возвращает только `error`, а контроллер не заполняет `MetaOptions.Status`, поэтому успех — всегда 200. См. ADR-0001, спайк M0 по этой теме не нужен.
 
 **Recaller**
 
@@ -211,7 +214,8 @@ CREATE TABLE upload_parts (
 
 - `landing=true` → отдать из landing. `restored` и не истёк → из cache. Иначе `InvalidObjectState`.
 - Range-запросы и условные заголовки (`If-Match`, `If-None-Match`, `If-Modified-Since`) — поведение как в posix-бэкенде.
-- Файл открывается до ответа, поэтому вытеснение во время чтения безопасно: Linux держит inode до закрытия дескриптора.
+- Файл открывается до ответа, поэтому вытеснение **после** открытия безопасно: Linux держит inode до закрытия дескриптора.
+- Промежуток «прочитали состояние → открыли файл» закрывает ADR-0004: janitor сначала ставит `landing=false` в транзакции и только потом делает `unlink`, а GET на `ENOENT` перечитывает строку и пересчитывает решение (максимум `spool.evict_retries` повторов, затем `InvalidObjectState`, а не `InternalError`).
 
 **CopyObject**
 
@@ -227,6 +231,7 @@ CREATE TABLE upload_parts (
 - Удаляет истёкшие restore: строка из `restores`, файл из cache.
 - Удаляет незавершённые multipart старше `mpu.ttl`.
 - Orphan GC: файлы в landing, cache, mpu без соответствующей строки старше `orphan.grace`.
+- Чистка терминальных строк: `objects` в состояниях `deleted` и `failed` помечаются `retired_at` и физически удаляются старше `meta.terminal_retention` (по умолчанию 90 дней). Без этого таблица растёт всю жизнь системы: каждая перезапись ключа добавляет строку, а по `objects` построены индексы очередей и листинга. `admin verify` на ретайрных строках не ругается, но проверяет, что файлов у них уже нет.
 
 ## Интеграция с Phobos
 
@@ -329,6 +334,8 @@ type Store interface {
 
 **Диски**: landing и mpu — одна XFS с `reflink=1` (быстрый SSD или NVMe, по скорости не ниже суммарной записи драйвов), cache — отдельный том. Лимиты и watermark заданы в процентах тома.
 
+`cache/tmp` обязан быть на той же ФС, что и `cache`: recaller пишет во временный файл и поднимает его `rename`-ом, а `rename` через точки монтирования даёт `EXDEV`. Требование проверяется на старте сравнением `st_dev` и падает с внятной ошибкой, а не на первом restore.
+
 **Конфиг tapegw** (YAML; любое поле переопределяется переменной `TAPEGW_*`):
 
 ```yaml
@@ -388,12 +395,12 @@ metrics: {listen: ":9464"}
 - Архивация: байт/с и объектов/с, длительность батча, ошибки `phobos_put` по коду.
 - Restore: гистограмма «запрос → restored», ошибки `phobos_get`.
 - Диски: заполненность landing и cache, объём, вытесненный janitor.
-- S3: запросы по операции и коду ответа (если versitygw отдаёт свои метрики — использовать их, не дублировать).
+- S3: запросы по операции и коду ответа. Своим экспортёром: versitygw v1.10.0 Prometheus не отдаёт вообще, у него только StatsD/DogStatsD (ADR-0002). Имя S3-действия в контексте versitygw отсутствует, метку `action` выводим сами из метода и query-подресурсов.
 - klipper-tlc: число load/unload, их длительность, ошибки механики, состояние «требует оператора».
 
 **Логи** — `log/slog` в JSON; у каждой записи воркера есть `object_id` и `batch_id`, у S3-запросов — request id из versitygw.
 
-**Health**: `/health/live` (процесс жив) и `/health/ready` (Postgres, `phobosd` и диски доступны, landing ниже high watermark). При landing выше `high` + запас PUT получает `SlowDown` (503): лучше притормозить клиентов, чем переполнить диск.
+**Health**: `/health/live` (процесс жив) и `/health/ready` (Postgres, `phobosd` и диски доступны, landing ниже high watermark). При landing выше `high` + запас PUT получает `SlowDown` (503): лучше притормозить клиентов, чем переполнить диск. Делается это middleware-ом через `embedgw.Config.S3Options` → `s3api.WithMiddleware` — патчить versitygw не нужно. Шов монтируется **до** аутентификации и ограничивает только операции записи (`PutObject`, `UploadPart`, `CompleteMultipartUpload`): блокировать `DeleteObject` означало бы запрещать то, что диск освобождает.
 
 **Админ-API и CLI** (`tapegw admin …`, отдельный порт или префикс `AdminPathPrefix`): список объектов по состоянию, retry для `failed`, принудительное вытеснение из cache, статистика очередей, `rebuild-meta` (M9).
 
@@ -441,7 +448,7 @@ AGENTS.md            краткие правила ниже + команды с�
 2. `go build ./... && go test ./...` проходят на любом Linux без Phobos и без cgo. Всё, что требует Phobos, — под тегом `phobos` и в стенде ci-dir.
 3. Исходники Phobos и versitygw не патчатся. Если без патча нельзя — сначала ADR и вопрос в ревью.
 4. Неподдерживаемые S3-операции возвращают `NotImplemented` через `BackendUnsupported`, а не молча что-то делают.
-5. Поведение, которое уже есть в posix-бэкенде versitygw (валидация ключей, Range, условные заголовки, checksum, коды ошибок), повторяется по его коду, а не придумывается.
+5. Поведение, которое уже есть в versitygw, повторяется по его коду, а не придумывается: для обычных операций — posix-бэкенд (валидация ключей, Range, условные заголовки, checksum), для Glacier-семантики (`x-amz-restore`, storage class, `RestoreObject`) — `backend/scoutfs/scoutfs_compat.go`.
 6. Любое изменение состояния объекта — одна транзакция Postgres. Сначала файл на диске с `fsync`, потом commit. Никогда наоборот.
 7. Каждый воркер идемпотентен: повтор после падения в любой точке приводит к тому же результату. Для каждого воркера есть тест «упасть после шага N».
 8. Ошибки оборачиваются через `fmt.Errorf("…: %w", err)`, логи — `slog`, никаких `panic` вне `main`.

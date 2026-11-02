@@ -8,6 +8,8 @@ Architectural Decision Records. Порядок задан в `docs/ARCHITECTURE.
 
 | № | Название | Статус |
 | --- | --- | --- |
-| [0001](0001-restore-object-status-code.md) | RestoreObject всегда отвечает 200 | предложено |
-| [0002](0002-metrics-transport.md) | Транспорт метрик: свой Prometheus-экспортёр | предложено |
-| [0003](0003-standard-storage-class.md) | Семантика класса STANDARD | ожидает решения владельца, блокирует M1 |
+| [0001](0001-restore-object-status-code.md) | RestoreObject всегда отвечает 200 | принято |
+| [0002](0002-metrics-transport.md) | Транспорт метрик: свой Prometheus-экспортёр | принято |
+| [0003](0003-standard-storage-class.md) | Классы хранения: входящие отвергаем, исходящие всегда GLACIER | принято |
+| [0004](0004-landing-eviction-race.md) | Гонка GET и вытеснения landing-копии | принято |
+| [0005](0005-key-rewrite-advisory-lock.md) | Перезапись ключа: advisory-лок вместо ретрая | принято |
