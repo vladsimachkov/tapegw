@@ -44,6 +44,11 @@ ALTER TABLE tenants
   ADD COLUMN system boolean NOT NULL DEFAULT false;
 UPDATE tenants SET system = true WHERE id = 1;
 ALTER TABLE tenants ADD UNIQUE (id, system);
+-- Системность самого тенанта 1 тоже закрепляется: без этого флага можно
+-- коснуться, и каскад обновит флаг у admin-учёток (проверено). Чек обязан
+-- идти ПОСЛЕ UPDATE выше: на строке с system = false он не пройдёт валидацию.
+ALTER TABLE tenants ADD CONSTRAINT tenants_default_is_system
+  CHECK (id <> 1 OR system);
 
 -- Колонку нельзя добавить сразу NOT NULL: на непустой accounts она будет
 -- содержать NULL, и ALTER упадёт ещё до backfill. Проверено на живом
@@ -72,6 +77,8 @@ ALTER TABLE accounts
 | `role = 'userplus'`, `tenant_id = 2`, `tenant_system = true` | `CHECK` → отказ |
 | `role = 'user'`, `tenant_id = 2`, `tenant_system = false` | ок |
 | `UPDATE ... SET tenant_system = true` для клиентской учётки | `CHECK` → отказ |
+| `UPDATE tenants SET system = false WHERE id = 1` | `CHECK` → отказ |
+| `UPDATE tenants SET system = true` для тенанта с обычными учётками | `CHECK` учёток → отказ через каскад |
 
 То есть записать учётку с неверным флагом нельзя ни в какую сторону, и правило
 видно прямо в схеме. `userplus` под `role = 'admin'` не подпадает, поэтому в
@@ -81,6 +88,18 @@ ALTER TABLE accounts
 отказ при выдаче учётки) и покрывается тестом. Проверка в схеме защищает от
 ручной правки таблицы и от миграции данных, проверка в коде даёт понятный
 `AccessDenied` вместо `SQLSTATE 23514`.
+
+Отдельно закрепляется **системность самого тенанта 1**. Схема выше запрещает
+клиентские учётки в системном тенанте, но не мешает **снять флаг**:
+`UPDATE tenants SET system = false WHERE id = 1` проходит, если в тенанте лежат
+tолько admin-учётки, а каскад `ON UPDATE CASCADE` честно обновит им
+`tenant_system`. После этого в тенант 1 заводится клиент — и все бакеты, созданные
+root, становятся его. Это ровно тот сценарий, ради которого ADR и пишется, поэтому
+закрывается он проверочным ограничением на строку, без межтабличных правил:
+
+```sql
+ALTER TABLE tenants ADD CONSTRAINT tenants_default_is_system CHECK (id <> 1 OR system);
+```
 
 API создания тенантов (появится в T1) **никогда не выдаёт `id = 1`** — он не
 просто «не предлагает» его, а отвергает явную просьбу.
@@ -116,11 +135,20 @@ system = true`.
 ## Проверка
 
 SQL выше прогнан на живом Postgres (схема-копия `tenants` + `accounts` из
-миграции 0005). Миграция проходит, все шесть строк таблицы воспроизводятся с
-указанными ограничениями. Отдельно проверено, что вариант «`ADD COLUMN
-NOT NULL` одной командой» на непустой `accounts` даёт
-`column "tenant_system" ... contains null values` — поэтому последовательность
-зафиксирована здесь, а не оставляется на усмотрение автору миграции.
+миграции 0005). Миграция проходит, все восемь строк таблицы воспроизводятся с
+указанными ограничениями. Отдельно проверено:
+
+- вариант «`ADD COLUMN NOT NULL` одной командой» на непустой `accounts` даёт
+  `column "tenant_system" ... contains null values` — поэтому последовательность
+  зафиксирована здесь, а не оставляется на усмотрение автору миграции;
+- **без** `tenants_default_is_system` снятие флага с `id = 1` проходит, каскад
+  обновляет `tenant_system` у admin-учётки, и после этого `INSERT` клиентской
+  учётки в тенант 1 принимается — то есть дыра реальна, а не теоретическая;
+- чек на `tenants` обязан идти **после** `UPDATE ... SET system = true`, иначе
+  `ALTER TABLE` падает: `check constraint "tenants_default_is_system" ... is
+  violated by some row`;
+- помечать системным тенант **без** учёток можно (нарушать нечему) — это
+  допустимое состояние, а не ошибка.
 
 ## Отклонённые альтернативы
 
