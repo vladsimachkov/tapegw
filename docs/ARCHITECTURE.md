@@ -826,7 +826,10 @@ Postgres: `embedgw.Config.IAMService` принимает нашу реализа
       `legal_hold`; `buckets.versioning`, `object_lock_enabled`, `default_retention`.
       `versionId` — UUID строки `objects`, отдельная нумерация не нужна.
 - [ ] `PutBucketVersioning` / `GetBucketVersioning` (вместо нынешнего «всегда пусто»),
-      `ListObjectVersions`, GET/HEAD/DELETE по `versionId`.
+      `ListObjectVersions`, GET/HEAD/DELETE по `versionId`. **Переход назад в
+      `unversioned` запрещён**: только `unversioned → enabled`, `enabled → suspended`,
+      `suspended → enabled`, как в AWS. Логика PutObject опирается на то, что в бакете
+      без версий текущая версия всегда null-версия. См. ADR-0015.
 - [ ] **ListObjects v2 пишется сразу вместе с ListObjectVersions**, а не сначала
       обычный, потом версионный.
 - [ ] DeleteObject без `versionId` в версионированном бакете = delete marker; с

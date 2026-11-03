@@ -528,3 +528,132 @@ func TestConcurrentOverwriteVersionedOneCurrent(t *testing.T) {
 		t.Errorf("всего строк %d, ожидали %d: ни одна версия не должна теряться", total, n)
 	}
 }
+
+// --- suspended не имеет права трогать обычную версию (блокер ревью V PR#1) ---
+
+// versionState возвращает (is_current, state) версии по её etag.
+func versionState(t *testing.T, m *meta.Meta, bucket, etag string) (bool, string) {
+	t.Helper()
+	var cur bool
+	var state string
+	err := m.Pool.QueryRow(context.Background(),
+		`SELECT is_current, state::text FROM objects
+		  WHERE bucket_id = (SELECT id FROM buckets WHERE name=$1) AND etag=$2`,
+		bucket, etag).Scan(&cur, &state)
+	if err != nil {
+		t.Fatalf("версия %s/%s не найдена: %v", bucket, etag, err)
+	}
+	return cur, state
+}
+
+// Включение версий, запись обычной версии, приостановка и ещё одна запись. По AWS
+// приостановленный бакет заменяет null-версию, а текущую обычную версию трогать
+// нельзя — клиент сохранил её именно ради истории.
+//
+// Прежний код (один запрос WHERE is_current) отправлял v1 в deleting: тихая
+// потеря данных без единой ошибки.
+func TestSuspendedDoesNotDeleteNormalVersion(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "susp2")
+	setVersioning(t, m, "susp2", meta.VersioningEnabled)
+
+	v1 := putInput("susp2", "k")
+	v1.ETag = "v1-normal"
+	if _, err := m.PutObject(ctx, v1); err != nil {
+		t.Fatalf("PUT v1 при enabled: %v", err)
+	}
+
+	setVersioning(t, m, "susp2", meta.VersioningSuspended)
+	v2 := putInput("susp2", "k")
+	v2.ETag = "v2-null"
+	if _, err := m.PutObject(ctx, v2); err != nil {
+		t.Fatalf("PUT v2 при suspended: %v", err)
+	}
+
+	cur, state := versionState(t, m, "susp2", "v1-normal")
+	if state == "deleting" || state == "deleted" {
+		t.Fatalf("обычная версия v1 удалена (state=%s) — потеря истории", state)
+	}
+	if state != "pending" {
+		t.Errorf("v1 в состоянии %s, ожидали pending", state)
+	}
+	if cur {
+		t.Errorf("v1 осталась текущей после записи null-версии")
+	}
+
+	cur2, state2 := versionState(t, m, "susp2", "v2-null")
+	if !cur2 || state2 != "pending" {
+		t.Errorf("v2: current=%v state=%s, ожидали current и pending", cur2, state2)
+	}
+
+	current, nulls, _ := rowsByKey(t, m, "susp2", "k")
+	if current != 1 {
+		t.Errorf("текущих версий %d, должна быть одна", current)
+	}
+	if nulls != 1 {
+		t.Errorf("null-версий %d, обязана быть ровно одна (v2)", nulls)
+	}
+}
+
+// Тот же ход состояний, но начинаем с null-версии: unversioned → enabled →
+// suspended. Третий PUT обязан пройти.
+//
+// Прежний код на шаге suspended переводил в deleting текущую обычную версию, а
+// INSERT с is_null_version = true упирался в прежнюю null-версию, которая
+// осталась нетекущей с флагом. Транзакция откатывалась, и клиент получал ошибку
+// вместо записи.
+func TestSuspendedAfterEnabledAfterUnversioned(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "cycle")
+
+	steps := []struct {
+		state string
+		etag  string
+	}{
+		{meta.VersioningUnversioned, "n1-null"},
+		{meta.VersioningEnabled, "n2-normal"},
+		{meta.VersioningSuspended, "n3-null"},
+	}
+	for _, st := range steps {
+		setVersioning(t, m, "cycle", st.state)
+		in := putInput("cycle", "k")
+		in.ETag = st.etag
+		if _, err := m.PutObject(ctx, in); err != nil {
+			t.Fatalf("PUT %s при %s: %v", st.etag, st.state, err)
+		}
+	}
+
+	// Обычная версия n2 обязана пережить переход в suspended.
+	cur, state := versionState(t, m, "cycle", "n2-normal")
+	if state == "deleting" || state == "deleted" {
+		t.Fatalf("обычная версия n2 удалена (state=%s)", state)
+	}
+	if cur {
+		t.Errorf("n2 осталась текущей после записи null-версии")
+	}
+
+	// Null-версия n1 заменена: живой null-версией обязана быть n3.
+	cur3, state3 := versionState(t, m, "cycle", "n3-null")
+	if !cur3 || state3 != "pending" {
+		t.Errorf("n3: current=%v state=%s, ожидали current и pending", cur3, state3)
+	}
+	var nullOwner string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT etag FROM objects
+		  WHERE bucket_id = (SELECT id FROM buckets WHERE name='cycle')
+		    AND key='k' AND is_null_version`).Scan(&nullOwner); err != nil {
+		t.Fatalf("null-версия не найдена: %v", err)
+	}
+	if nullOwner != "n3-null" {
+		t.Errorf("null-версией остался %q, ожидали n3-null", nullOwner)
+	}
+
+	current, nulls, _ := rowsByKey(t, m, "cycle", "k")
+	if current != 1 || nulls != 1 {
+		t.Errorf("текущих %d (хотели 1), null-версий %d (хотели 1)", current, nulls)
+	}
+}

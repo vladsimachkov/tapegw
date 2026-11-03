@@ -200,14 +200,34 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 				return fmt.Errorf("retire previous version of %s/%s: %w", in.Bucket, in.Key, err)
 			}
 		} else {
+			// unversioned и suspended — два запроса, а не один, и это не
+			// перестраховка.
+			//
+			// В приостановленном бакете текущей может быть **обычная** версия,
+			// записанная, пока версии были включены. Её удалять нельзя — клиент
+			// сохранил её именно ради истории. По AWS заменяется только
+			// null-версия.
+			//
+			// 1. Текущая обычная версия просто перестаёт быть текущей.
+			if _, err := tx.Exec(ctx,
+				`UPDATE objects
+				    SET is_current = false
+				  WHERE bucket_id = $1 AND key = $2 AND is_current AND NOT is_null_version`,
+				bucketID, in.Key); err != nil {
+				return fmt.Errorf("retire current version of %s/%s: %w", in.Bucket, in.Key, err)
+			}
+
+			// 2. Null-версия заменяется — та, что сейчас текущая, и та, что
+			//    перестала быть текущей раньше. Если не снять флаг здесь, новый
+			//    INSERT с is_null_version = true упрётся в objects_null_version.
 			if _, err := tx.Exec(ctx,
 				`UPDATE objects
 				    SET is_current = false,
 				        state = 'deleting',
 				        is_null_version = false
-				  WHERE bucket_id = $1 AND key = $2 AND is_current`,
+				  WHERE bucket_id = $1 AND key = $2 AND is_null_version`,
 				bucketID, in.Key); err != nil {
-				return fmt.Errorf("retire previous version of %s/%s: %w", in.Bucket, in.Key, err)
+				return fmt.Errorf("replace null version of %s/%s: %w", in.Bucket, in.Key, err)
 			}
 		}
 
