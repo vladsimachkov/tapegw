@@ -21,6 +21,7 @@ import (
 
 	"github.com/vladsimachkov/tapegw/internal/backend"
 	"github.com/vladsimachkov/tapegw/internal/config"
+	"github.com/vladsimachkov/tapegw/internal/iam"
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/spool"
 )
@@ -119,6 +120,27 @@ func run(args []string) error {
 	}
 	if cfg.Admin.Listen != "" {
 		gwCfg.AdminPorts = []string{cfg.Admin.Listen}
+	}
+
+	// Учётки из Postgres включены, когда задан iam.kek_file: без кольца KEK
+	// нечем разворачивать secret_wrapped, а «тихо работать без учёток» —
+	// это отказ, который не видно. Пока поля нет, живёт прежний s3.iam_dir
+	// (или режим одной учётки), поэтому переход в продакшене — один конфиг.
+	if cfg.IAM.KEKFile != "" {
+		ring, err := iam.LoadKeyRing(cfg.IAM.KEKFile, cfg.IAM.KEKVersion)
+		if err != nil {
+			return err
+		}
+		svc, err := iam.New(pool, ring, iam.Options{RootAccess: cfg.Root.Access})
+		if err != nil {
+			return err
+		}
+		// Поле обходит все прочие IAM-бэкенды versitygw, включая iam_dir
+		// (embedgw.go:199), поэтому рядом оно уже не используется.
+		gwCfg.IAMService = svc
+		logger.Info("iam: учётки из Postgres",
+			slog.String("kek_file", cfg.IAM.KEKFile),
+			slog.Int("kek_version", cfg.IAM.KEKVersion))
 	}
 
 	logger.Info("starting s3 gateway",

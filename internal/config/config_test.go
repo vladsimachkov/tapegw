@@ -137,6 +137,8 @@ func TestLoadEnvOverridesYAML(t *testing.T) {
 	t.Setenv("TAPEGW_MIGRATOR_BATCH_MAX_BYTES", "12GiB")
 	t.Setenv("TAPEGW_S3_MAX_OBJECT_SIZE", "2GiB")
 	t.Setenv("TAPEGW_DB_MIGRATE_ON_START", "false")
+	t.Setenv("TAPEGW_IAM_KEK_FILE", "/tmp/kek.json")
+	t.Setenv("TAPEGW_IAM_KEK_VERSION", "3")
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -157,6 +159,11 @@ func TestLoadEnvOverridesYAML(t *testing.T) {
 	}
 	if cfg.MigrateOnStartValue() {
 		t.Error("TAPEGW_DB_MIGRATE_ON_START=false не применён")
+	}
+	// Кольцо KEK настраивается тем же способом, что и остальное (правило 9):
+	// номер версии в проде задаётся переменной в юните, а не файлом конфига.
+	if cfg.IAM.KEKFile != "/tmp/kek.json" || cfg.IAM.KEKVersion != 3 {
+		t.Errorf("iam из env не применён: %+v", cfg.IAM)
 	}
 }
 
@@ -187,6 +194,16 @@ func TestValidateRejectsBadWatermarks(t *testing.T) {
 		{"max_object_size больше батча", func(c *Config) {
 			c.S3.MaxObjectSize = 500 * GiB
 			c.Migrator.BatchMaxBytes = 200 * GiB
+		}},
+		// Учётки: два источника сразу — это «непонятно, кто настоящий»
+		// (embedgw берёт внешний IAMService и молча игнорирует iam_dir).
+		{"iam.kek_file вместе с s3.iam_dir", func(c *Config) {
+			c.IAM.KEKFile = "/etc/tapegw/kek.json"
+			c.S3.IAMDir = "/etc/tapegw/iam"
+		}},
+		{"iam.kek_version без кольца", func(c *Config) {
+			c.IAM.KEKFile = "/etc/tapegw/kek.json"
+			c.IAM.KEKVersion = 0
 		}},
 	}
 
