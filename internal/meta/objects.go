@@ -235,6 +235,7 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 		//
 		// tenant_id и pool_id передаются явно: колонки NOT NULL без DEFAULT
 		// (миграция 0005), чтобы забытый тенант падал, а не писался в первый.
+		// TODO(T1): до стража тенанта — дальше объект получает тенанта параметром.
 		//
 		// is_null_version ставится по состоянию бакета: пока версии не включены,
 		// у объекта versionId = "null" в смысле AWS. Именно эта пометка потом
@@ -250,7 +251,7 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 			           online_until, created_at, archived_at`,
 			in.ID, bucketID, in.Key, in.Size, in.ETag, checksums,
 			in.ContentType, userMeta, in.ACL, tags, in.StorageClass,
-			in.OnlineUntil, DefaultTenantID, DefaultPoolID, nullVersion)
+			in.OnlineUntil, AdminTenantID().arg(), DefaultPoolID, nullVersion)
 		if err != nil {
 			return fmt.Errorf("insert object %s/%s: %w", in.Bucket, in.Key, err)
 		}

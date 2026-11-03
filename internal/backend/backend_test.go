@@ -52,6 +52,15 @@ func newBackendWith(t *testing.T, mutate func(*config.Config)) (*backend.TapeGW,
 	return backend.New(m, land, cfg), m, land
 }
 
+// testProjectID — ProjectID учётки тестового тенанта, а заодно и tenants.id:
+// миграция 0005 заводит единственный тенант `default` с id = 1 и строит
+// соответствие tenants.id == Account.ProjectID.
+const testProjectID = 1
+
+// testTenantID — то же число в виде bigint: тесты, которые готовят строки
+// прямым SQL, подставляют его в колонку tenant_id.
+const testTenantID int64 = testProjectID
+
 // ownerCtx имитирует то, что делает versitygw: кладёт аккаунт запроса в контекст.
 //
 // Ключ — строка, а не типизированный struct{}: именно так делает сам versitygw
@@ -268,7 +277,7 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 		SELECT gen_random_uuid(), (SELECT id FROM buckets WHERE name='full'),
 		       'a.txt', 3, 'd41d8cd98f00b204e9800998ecf8427e', 'archived',
 		       now() + interval '1 day', $1, $2`,
-		meta.DefaultTenantID, meta.DefaultPoolID); err != nil {
+		testTenantID, meta.DefaultPoolID); err != nil {
 		t.Fatalf("подготовка объекта: %v", err)
 	}
 
