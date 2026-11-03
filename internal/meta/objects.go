@@ -132,16 +132,23 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 		//    его и отдаст ErrNotFound.
 		var bucketID int64
 		var versioning string
+		var bucketTenant int64
 		bucketQ, bucketArgs := withTenant(
-			`SELECT id, versioning FROM buckets
+			`SELECT id, versioning, tenant_id FROM buckets
 			  WHERE name = $1 AND deleted_at IS NULL`, tenant, in.Bucket)
-		err := tx.QueryRow(ctx, bucketQ+` FOR SHARE`, bucketArgs...).Scan(&bucketID, &versioning)
+		err := tx.QueryRow(ctx, bucketQ+` FOR SHARE`, bucketArgs...).Scan(&bucketID, &versioning, &bucketTenant)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
 		if err != nil {
 			return fmt.Errorf("lock bucket %q: %w", in.Bucket, err)
 		}
+
+		// Объект наследует тенанта БАКЕТА, а не учётки (ADR-0017 п. 6). У
+		// учётки с обходом по роли тенанта нет вовсе, и подстановка её значения
+		// в objects.tenant_id означала бы FK violation на tenants — то есть 500
+		// на каждый PUT администратором. Фильтр выше при этом не ослабевает:
+		// чужой бакет запрос просто не находит.
 
 		// Пока версии не включены, у объекта versionId = "null" в смысле AWS.
 		// По этому же признаку прежняя строка уходит в deleting (шаг 4), а не
@@ -254,7 +261,7 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 			           online_until, created_at, archived_at`,
 			in.ID, bucketID, in.Key, in.Size, in.ETag, checksums,
 			in.ContentType, userMeta, in.ACL, tags, in.StorageClass,
-			in.OnlineUntil, tenant.arg(), DefaultPoolID, nullVersion)
+			in.OnlineUntil, bucketTenant, DefaultPoolID, nullVersion)
 		if err != nil {
 			return fmt.Errorf("insert object %s/%s: %w", in.Bucket, in.Key, err)
 		}

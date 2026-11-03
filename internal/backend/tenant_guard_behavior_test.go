@@ -5,6 +5,8 @@ package backend_test
 // вопрос «ни один ли метод не забыт», эти тесты — «правильный ли отказ».
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -136,4 +138,51 @@ func hasBucket(list s3response.ListAllMyBucketsResult, name string) bool {
 		}
 	}
 	return false
+}
+
+// Регрессия: PUT учёткой с обходом по роли.
+//
+// Поймано e2e, а не юнитами: у root нет ProjectID, поэтому подстановка
+// «тенанта учётки» в objects.tenant_id давала FK violation на tenants и 500
+// на каждый PUT администратором. Юниты этого не видели, потому что все их
+// учётки обычные. Объект обязан наследовать тенанта бакета (ADR-0017 п. 6).
+func TestAdminPutObjectInheritsBucketTenant(t *testing.T) {
+	be, m, _ := newBackend(t)
+	ctx := context.Background()
+
+	const ownerProject = 7
+	// Справочник тенантов в тестовой базе содержит только default (id=1), а на
+	// buckets.tenant_id висит FK — заведём отдельный тенант, чтобы «тенант
+	// бакета» и «тенант учётки с обходом» заведомо не совпали.
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO tenants (id, name, pool_id) VALUES ($1, 't7', $2)
+		 ON CONFLICT (id) DO NOTHING`,
+		ownerProject, meta.DefaultPoolID); err != nil {
+		t.Fatalf("завести тенант %d: %v", ownerProject, err)
+	}
+
+	owner := accountCtx(auth.Account{Access: "alice7", Role: auth.RoleUser, ProjectID: ownerProject})
+	if err := be.CreateBucket(owner, &s3.CreateBucketInput{Bucket: ptr("t7")}, nil); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	// Обход по роли: учётка admin вообще без ProjectID.
+	if _, err := be.PutObject(adminCtx(), s3response.PutObjectInput{
+		Bucket: ptr("t7"), Key: ptr("k"), Body: strings.NewReader("payload"),
+		ContentLength: ptr(int64(7)),
+	}); err != nil {
+		t.Fatalf("PUT администратором в чужой бакет: %v", err)
+	}
+
+	// Тенант объекта — тенант бакета, а не ноль и не значение обхода.
+	var got int64
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT o.tenant_id FROM objects o
+		   JOIN buckets b ON b.id = o.bucket_id
+		  WHERE b.name = 't7' AND o.key = 'k'`).Scan(&got); err != nil {
+		t.Fatalf("tenant_id объекта: %v", err)
+	}
+	if got != ownerProject {
+		t.Errorf("tenant_id объекта = %d, хотели %d (тенант бакета)", got, ownerProject)
+	}
 }

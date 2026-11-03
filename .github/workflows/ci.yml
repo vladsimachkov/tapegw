@@ -145,8 +145,12 @@ jobs:
           # Файловый IAM: без него versitygw живёт в режиме одной учётки и
           # знает только root, а проверки доступа на root не проверяются вовсе
           # (root и admin идут мимо политик и ACL).
+          # projectID — тенант учётки (ADR-0017). Нуль страж читает как
+          # «тенанта нет» и отказывает до всякой политики, поэтому проверки
+          # доступа проверяли бы отказ стража вместо политики. Единица — тот же
+          # тенант, в котором root создаёт бакеты стенда.
           cat > /tmp/iam/users.json <<'JSON'
-          {"accessAccounts":{"userplus":{"access":"userplus","secret":"usersecret","role":"user","userID":1001,"groupID":1001,"projectID":0}}}
+          {"accessAccounts":{"userplus":{"access":"userplus","secret":"usersecret","role":"user","userID":1001,"groupID":1001,"projectID":1}}}
           JSON
           # Heredoc без кавычек: нужен подстанов port'а. В теле других $
           # нет, и добавлять их сюда не следует — иначе начнут раскрываться.
