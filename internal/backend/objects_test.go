@@ -22,6 +22,7 @@ import (
 
 	"github.com/vladsimachkov/tapegw/internal/backend"
 	"github.com/vladsimachkov/tapegw/internal/config"
+	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/spool"
 )
 
@@ -326,8 +327,8 @@ func TestHeadRestoringObjectShowsOngoing(t *testing.T) {
 		t.Fatalf("update: %v", err)
 	}
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO restores (object_id, state, tier, days, requested_at)
-		 VALUES ($1,'requested','Standard',7,now())`, id); err != nil {
+		`INSERT INTO restores (object_id, state, tier, days, requested_at, tenant_id)
+		 VALUES ($1,'requested','Standard',7,now(),$2)`, id, meta.DefaultTenantID); err != nil {
 		t.Fatalf("insert restore: %v", err)
 	}
 
@@ -405,9 +406,9 @@ func TestRestoreHeader(t *testing.T) {
 			exp = expires
 		}
 		if _, err := m.Pool.Exec(ctx,
-			`INSERT INTO restores (object_id, state, tier, days, requested_at, restored_at, expires_at)
-			 VALUES ($1,$2,'Standard',7,now(), CASE WHEN $3::timestamptz IS NULL THEN NULL ELSE now() END, $3::timestamptz)`,
-			id, state, exp); err != nil {
+			`INSERT INTO restores (object_id, state, tier, days, requested_at, restored_at, expires_at, tenant_id)
+			 VALUES ($1,$2,'Standard',7,now(), CASE WHEN $3::timestamptz IS NULL THEN NULL ELSE now() END, $3::timestamptz, $4)`,
+			id, state, exp, meta.DefaultTenantID); err != nil {
 			t.Fatalf("insert restore: %v", err)
 		}
 	}

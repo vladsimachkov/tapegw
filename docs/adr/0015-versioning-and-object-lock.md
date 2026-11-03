@@ -22,9 +22,21 @@ versitygw (блокировка без версий) не подходит.
 
 - `versionId` = UUID строки `objects`.
 - `objects`: `is_delete_marker`, `retention_mode`, `retain_until`, `legal_hold`,
-  `wrapped_dek`.
+  `wrapped_dek`, `is_null_version`.
 - `buckets`: `versioning` (`unversioned`/`enabled`/`suspended`), `object_lock_enabled`,
   `default_retention`.
+- **`is_null_version`** — пометка null-версии. В AWS у объекта, записанного до
+  включения версий или в приостановленном бакете, `versionId` равен строке `"null"`, и
+  запись в приостановленный бакет заменяет именно её, не трогая остальные версии. У нас
+  `versionId` — всегда UUID строки, поэтому без отдельного признака отличить null-версию
+  нечем и правило «заменить предыдущую null-версию» не выражается. Частичный уникальный
+  индекс `objects_null_version (bucket_id, key) WHERE is_null_version` запрещает больше
+  одной null-версии на ключ — то есть правило живёт в схеме, а не в коде.
+- **Заполнение `is_null_version` — первый PR этапа V, вместе с условным `deleting`.**
+  Раньше нельзя: прежняя версия при перезаписи сейчас остаётся живой в состоянии
+  `deleting`, а с `is_null_version = true` на обеих строках уникальный индекс отверг бы
+  вторую. То есть правильная запись null-версии и условный `deleting` — одна правка, а
+  не две.
 - `Suspended` и версия `null`: при записи в приостановленный бакет предыдущая null-версия
   **заменяется**, остальные версии сохраняются.
 - Перезапись ключа в бакете с `enabled`: старая версия **остаётся** (`is_current=false`,

@@ -30,6 +30,11 @@ CREATE TYPE bucket_versioning AS ENUM ('unversioned','enabled','suspended');
 
 CREATE TYPE tenant_status AS ENUM ('active','suspended','deleting','deleted');
 
+-- У ключа доступа свои состояния: его отзывают, не трогая тенанта. Общее с
+-- tenant_status enum рано или поздно привело бы к `account.status = 'deleting'`
+-- в коде, где смысл у слова другой.
+CREATE TYPE account_status AS ENUM ('active','revoked');
+
 CREATE TYPE pool_kind AS ENUM ('shared','dedicated');
 
 -- ---------------------------------------------------------------------------
@@ -120,7 +125,11 @@ CREATE TABLE accounts (
   -- поэтому тенантам он не выдаётся никогда — только системным операторам.
   role           text NOT NULL CHECK (role IN ('user','userplus','admin')),
   tenant_id      bigint NOT NULL REFERENCES tenants(id),
-  status         tenant_status NOT NULL DEFAULT 'active',
+  status         account_status NOT NULL DEFAULT 'active',
+  -- Секреты учёток шифруются тем же KEK, что и ключи тенантов, поэтому версия
+  -- KEK нужна и здесь: иначе после ротации KEK нельзя выбросить старый ключ —
+  -- в accounts останутся секреты, завернутые им.
+  kek_version    int NOT NULL DEFAULT 1,
   created_at     timestamptz NOT NULL DEFAULT now()
 );
 
@@ -130,6 +139,14 @@ CREATE TABLE accounts (
 
 ALTER TABLE buckets
   ADD COLUMN tenant_id bigint NOT NULL DEFAULT 1 REFERENCES tenants(id);
+
+-- DEFAULT нужен был только чтобы заполнить существующие строки при ADD COLUMN.
+-- Оставлять его нельзя: любой путь кода, который забудет передать тенанта
+-- (CopyObject, CompleteMultipartUpload, restore), молча запишет объект в тенант 1.
+-- Ни ошибки, ни признака — ровно та форма, что опасная заглушка с NotFound
+-- (правило 4 в AGENTS.md). Без DEFAULT забытый тенант даст ошибку NOT NULL на
+-- первом же тесте.
+ALTER TABLE buckets ALTER COLUMN tenant_id DROP DEFAULT;
 
 ALTER TABLE buckets
   ADD COLUMN versioning bucket_versioning NOT NULL DEFAULT 'unversioned';
@@ -156,6 +173,12 @@ ALTER TABLE objects
 ALTER TABLE objects
   ADD COLUMN pool_id bigint NOT NULL REFERENCES pools(id) DEFAULT 1;
 
+-- См. про DROP DEFAULT выше: и тенант, и пул обязаны приходить из кода явно.
+-- Пул здесь не косметика: по ADR-0013 запись без тега пула может попасть на ленту
+-- чужого пула, поэтому «пул по умолчанию» в схеме — это дыра в изоляции.
+ALTER TABLE objects ALTER COLUMN tenant_id DROP DEFAULT;
+ALTER TABLE objects ALTER COLUMN pool_id  DROP DEFAULT;
+
 -- Delete marker — «версия-маркер удаления»: текущая версия без тела, из-за которой
 -- GET отдаёт 404, а сама версия под ней остаётся живой.
 ALTER TABLE objects
@@ -174,25 +197,59 @@ ALTER TABLE objects
 ALTER TABLE objects
   ADD COLUMN wrapped_dek bytea;
 
--- Индекс листинга сужается: ListObjects обязан НЕ показывать delete markers, а
--- прежний индекс тянул их в выборку. Заодно точно совпадает с запросом листинга.
-DROP INDEX IF EXISTS objects_listing;
-CREATE INDEX objects_listing ON objects (bucket_id, key COLLATE "C")
-  WHERE is_current AND NOT is_delete_marker;
+-- Null-версия. В AWS у объекта, записанного до включения версий или в
+-- приостановленном бакет, versionId равен строке "null", и запись в
+-- приостановленный бакет заменяет именно её, не трогая остальные версии.
+-- У нас versionId — всегда UUID строки, поэтому отличить null-версию нечем и
+-- правило «заменить предыдущую null-версию» не выразить вовсе.
+--
+-- Дешёво только сейчас: на непустой таблице это UPDATE по всем строкам.
+ALTER TABLE objects
+  ADD COLUMN is_null_version boolean NOT NULL DEFAULT false;
 
--- ListObjectVersions показывает все версии и маркеры, включая некурентные, —
--- ему нужен неполный индекс по всем строкам.
+-- Существующие строки (в бою их нет, в dev-базах они есть) лежат в бакетах без
+-- версий, то есть по смыслу AWS и есть null-версии.
+UPDATE objects SET is_null_version = true
+ WHERE bucket_id IN (SELECT id FROM buckets WHERE versioning <> 'enabled');
+
+-- Не больше одной null-версии на ключ — это и есть «запись в suspended бакет
+-- заменяет предыдущую null-версию», выражённое ограничением, а не кодом.
+CREATE UNIQUE INDEX objects_null_version
+  ON objects (bucket_id, key COLLATE "C") WHERE is_null_version;
+
+-- Согласованность блокировки. Без этих правил схема допускает режим без срока,
+-- срок без режима и блокировку на delete marker — а у маркера ни режима, ни
+-- задержки быть не может в принципе. В базе эти правила надёжнее, чем в коде:
+-- их нельзя обойти новым путём в бэкенде.
+ALTER TABLE objects ADD CONSTRAINT objects_retention_pair
+  CHECK ((retention_mode IS NULL) = (retain_until IS NULL));
+
+ALTER TABLE objects ADD CONSTRAINT objects_no_lock_on_marker
+  CHECK (NOT is_delete_marker OR (retention_mode IS NULL AND NOT legal_hold));
+
+-- ListObjectVersions показывает все версии и маркеры, включая некурентные,
+-- поэтому ему нужен неполный индекс по всем строкам.
+--
+-- Отдельного индекса под ListObjects НЕ создаётся. objects_listing был дублем
+-- objects_current и удалён в миграции 0002; возвращать его означало бы писать в
+-- три индекса на (bucket_id, key) на каждый PUT. Delete markers среди текущих
+-- строк редки, поэтому листинг идёт по objects_current с фильтром
+-- NOT is_delete_marker — добор строк на месте дешевле отдельного индекса.
 CREATE INDEX objects_versions ON objects (bucket_id, key COLLATE "C");
 
--- Планировщики (ADR-0016): round-robin берёт по чуть-чуть от каждого тенанта с
--- непустой очередью, а не перебирает всех. Порядок колонок именно такой, чтобы
--- DISTINCT ON (tenant_id) и «не больше K объектов одного тенанта» шли по индексу.
-CREATE INDEX objects_tenant_queue ON objects (tenant_id, next_try_at)
+-- Планировщики (ADR-0016 и ADR-0013): migrator набирает батч сначала внутри пула
+-- (батч всегда в пределах одного пула), и только потом разкладывает по тенантам,
+-- поэтому pool_id стоит первым. DISTINCT ON (tenant_id) и «не больше K объектов
+-- одного тенанта» при таком порядке идут по индексу.
+CREATE INDEX objects_tenant_queue ON objects (pool_id, tenant_id, next_try_at)
   WHERE state = 'pending';
 
--- Суточная сверка счётчиков учёта с фактом (ADR-0011): сумма по всем строкам
--- тенанта, включая некурентные версии и маркеры.
-CREATE INDEX objects_tenant_size ON objects (tenant_id, size);
+-- Суточная сверка счётчиков учёта с фактом (ADR-0011). size в INCLUDE, а не в
+-- ключевых колонках: запрос «сумма size по тенанту» получает index-only scan,
+-- но порядок строк по size никто не просит, и на каждый PUT индекс не растёт
+-- за счёт сортировки. Отдельный индекс по tenant_id всё равно нужен (удаление
+-- тенанта, та же сверка), поэтому он и остаётся.
+CREATE INDEX objects_tenant ON objects (tenant_id) INCLUDE (size);
 
 -- ---------------------------------------------------------------------------
 -- Restore: тенант для честной очереди
@@ -202,6 +259,9 @@ CREATE INDEX objects_tenant_size ON objects (tenant_id, size);
 
 ALTER TABLE restores
   ADD COLUMN tenant_id bigint NOT NULL DEFAULT 1 REFERENCES tenants(id);
+
+-- См. про DROP DEFAULT у buckets/objects: recaller обязан знать тенанта явно.
+ALTER TABLE restores ALTER COLUMN tenant_id DROP DEFAULT;
 
 CREATE INDEX restores_tenant_queue ON restores (tenant_id, tier, requested_at)
   WHERE state = 'requested';
@@ -228,15 +288,20 @@ CREATE TABLE object_parts (
 DROP TABLE IF EXISTS object_parts;
 DROP INDEX IF EXISTS restores_tenant_queue;
 ALTER TABLE restores DROP COLUMN IF EXISTS tenant_id;
-DROP INDEX IF EXISTS objects_tenant_size;
+DROP INDEX IF EXISTS objects_tenant;
 DROP INDEX IF EXISTS objects_tenant_queue;
+DROP INDEX IF EXISTS objects_null_version;
 DROP INDEX IF EXISTS objects_versions;
-DROP INDEX IF EXISTS objects_listing;
-CREATE INDEX objects_listing ON objects (bucket_id, key COLLATE "C") WHERE is_current;
+-- objects_listing здесь НЕ создаётся: он удалён как дубль в миграции 0002,
+-- и возвращать его при откате значит вернуть известную ошибку.
+ALTER TABLE objects DROP COLUMN IF EXISTS is_null_version;
+ALTER TABLE objects DROP CONSTRAINT IF EXISTS objects_no_lock_on_marker;
+ALTER TABLE objects DROP CONSTRAINT IF EXISTS objects_retention_pair;
 ALTER TABLE objects DROP COLUMN IF EXISTS wrapped_dek;
 ALTER TABLE objects DROP COLUMN IF EXISTS legal_hold;
 ALTER TABLE objects DROP COLUMN IF EXISTS retain_until;
 ALTER TABLE objects DROP COLUMN IF EXISTS retention_mode;
+ALTER TABLE objects DROP CONSTRAINT IF EXISTS objects_delete_marker_empty;
 ALTER TABLE objects DROP COLUMN IF EXISTS is_delete_marker;
 ALTER TABLE objects DROP COLUMN IF EXISTS pool_id;
 ALTER TABLE objects DROP COLUMN IF EXISTS tenant_id;
@@ -249,6 +314,7 @@ DROP TABLE IF EXISTS accounts;
 DROP TABLE IF EXISTS tenant_usage;
 DROP TABLE IF EXISTS tenants;
 DROP TABLE IF EXISTS pools;
+DROP TYPE IF EXISTS account_status;
 DROP TYPE IF EXISTS pool_kind;
 DROP TYPE IF EXISTS tenant_status;
 DROP TYPE IF EXISTS bucket_versioning;
