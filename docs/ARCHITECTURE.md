@@ -826,21 +826,25 @@ Postgres: `embedgw.Config.IAMService` принимает нашу реализа
       `legal_hold`; `buckets.versioning`, `object_lock_enabled`, `default_retention`.
       `versionId` — UUID строки `objects`, отдельная нумерация не нужна.
 - [ ] `PutBucketVersioning` / `GetBucketVersioning` (вместо нынешнего «всегда пусто»),
-      `ListObjectVersions`, GET/HEAD/DELETE по `versionId`.
+      `ListObjectVersions`, GET/HEAD/DELETE по `versionId`. **Переход назад в
+      `unversioned` запрещён**: только `unversioned → enabled`, `enabled → suspended`,
+      `suspended → enabled`, как в AWS. Логика PutObject опирается на то, что в бакете
+      без версий текущая версия всегда null-версия. См. ADR-0015.
 - [ ] **ListObjects v2 пишется сразу вместе с ListObjectVersions**, а не сначала
       обычный, потом версионный.
 - [ ] DeleteObject без `versionId` в версионированном бакете = delete marker; с
       `versionId` = истинное удаление с проверкой блокировки. Маркеры и блокировка —
       **одним этапом**: при включённых версиях удаление без `versionId` versitygw не
       проверяет (создаётся маркер), так что без маркеров Object Lock выглядит сломанным.
-- [ ] **Поправка к уже слитому PR #6:** PutObject переводит прежнюю версию в `deleting`
+- [x] **Поправка к уже слитому PR #6:** PutObject переводит прежнюю версию в `deleting`
       безусловно. Для бакета без версий это верно, для бакета с `enabled` — уничтожение
-      истории и обход блокировки. Переход обязан стать условным от `buckets.versioning`.
-- [ ] **Следствие из уникального индекса null-версии (тот же PR):** при перезаписи в
+      истории и обход блокировки. Переход стал условным от `buckets.versioning`.
+- [x] **Следствие из уникального индекса null-версии (тот же PR):** при перезаписи в
       бакете `unversioned` или `suspended` старая null-версия, уходя в `deleting`,
       обязана **в той же транзакции** получить `is_null_version = false`. Иначе новая
-      строка с `true` упрётся в `objects_null_version`. Тест — «две перезаписи подряд в
-      бакете без версий»: три PUT одного ключа, все проходят, null-версия ровно одна.
+      строка с `true` упрётся в `objects_null_version`. Тест — «три PUT одного ключа
+      в бакет без версий» — проходит; без сброса флага он падает на
+      `duplicate key ... objects_null_version`, что и проверялось мутацией.
 - [ ] `ObjectLockEnabledForBucket` в CreateBucket: в AWS блокировку нельзя включить
       задним числом, только при создании бакета. Бэкенд её получает
       (`controllers/bucket-put.go:701`), поэтому решение нужно до первых боевых бакетов.

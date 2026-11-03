@@ -37,6 +37,45 @@ versitygw (блокировка без версий) не подходит.
   `deleting`, а с `is_null_version = true` на обеих строках уникальный индекс отверг бы
   вторую. То есть правильная запись null-версии и условный `deleting` — одна правка, а
   не две.
+
+### Переходы версионирования: назад в unversioned нельзя
+
+Как в AWS, из `enabled` можно уйти только в `suspended`; обратного перехода в
+`unversioned` нет. Для нас это не косметика, а условие корректности логики PutObject:
+она предполагает, что в бакете `unversioned` текущая версия всегда null-версия. Если
+бы бакет мог вернуться в `unversioned`, в нём остались бы обычные версии, и ветка
+«unversioned» начала бы удалять то, что удалять не должна.
+
+Поэтому `PutBucketVersioning` обязан отвергать переход `enabled|suspended →
+unversioned` (в AWS это `InvalidBucketState`). Разрешены только
+`unversioned → enabled`, `enabled → suspended`, `suspended → enabled`.
+
+### Почему suspended — это два запроса, а не один
+
+В приостановленном бакете текущей может быть **обычная** версия, записанная, пока
+версии были включены. По AWS заменяется только null-версия, поэтому:
+
+```sql
+-- 1. текущая обычная версия просто перестаёт быть текущей
+UPDATE objects SET is_current = false
+ WHERE bucket_id = $1 AND key = $2 AND is_current AND NOT is_null_version;
+
+-- 2. null-версия (текущая или нет) заменяется
+UPDATE objects SET is_current = false, state = 'deleting', is_null_version = false
+ WHERE bucket_id = $1 AND key = $2 AND is_null_version;
+```
+
+Один запрос `WHERE is_current` даёт две поломки, и обе проверены тестами и мутацией:
+
+- **тихая потеря данных**: `enabled: PUT k` → `suspended: PUT k` — версия `v1`,
+  сохранённая ради истории, уходит в `deleting` без единой ошибки;
+- **ошибка вместо записи**: `unversioned: PUT k` → `enabled: PUT k` → `suspended: PUT k`
+  — прежняя null-версия остаётся нетекущей с флагом, и новый `INSERT` с
+  `is_null_version = true` упирается в `objects_null_version`. Транзакция откатывается,
+  данные целы, но клиент получает ошибку.
+
+Для `unversioned` те же два запроса дают тот же результат, что и один: там текущая
+строка и есть null-версия, поэтому первый запрос не находит строк.
 - `Suspended` и версия `null`: при записи в приостановленный бакет предыдущая null-версия
   **заменяется**, остальные версии сохраняются.
 - Перезапись ключа в бакете с `enabled`: старая версия **остаётся** (`is_current=false`,
