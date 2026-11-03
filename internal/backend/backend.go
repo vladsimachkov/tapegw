@@ -23,6 +23,7 @@ import (
 	"github.com/vladsimachkov/tapegw/internal/config"
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	tapegwerr "github.com/vladsimachkov/tapegw/internal/s3err"
+	"github.com/vladsimachkov/tapegw/internal/spool"
 )
 
 // TapeGW — бэкенд S3-поверхности. Состояние только в Postgres (meta) и на
@@ -31,20 +32,24 @@ import (
 type TapeGW struct {
 	*vbackend.BackendUnsupported
 
-	meta *meta.Meta
-	cfg  *config.Config
+	meta  *meta.Meta
+	cfg   *config.Config
+	spool *spool.Spool
 }
 
 // compile-time check: не даём интерфейсу versitygw тихо уехать вперёд.
 var _ vbackend.Backend = (*TapeGW)(nil)
 
 // New собирает бэкенд. meta обязателен: без метаданных бэкенд не может
-// ответить ни на один запрос.
-func New(m *meta.Meta, cfg *config.Config) *TapeGW {
+// ответить ни на один запрос. spool — дисковый буфер landing; без него PutObject
+// некуда писать, поэтому nil на месте spool означает «объектные операции
+// выключены» и они честно вернут NotImplemented.
+func New(m *meta.Meta, s *spool.Spool, cfg *config.Config) *TapeGW {
 	return &TapeGW{
 		BackendUnsupported: &vbackend.BackendUnsupported{},
 		meta:               m,
 		cfg:                cfg,
+		spool:              s,
 	}
 }
 

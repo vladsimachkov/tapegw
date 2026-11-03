@@ -16,6 +16,7 @@ import (
 	"github.com/vladsimachkov/tapegw/internal/backend"
 	"github.com/vladsimachkov/tapegw/internal/config"
 	"github.com/vladsimachkov/tapegw/internal/meta"
+	"github.com/vladsimachkov/tapegw/internal/spool"
 	"github.com/vladsimachkov/tapegw/internal/testdb"
 )
 
@@ -23,13 +24,32 @@ import (
 // Здесь проверяется слой, на который эти команды опираются: бакетные операции
 // бэкенда. Сквозной прогон живым aws cli — test/e2e (M2+).
 
-// newBackend поднимает бэкенд поверх тестовой базы. meta возвращается отдельно:
-// часть тестов готовит данные напрямую через SQL, минуя бэкенд.
-func newBackend(t *testing.T) (*backend.TapeGW, *meta.Meta) {
+// newBackend поднимает бэкенд поверх тестовой базы и временного landing-буфера.
+// meta возвращается отдельно: часть тестов готовит данные напрямую через SQL,
+// минуя бэкенд.
+func newBackend(t *testing.T) (*backend.TapeGW, *meta.Meta, *spool.Spool) {
+	t.Helper()
+	return newBackendWith(t, nil)
+}
+
+// newBackendWith то же самое, но конфиг можно поправить до сборки бэкенда —
+// например уменьшить s3.max_object_size, чтобы проверить EntityTooLarge.
+func newBackendWith(t *testing.T, mutate func(*config.Config)) (*backend.TapeGW, *meta.Meta, *spool.Spool) {
 	t.Helper()
 	m := testdb.Connect(t)
 	testdb.Clean(t, m)
-	return backend.New(m, config.Default()), m
+
+	cfg := config.Default()
+	if mutate != nil {
+		mutate(cfg)
+	}
+	// Буфер в каталоге теста: go test удаляет его сам, а проверка st_dev внутри
+	// spool.Open на реальном ФС всё равно проходит.
+	land, err := spool.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("spool.Open: %v", err)
+	}
+	return backend.New(m, land, cfg), m, land
 }
 
 // ownerCtx имитирует то, что делает versitygw: кладёт аккаунт запроса в контекст.
@@ -44,7 +64,7 @@ func ownerCtx(access string) context.Context {
 func ptr[T any](v T) *T { return &v }
 
 func TestBucketLifecycle(t *testing.T) {
-	be, _ := newBackend(t)
+	be, _, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
 	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("photos")}, []byte(`{"owner":"alice"}`)); err != nil {
@@ -80,7 +100,7 @@ func TestBucketLifecycle(t *testing.T) {
 // повторять ли попытку.
 
 func TestCreateBucketAlreadyOwnedByYou(t *testing.T) {
-	be, _ := newBackend(t)
+	be, _, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
 	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("dup")}, nil); err != nil {
@@ -97,7 +117,7 @@ func TestCreateBucketAlreadyOwnedByYou(t *testing.T) {
 }
 
 func TestCreateBucketOtherOwner(t *testing.T) {
-	be, _ := newBackend(t)
+	be, _, _ := newBackend(t)
 
 	if err := be.CreateBucket(ownerCtx("alice"), &s3.CreateBucketInput{Bucket: ptr("shared")}, nil); err != nil {
 		t.Fatalf("CreateBucket alice: %v", err)
@@ -115,7 +135,7 @@ func TestCreateBucketOtherOwner(t *testing.T) {
 // Мягкое удаление освобождает имя: rb -> mb должно работать, хотя строка
 // бакета остаётся в таблице, потому что на неё ссылаются objects.
 func TestBucketNameReusableAfterDelete(t *testing.T) {
-	be, _ := newBackend(t)
+	be, _, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
 	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("reuse")}, nil); err != nil {
@@ -134,7 +154,7 @@ func TestBucketNameReusableAfterDelete(t *testing.T) {
 
 // Префикс и max-buckets должны фильтроваться в SQL, а не в Go.
 func TestListBucketsPrefix(t *testing.T) {
-	be, _ := newBackend(t)
+	be, _, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
 	for _, name := range []string{"aa-1", "aa-2", "aa-3", "bb-1"} {
@@ -157,7 +177,7 @@ func TestListBucketsPrefix(t *testing.T) {
 // если эхом вернуть входной токен, пагинатор SDK и `aws s3 ls` будут
 // запрашивать последнюю страницу вечно.
 func TestListBucketsPaginationTerminates(t *testing.T) {
-	be, _ := newBackend(t)
+	be, _, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
 	want := []string{"bkt-1", "bkt-2", "bkt-3", "bkt-4", "bkt-5"}
@@ -210,7 +230,7 @@ func TestListBucketsPaginationTerminates(t *testing.T) {
 
 // На последней странице токен обязан быть пустым — иначе пагинатор не остановится.
 func TestListBucketsLastPageHasNoToken(t *testing.T) {
-	be, _ := newBackend(t)
+	be, _, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
 	for _, name := range []string{"one", "two"} {
@@ -233,17 +253,20 @@ func TestListBucketsLastPageHasNoToken(t *testing.T) {
 }
 
 func TestDeleteBucketNotEmpty(t *testing.T) {
-	be, m := newBackend(t)
+	be, m, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
 	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("full")}, nil); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 
+	// online_until обязателен с миграции 0004: NULL в этой колонке молча
+	// выключал бы вытеснение, поэтому колонка NOT NULL.
 	if _, err := m.Pool.Exec(ctx, `
-		INSERT INTO objects (id, bucket_id, key, size, etag, state)
+		INSERT INTO objects (id, bucket_id, key, size, etag, state, online_until)
 		SELECT gen_random_uuid(), (SELECT id FROM buckets WHERE name='full'),
-		       'a.txt', 3, 'd41d8cd98f00b204e9800998ecf8427e', 'archived'`); err != nil {
+		       'a.txt', 3, 'd41d8cd98f00b204e9800998ecf8427e', 'archived',
+		       now() + interval '1 day'`); err != nil {
 		t.Fatalf("подготовка объекта: %v", err)
 	}
 
@@ -257,7 +280,7 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 }
 
 func TestBucketTagging(t *testing.T) {
-	be, _ := newBackend(t)
+	be, _, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
 	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{
@@ -286,7 +309,7 @@ func TestBucketTagging(t *testing.T) {
 }
 
 func TestBucketACL(t *testing.T) {
-	be, _ := newBackend(t)
+	be, _, _ := newBackend(t)
 	ctx := ownerCtx("alice")
 
 	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("acl")}, []byte(`{"acl":"private"}`)); err != nil {
@@ -319,7 +342,7 @@ func TestBucketACL(t *testing.T) {
 // Неподдержанные операции обязаны отвечать NotImplemented, а не «молча
 // что-то делать» (правило 4). Проверяем на multipart: он появится только в M3.
 func TestUnsupportedOperationsReportNotImplemented(t *testing.T) {
-	be, _ := newBackend(t)
+	be, _, _ := newBackend(t)
 
 	_, err := be.CreateMultipartUpload(context.Background(), s3response.CreateMultipartUploadInput{
 		Bucket: ptr("any"), Key: ptr("k"),

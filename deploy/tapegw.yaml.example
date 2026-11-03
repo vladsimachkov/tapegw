@@ -16,7 +16,8 @@ s3:
     cert: ""          # пусто = HTTP. Для продакшена обязателен: SigV4 в открытом виде
     key: ""
   iam_dir: /etc/tapegw/iam
-  default_storage_class: GLACIER
+  # Класс хранилища не настраивается: tapegw хранит всё на ленте и всегда
+  # отвечает GLACIER (ADR-0003). Отдельной настройки в конфиге нет намеренно.
   health_path: /health
   max_connections: 50000
   max_requests: 50000

@@ -16,7 +16,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"testing"
@@ -153,13 +152,19 @@ func TestUnsupportedIsNotImplemented(t *testing.T) {
 		_, _ = c.DeleteBucket(context.Background(), &s3.DeleteBucketInput{Bucket: aws.String(bucket)})
 	})
 
-	_, err := c.PutObject(context.Background(), &s3.PutObjectInput{
+	_, err := c.PutObjectRetention(context.Background(), &s3.PutObjectRetentionInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String("a.txt"),
-		Body:   newReader("hello"),
+		// Дату контроллер versitygw валидирует до обращения к бэкенду, и с
+		// пустой датой мы получили бы InvalidArgument вместо NotImplemented —
+		// то есть проверяли бы не то.
+		Retention: &types.ObjectLockRetention{
+			Mode:            types.ObjectLockRetentionModeGovernance,
+			RetainUntilDate: aws.Time(time.Now().Add(24 * time.Hour)),
+		},
 	})
 	if err == nil {
-		t.Fatal("PutObject ещё не реализован (это M2), а вернул успех")
+		t.Fatal("Object Lock вне MVP (см. «Чего нет в MVP»), а операция вернула успех")
 	}
 	// Код в aws-sdk-go-v2 приходит не типизированным типом, а строкой ошибки
 	// API, поэтому сравниваем строку. Важно именно «NotImplemented», а не любой
@@ -168,10 +173,3 @@ func TestUnsupportedIsNotImplemented(t *testing.T) {
 		t.Errorf("ожидали NotImplemented, получили %T: %v", err, err)
 	}
 }
-
-func newReader(s string) io.ReadSeekCloser { return nopSeeker{strings.NewReader(s)} }
-
-// nopSeeker — то, что хочет s3-клиент: чтение, seek и закрытие.
-type nopSeeker struct{ *strings.Reader }
-
-func (nopSeeker) Close() error { return nil }

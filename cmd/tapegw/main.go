@@ -22,6 +22,7 @@ import (
 	"github.com/vladsimachkov/tapegw/internal/backend"
 	"github.com/vladsimachkov/tapegw/internal/config"
 	"github.com/vladsimachkov/tapegw/internal/meta"
+	"github.com/vladsimachkov/tapegw/internal/spool"
 )
 
 // Заполняется сборкой: -ldflags "-X main.Version=... -X main.Build=..."
@@ -92,7 +93,12 @@ func run(args []string) error {
 	}
 	defer pool.Close()
 
-	be := backend.New(pool, cfg)
+	land, err := spool.Open(cfg.Spool.Landing)
+	if err != nil {
+		return fmt.Errorf("landing: %w", err)
+	}
+
+	be := backend.New(pool, land, cfg)
 
 	gwCfg := &embedgw.Config{
 		Ports:             cfg.S3.Listen,
