@@ -57,6 +57,11 @@ type S3 struct {
 	MaxConnections    int `yaml:"max_connections"`
 	MaxRequests       int `yaml:"max_requests"`
 	MultipartMaxParts int `yaml:"multipart_max_parts"`
+	// MaxObjectSize — верхняя граница размера одного объекта. Отсекается на PUT
+	// как EntityTooLarge. Обязана быть не больше migrator.batch_max_bytes:
+	// батч пишется с no_split целиком на один носитель, поэтому объект крупнее
+	// батча никогда не был бы заархивирован. См. ADR-0008.
+	MaxObjectSize ByteSize `yaml:"max_object_size"`
 }
 
 type TLS struct {
@@ -231,6 +236,7 @@ func Default() *Config {
 			MaxConnections:    50000,
 			MaxRequests:       50000,
 			MultipartMaxParts: 10000,
+			MaxObjectSize:     100 * GiB,
 		},
 		DB: DB{
 			DSN:                 "postgres://tapegw@localhost/phobos?search_path=tapegw",
@@ -451,6 +457,17 @@ func (c *Config) Validate() error {
 	}
 	if (c.S3.TLS.Cert == "") != (c.S3.TLS.Key == "") {
 		add("s3.tls: cert и key задаются парой")
+	}
+	// Размер объекта ограничен так, чтобы он гарантированно влезал в батч:
+	// батч пишется с no_split целиком на один носитель (ADR-0008), и объект
+	// крупнее батча не был бы заархивирован никогда.
+	if c.S3.MaxObjectSize <= 0 {
+		add("s3.max_object_size: %d, должно быть > 0", int64(c.S3.MaxObjectSize))
+	}
+	if c.Migrator.BatchMaxBytes > 0 && c.S3.MaxObjectSize > c.Migrator.BatchMaxBytes {
+		add("s3.max_object_size: %d не больше migrator.batch_max_bytes: %d — "+
+			"объект крупнее батча не будет заархивирован", int64(c.S3.MaxObjectSize),
+			int64(c.Migrator.BatchMaxBytes))
 	}
 	if c.DB.DSN == "" {
 		add("db.dsn обязателен")
