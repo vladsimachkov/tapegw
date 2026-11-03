@@ -2,6 +2,7 @@ package meta_test
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -317,3 +318,213 @@ func TestOnlineUntilNotNull(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// --- Версионирование и null-версия (этап V, ADR-0015) ---
+
+// setVersioning ставит состояние версионирования напрямую: PutBucketVersioning
+// появляется позже по этапу V, а развилка в PutObject нужна уже сейчас.
+func setVersioning(t *testing.T, m *meta.Meta, bucket, state string) {
+	t.Helper()
+	_, err := m.Pool.Exec(context.Background(),
+		`UPDATE buckets SET versioning = $2 WHERE name = $1`, bucket, state)
+	if err != nil {
+		t.Fatalf("set versioning %s=%s: %v", bucket, state, err)
+	}
+}
+
+// rowsByKey возвращает по ключу: число текущих, число null-версий и состояния
+// всех строк.
+func rowsByKey(t *testing.T, m *meta.Meta, bucket, key string) (current, nulls int, states []string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FILTER (WHERE is_current),
+		        count(*) FILTER (WHERE is_null_version)
+		   FROM objects WHERE bucket_id = (SELECT id FROM buckets WHERE name=$1) AND key=$2`,
+		bucket, key).Scan(&current, &nulls); err != nil {
+		t.Fatalf("count %s/%s: %v", bucket, key, err)
+	}
+	rs, err := m.Pool.Query(ctx,
+		`SELECT state::text FROM objects
+		  WHERE bucket_id = (SELECT id FROM buckets WHERE name=$1) AND key=$2
+		  ORDER BY state`, bucket, key)
+	if err != nil {
+		t.Fatalf("states %s/%s: %v", bucket, key, err)
+	}
+	defer rs.Close()
+	for rs.Next() {
+		var s string
+		if err := rs.Scan(&s); err != nil {
+			t.Fatalf("scan state: %v", err)
+		}
+		states = append(states, s)
+	}
+	return current, nulls, states
+}
+
+// Три перезаписи одного ключа в бакете без версий. Это тот случай, из-за которого
+// сброс is_null_version у прежней строки обязан быть в той же транзакции:
+// частичный уникальный индекс objects_null_version пропускает только одну
+// null-версию на ключ, и без сброса вторая и третья перезаписи упали бы.
+func TestOverwriteUnversionedReplacesNullVersion(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "unv")
+
+	for i, etag := range []string{"v1", "v2", "v3"} {
+		in := putInput("unv", "k")
+		in.ETag = etag
+		if _, err := m.PutObject(ctx, in); err != nil {
+			t.Fatalf("PUT %d (%s): %v", i+1, etag, err)
+		}
+		current, nulls, states := rowsByKey(t, m, "unv", "k")
+		if current != 1 {
+			t.Errorf("PUT %d: текущих строк %d, должна быть одна", i+1, current)
+		}
+		if nulls != 1 {
+			t.Errorf("PUT %d: null-версий %d, обязана быть ровно одна (текущая)", i+1, nulls)
+		}
+		// Все прежние версии уходят в deleting: в бакете без версий они
+		// заменяются, а не сохраняются.
+		want := make([]string, 0, i+1)
+		for j := 0; j < i; j++ {
+			want = append(want, "deleting")
+		}
+		want = append(want, "pending")
+		if len(states) != len(want) {
+			t.Fatalf("PUT %d: строк %d (%v), ожидали %d", i+1, len(states), states, len(want))
+		}
+		for j := range want {
+			if states[j] != want[j] {
+				t.Errorf("PUT %d: состояния %v, ожидали %v", i+1, states, want)
+				break
+			}
+		}
+	}
+
+	// null-версией обязана остаться именно текущая строка, а не одна из старых.
+	var onCurrent bool
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT is_null_version FROM objects
+		  WHERE bucket_id = (SELECT id FROM buckets WHERE name='unv')
+		    AND key='k' AND is_current`).Scan(&onCurrent); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !onCurrent {
+		t.Errorf("текущая строка не помечена null-версией")
+	}
+}
+
+// В бакете с включёнными версиями прежняя версия живёт дальше: is_current=false,
+// но состояние не меняется. Перевод в deleting здесь означал бы уничтожение
+// истории и обход Object Lock.
+func TestOverwriteVersionedKeepsOldVersion(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "ver")
+	setVersioning(t, m, "ver", meta.VersioningEnabled)
+
+	first := putInput("ver", "k")
+	first.ETag = "v1"
+	if _, err := m.PutObject(ctx, first); err != nil {
+		t.Fatalf("первый PUT: %v", err)
+	}
+	second := putInput("ver", "k")
+	second.ETag = "v2"
+	if _, err := m.PutObject(ctx, second); err != nil {
+		t.Fatalf("второй PUT: %v", err)
+	}
+
+	current, nulls, states := rowsByKey(t, m, "ver", "k")
+	if current != 1 {
+		t.Errorf("текущих строк %d, должна быть одна", current)
+	}
+	if nulls != 0 {
+		t.Errorf("null-версий %d, в бакете с версиями их быть не должно", nulls)
+	}
+	// Прежняя версия обязана остаться pending: не deleting.
+	if len(states) != 2 || states[0] != "pending" || states[1] != "pending" {
+		t.Errorf("состояния %v, ожидали две живые pending-версии", states)
+	}
+
+	// И GetObject обязан отдавать новую.
+	back, err := m.GetObject(ctx, "ver", "k")
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	if back.ID != second.ID {
+		t.Errorf("GetObject вернул не текущую версию: %v", back.ID)
+	}
+}
+
+// Приостановленные версии ведут себя как «версий нет»: новая запись заменяет
+// предыдущую null-версию, а не добавляется к ней.
+func TestOverwriteSuspendedReplacesNullVersion(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "susp")
+	setVersioning(t, m, "susp", meta.VersioningSuspended)
+
+	for _, etag := range []string{"v1", "v2"} {
+		in := putInput("susp", "k")
+		in.ETag = etag
+		if _, err := m.PutObject(ctx, in); err != nil {
+			t.Fatalf("PUT %s: %v", etag, err)
+		}
+	}
+
+	current, nulls, states := rowsByKey(t, m, "susp", "k")
+	if current != 1 || nulls != 1 {
+		t.Errorf("текущих %d (хотели 1), null-версий %d (хотели 1)", current, nulls)
+	}
+	if len(states) != 2 || states[0] != "deleting" || states[1] != "pending" {
+		t.Errorf("состояния %v, ожидали deleting + pending", states)
+	}
+}
+
+// Параллельные перезаписи в бакете с версиями: код другой ветки, и она обязана
+// держать то же правило «одна текущая строка».
+func TestConcurrentOverwriteVersionedOneCurrent(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "race")
+	setVersioning(t, m, "race", meta.VersioningEnabled)
+
+	const n = 12
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			in := putInput("race", "k")
+			in.ETag = fmt.Sprintf("etag-%d", i)
+			_, errs[i] = m.PutObject(ctx, in)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("PUT %d: %v", i, err)
+		}
+	}
+	current, nulls, _ := rowsByKey(t, m, "race", "k")
+	if current != 1 {
+		t.Errorf("текущих строк %d, должна быть одна", current)
+	}
+	if nulls != 0 {
+		t.Errorf("null-версий %d в бакете с версиями", nulls)
+	}
+	var total int
+	if err := m.Pool.QueryRow(ctx, `SELECT count(*) FROM objects`).Scan(&total); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if total != n {
+		t.Errorf("всего строк %d, ожидали %d: ни одна версия не должна теряться", total, n)
+	}
+}

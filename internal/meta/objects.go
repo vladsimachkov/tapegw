@@ -129,15 +129,22 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 		// 2. Бакет на чтение: конфликтует с FOR UPDATE у DeleteBucket, но не
 		//    мешает параллельным PUT в тот же бакет.
 		var bucketID int64
+		var versioning string
 		err := tx.QueryRow(ctx,
-			`SELECT id FROM buckets WHERE name = $1 AND deleted_at IS NULL FOR SHARE`,
-			in.Bucket).Scan(&bucketID)
+			`SELECT id, versioning FROM buckets
+			  WHERE name = $1 AND deleted_at IS NULL FOR SHARE`,
+			in.Bucket).Scan(&bucketID, &versioning)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
 		if err != nil {
 			return fmt.Errorf("lock bucket %q: %w", in.Bucket, err)
 		}
+
+		// Пока версии не включены, у объекта versionId = "null" в смысле AWS.
+		// По этому же признаку прежняя строка уходит в deleting (шаг 4), а не
+		// остаётся живой версией.
+		nullVersion := IsNullVersionBucket(versioning)
 
 		// 3. Условная запись. Проверяем после advisory-лока и до вставки: между
 		//    проверкой и записью никто не успевает сменить текущую версию, и
@@ -163,24 +170,45 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 			}
 		}
 
-		// 4. Прежняя текущая строка теряет актуальность и тут же переходит в
-		//    deleting. Одного is_current = false мало: в состоянии pending её
-		//    заархивировал бы migrator (лишняя запись на ленту), а deleter её
-		//    вообще не увидел бы, и копия осталась бы и в landing, и на ленте
-		//    навсегда. В deleting строку подхватит индекс objects_queue
-		//    (state IN ('pending','deleting')). Удаление из Phobos появится в M6,
-		//    но состояние обязано быть правильным уже сейчас — иначе потом
-		//    придётся разбирать накопившиеся «вечные» строки.
+		// 4. Прежняя текущая строка теряет актуальность. Что с ней дальше —
+		//    зависит от версионирования бакета (ADR-0015).
+		//
+		//    versioning = 'enabled': прежняя версия остаётся живой, просто
+		//    перестаёт быть текущей. Перевод в deleting здесь означал бы
+		//    уничтожение истории и обход Object Lock: клиент включил версии
+		//    именно затем, чтобы прежние данные не пропадали.
+		//
+		//    unversioned / suspended: по AWS предыдущая null-версия не
+		//    сохраняется, а заменяется. Поэтому строка уходит в deleting — одного
+		//    is_current = false мало: в pending её заархивировал бы migrator
+		//    (лишняя запись на ленту), а deleter её не увидел бы, и копия
+		//    осталась бы и в landing, и на ленте навсегда. В deleting строку
+		//    подхватывает индекс objects_queue.
+		//
+		//    С прежней null-версии в той же транзакции снимается флаг: частичный
+		//    уникальный индекс objects_null_version разрешает одну null-версию на
+		//    ключ, и без этого шага новая строка упрётся в него.
 		//
 		//    retired_at здесь не ставим: по миграции 0001 он помечает терминальные
 		//    строки (deleted/failed) для выгрузки, а deleting — ещё не терминальное.
-		if _, err := tx.Exec(ctx,
-			`UPDATE objects
-			    SET is_current = false,
-			        state = 'deleting'
-			  WHERE bucket_id = $1 AND key = $2 AND is_current`,
-			bucketID, in.Key); err != nil {
-			return fmt.Errorf("retire previous version of %s/%s: %w", in.Bucket, in.Key, err)
+		if versioning == VersioningEnabled {
+			if _, err := tx.Exec(ctx,
+				`UPDATE objects
+				    SET is_current = false
+				  WHERE bucket_id = $1 AND key = $2 AND is_current`,
+				bucketID, in.Key); err != nil {
+				return fmt.Errorf("retire previous version of %s/%s: %w", in.Bucket, in.Key, err)
+			}
+		} else {
+			if _, err := tx.Exec(ctx,
+				`UPDATE objects
+				    SET is_current = false,
+				        state = 'deleting',
+				        is_null_version = false
+				  WHERE bucket_id = $1 AND key = $2 AND is_current`,
+				bucketID, in.Key); err != nil {
+				return fmt.Errorf("retire previous version of %s/%s: %w", in.Bucket, in.Key, err)
+			}
 		}
 
 		// 5. Новая версия.
@@ -188,25 +216,21 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 		// tenant_id и pool_id передаются явно: колонки NOT NULL без DEFAULT
 		// (миграция 0005), чтобы забытый тенант падал, а не писался в первый.
 		//
-		// is_null_version здесь сознательно НЕ заполняется. Частичный уникальный
-		// индекс objects_null_version разрешает одну null-версию на ключ, а
-		// прежняя версия при перезаписи сейчас остаётся живой в состоянии
-		// deleting — вторая строка с тем же ключом этот индекс уже не пропускает.
-		// Заполнение идёт первым PR этапа V вместе с условным переходом в
-		// deleting по buckets.versioning (ADR-0015): там null-версия корректно
-		// заменяется, а не оставляется.
+		// is_null_version ставится по состоянию бакета: пока версии не включены,
+		// у объекта versionId = "null" в смысле AWS. Именно эта пометка потом
+		// позволяет записи в suspended-бакет заменить предыдущую null-версию.
 		created, err := tx.Query(ctx,
 			`INSERT INTO objects (
 			    id, bucket_id, key, is_current, size, etag, checksums,
 			    content_type, user_meta, acl, tags, storage_class,
-			    state, landing, online_until, tenant_id, pool_id)
-			 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12,$13,$14)
+			    state, landing, online_until, tenant_id, pool_id, is_null_version)
+			 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12,$13,$14,$15)
 			 RETURNING id, bucket_id, key, size, etag, checksums, content_type,
 			           user_meta, acl, tags, storage_class, state, landing,
 			           online_until, created_at, archived_at`,
 			in.ID, bucketID, in.Key, in.Size, in.ETag, checksums,
 			in.ContentType, userMeta, in.ACL, tags, in.StorageClass,
-			in.OnlineUntil, DefaultTenantID, DefaultPoolID)
+			in.OnlineUntil, DefaultTenantID, DefaultPoolID, nullVersion)
 		if err != nil {
 			return fmt.Errorf("insert object %s/%s: %w", in.Bucket, in.Key, err)
 		}
