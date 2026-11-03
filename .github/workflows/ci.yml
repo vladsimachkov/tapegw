@@ -145,12 +145,23 @@ jobs:
           # Файловый IAM: без него versitygw живёт в режиме одной учётки и
           # знает только root, а проверки доступа на root не проверяются вовсе
           # (root и admin идут мимо политик и ACL).
-          # projectID — тенант учётки (ADR-0017). Нуль страж читает как
-          # «тенанта нет» и отказывает до всякой политики, поэтому проверки
-          # доступа проверяли бы отказ стража вместо политики. Единица — тот же
-          # тенант, в котором root создаёт бакеты стенда.
+          #
+          # Обе учётки — в тенанте 2, клиентском (ADR-0018). В системном тенанте
+          # 1 проверять нечего: страж (ADR-0017) отказывает не-admin учётке
+          # системного тенанта, и тест «политика разрешает» проверял бы отказ
+          # стража вместо политики.
+          #
+          # Роли разные намеренно: бакет создаёт userplus — единственная не-admin
+          # роль, которой versitygw разрешает CreateBucket без identity-политик
+          # (access-control.go:597, для бэкендов без PolicyEvaluator). Обычный
+          # user бакет создать не может, и его права берутся только из политики
+          # бакета — это и есть проверяемый сценарий клиента: два ключа одного
+          # тенанта.
           cat > /tmp/iam/users.json <<'JSON'
-          {"accessAccounts":{"userplus":{"access":"userplus","secret":"usersecret","role":"user","userID":1001,"groupID":1001,"projectID":1}}}
+          {"accessAccounts":{
+            "userplus":{"access":"userplus","secret":"usersecret","role":"userplus","userID":1001,"groupID":1001,"projectID":2},
+            "userplain":{"access":"userplain","secret":"userplainsecret","role":"user","userID":1002,"groupID":1002,"projectID":2}
+          }}
           JSON
           # Heredoc без кавычек: нужен подстанов port'а. В теле других $
           # нет, и добавлять их сюда не следует — иначе начнут раскрываться.
@@ -172,14 +183,48 @@ jobs:
           done
           echo "tapegw не поднялся"; exit 1
 
+      # Тенант 2 (ADR-0018): строки о клиентских тенантах — это данные, а не
+      # схема, поэтому миграция заводит только системный тенант 1, а админ-API
+      # для создания тенантов появится на T4. До него стенд заводит тенант сам:
+      # без строки в tenants вставка бакета в тенант 2 упала бы на FK.
+      #
+      # Шаг обязан идти ПОСЛЕ старта tapegw: схему tapegw_ci создаёт применение
+      # миграций на старте процесса.
+      #
+      # psql берётся из контейнера сервиса, а не с раннера: клиент Postgres на
+      # образах раннеров меняется от версии к версии, а docker есть всегда —
+      # через него и поднимаются services. Контейнер ищется по опубликованному
+      # порту, который раннер вернул в job.services.postgres.ports.
+      - name: seed tenant 2
+        env:
+          TAPEGW_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+        run: |
+          if [ -z "${TAPEGW_PG_PORT}" ]; then
+            echo "раннер не вернул порт postgres"; exit 1
+          fi
+          cid=$(docker ps -q --filter "publish=${TAPEGW_PG_PORT}" | head -1)
+          if [ -z "${cid}" ]; then
+            echo "не нашли контейнер postgres на порту ${TAPEGW_PG_PORT}"; exit 1
+          fi
+          docker exec "$cid" psql -v ON_ERROR_STOP=1 -U tapegw -d phobos -c \
+            "SET search_path TO tapegw_ci;
+             INSERT INTO tenants (id, name, status, pool_id)
+             VALUES (2, 'ci-client', 'active', 1) ON CONFLICT (id) DO NOTHING"
+
       - name: e2e
         env:
           TAPEGW_E2E_ENDPOINT: http://127.0.0.1:7070
           TAPEGW_E2E_ACCESS: ci-access
           TAPEGW_E2E_SECRET: ci-secret
           # Обычный ключ: без него тесты доступа пропускаются, а не падают.
-          TAPEGW_E2E_USER_ACCESS: userplus
-          TAPEGW_E2E_USER_SECRET: usersecret
+          # userplain — роль user, права только из политики бакета.
+          TAPEGW_E2E_USER_ACCESS: userplain
+          TAPEGW_E2E_USER_SECRET: userplainsecret
+          # Ключ того же тенанта 2, который умеет создавать бакеты и выдавать
+          # права: без него проверка «политика разрешает» строилась бы на бакете
+          # системного тенанта.
+          TAPEGW_E2E_OWNER_ACCESS: userplus
+          TAPEGW_E2E_OWNER_SECRET: usersecret
         run: go test -count=1 ./test/e2e -v
 
   # Сборка с тегом phobos требует EL9 и исходников Phobos — это стенд ci-dir,

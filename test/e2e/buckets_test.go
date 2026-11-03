@@ -72,6 +72,22 @@ func userClient(t *testing.T) *s3.Client {
 	return clientWith(t, access, secret)
 }
 
+// ownerClient — ключ того же клиентского тенанта, который умеет создавать
+// бакеты и выдавать права (роль userplus: versitygw разрешает CreateBucket
+// не-admin только этой роли, auth/access-control.go:597, а identity-политик у
+// файлового IAM нет). Нужен затем, чтобы бакет стенда лежал в клиентском
+// тенанте, а не в системном: бакет, который создал root, принадлежит системному
+// тенанту, и проверка «политика разрешает чтение» проверяла бы доступ к бакету
+// системного тенанта вместо политики (ADR-0018).
+func ownerClient(t *testing.T) *s3.Client {
+	t.Helper()
+	access, secret := os.Getenv("TAPEGW_E2E_OWNER_ACCESS"), os.Getenv("TAPEGW_E2E_OWNER_SECRET")
+	if access == "" || secret == "" {
+		t.Skip("TAPEGW_E2E_OWNER_ACCESS / TAPEGW_E2E_OWNER_SECRET не заданы — пропускаем проверку доступа")
+	}
+	return clientWith(t, access, secret)
+}
+
 // userAccess — имя principal для политики: в файловом IAM им считается access
 // key, а не ARN (ARN умеет только standalone-IAM).
 func userAccess(t *testing.T) string {

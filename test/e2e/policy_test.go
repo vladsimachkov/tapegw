@@ -19,6 +19,13 @@ import (
 // на всё: versitygw вызывает его на каждом запросе и терпит ровно одну ошибку,
 // ErrNoSuchBucketPolicy (auth/access-control.go:421). Тесты на root этого не
 // ловили — root и admin идут мимо политик и ACL вообще.
+//
+// Сценарий строится **внутри клиентского тенанта 2** двумя его ключами
+// (ADR-0018): owner создаёт бакет и выдаёт права, user читает. Прежний вид
+// теста — бакет создаёт root, а читает userplus — по факту проверял доступ к
+// бакету системного тенанта. Разница для зелёного цвета не видна, поэтому здесь
+// она проверяется явно: отказ без политики и разрешение с политикой получают два
+// ключа одного тенанта, а не клиент и системный тенант.
 
 // policyFor — документ, дающий read только нашему пользователю. Principal в
 // файловом IAM — это access key, не ARN.
@@ -37,16 +44,19 @@ func isAccessDenied(err error) bool {
 }
 
 func TestBucketPolicyGrantsUser(t *testing.T) {
-	root := client(t)
+	owner := ownerClient(t)
 	user := userClient(t)
 	ctx := context.Background()
 	bucket := uniqueBucket("pol")
 
-	if _, err := root.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+	// Бакет создаёт ключ тенанта 2, значит и лежать он должен в тенанте 2.
+	// Если бы бакет достался системному тенанту, шаг 2 ниже не прошёл бы:
+	// страж отказывает раньше, чем политика успевает что-то разрешить.
+	if _, err := owner.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 	body := []byte("secret payload")
-	if _, err := root.PutObject(ctx, &s3.PutObjectInput{
+	if _, err := owner.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String("k"), Body: bytes.NewReader(body),
 	}); err != nil {
 		t.Fatalf("PutObject: %v", err)
@@ -60,8 +70,10 @@ func TestBucketPolicyGrantsUser(t *testing.T) {
 		t.Fatalf("без политики получили %v, хотели AccessDenied", err)
 	}
 
-	// 2. Политика выдаёт право — доступ появляется.
-	if _, err := root.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+	// 2. Политика выдаёт право — доступ появляется. Этот шаг и есть
+	// доказательство, что отказ выше пришёл от ACL и политики, а не от стража
+	// тенанта: чужому бакету политика не помог бы.
+	if _, err := owner.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
 		Bucket: aws.String(bucket), Policy: aws.String(string(policyFor(bucket, userAccess(t)))),
 	}); err != nil {
 		t.Fatalf("PutBucketPolicy: %v", err)
@@ -83,7 +95,7 @@ func TestBucketPolicyGrantsUser(t *testing.T) {
 
 	// 3. Политика возвращается дословно — колонка text затем и была, чтобы
 	//    jsonb не переставил ключи.
-	p, err := root.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)})
+	p, err := owner.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)})
 	if err != nil {
 		t.Fatalf("GetBucketPolicy: %v", err)
 	}
@@ -92,7 +104,7 @@ func TestBucketPolicyGrantsUser(t *testing.T) {
 	}
 
 	// 4. Сняли политику — снова отказ.
-	if _, err := root.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{
+	if _, err := owner.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{
 		Bucket: aws.String(bucket),
 	}); err != nil {
 		t.Fatalf("DeleteBucketPolicy: %v", err)
@@ -104,10 +116,43 @@ func TestBucketPolicyGrantsUser(t *testing.T) {
 	}
 
 	// 5. У бакета без политики — штатный NoSuchBucketPolicy, а не 500.
-	_, err = root.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)})
+	_, err = owner.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)})
 	var ae smithy.APIError
 	if !errors.As(err, &ae) || ae.ErrorCode() != "NoSuchBucketPolicy" {
 		t.Fatalf("без политики ответ %v, хотели NoSuchBucketPolicy", err)
+	}
+}
+
+// Политика не переписывает тенант: бакет системного тенанта остаётся закрытым
+// для ключа клиентского тенанта, даже когда документ прямо его разрешает.
+// Иначе «политика» стала бы способом перебраться через страж (ADR-0017).
+func TestBucketPolicyDoesNotCrossTenants(t *testing.T) {
+	root := client(t)
+	user := userClient(t)
+	ctx := context.Background()
+	bucket := uniqueBucket("xten")
+
+	// Бакет создаёт root — он попадает в системный тенант (ADR-0018), а у
+	// ключа стенда тенант клиентский.
+	if _, err := root.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	if _, err := root.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"), Body: bytes.NewReader([]byte("foreign")),
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	if _, err := root.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+		Bucket: aws.String(bucket), Policy: aws.String(string(policyFor(bucket, userAccess(t)))),
+	}); err != nil {
+		t.Fatalf("PutBucketPolicy: %v", err)
+	}
+
+	_, err := user.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"),
+	})
+	if !isAccessDenied(err) {
+		t.Fatalf("чужой бакет с разрешающей политикой вернул %v, хотели AccessDenied", err)
 	}
 }
 

@@ -46,16 +46,32 @@ TAPEGW_E2E_ACCESS=testaccess TAPEGW_E2E_SECRET=testsecret \
 
 Проверки доступа требуют **обычного** ключа: root и admin в versitygw идут мимо
 политик и ACL, поэтому e2e на root ничего про них не говорит. Для них в стенде
-нужен файловый IAM — `s3.iam_dir` с `users.json`:
+нужен файловый IAM — `s3.iam_dir` с `users.json`, и **две** учётки одного
+клиентского тенанта: одна создаёт бакет и выдаёт права, вторая читает только
+если политика разрешила (ADR-0018).
 
 ```bash
 mkdir -p /tmp/iam
 cat > /tmp/iam/users.json <<'JSON'
-{"accessAccounts":{"userplus":{"access":"userplus","secret":"usersecret","role":"user","userID":1001,"groupID":1001,"projectID":0}}}
+{"accessAccounts":{
+  "userplus":{"access":"userplus","secret":"usersecret","role":"userplus","userID":1001,"groupID":1001,"projectID":2},
+  "userplain":{"access":"userplain","secret":"userplainsecret","role":"user","userID":1002,"groupID":1002,"projectID":2}
+}}
 JSON
 # в конфиг tapegw: s3.iam_dir: /tmp/iam
 
-TAPEGW_E2E_USER_ACCESS=userplus TAPEGW_E2E_USER_SECRET=usersecret \
+# projectID — тенант учётки. Нужен клиентский тенант (2), а не 0 и не 1:
+# нуль страж (ADR-0017) читает как «тенанта нет» и отказывает до политики,
+# а в системном тенанте 1 не-admin учётку отсекает ADR-0018. В обоих случаях
+# тест «политика разрешает» проверял бы отказ стража вместо политики.
+# Миграция заводит только системный тенант, поэтому стенд добавляет свой сам:
+psql "$TAPEGW_TEST_DSN" -c "INSERT INTO tenants (id, name, status, pool_id) \
+  VALUES (2, 'e2e-client', 'active', 1) ON CONFLICT (id) DO NOTHING"
+
+# Роль владельца — userplus: бакеты без identity-политик может создавать только
+# она (auth/access-control.go:597), а роль user — нет.
+TAPEGW_E2E_USER_ACCESS=userplain TAPEGW_E2E_USER_SECRET=userplainsecret \
+TAPEGW_E2E_OWNER_ACCESS=userplus TAPEGW_E2E_OWNER_SECRET=usersecret \
   go test -count=1 ./test/e2e -run Policy -v
 ```
 
