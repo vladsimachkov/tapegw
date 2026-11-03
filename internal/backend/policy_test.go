@@ -1,14 +1,14 @@
 package backend_test
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/versity/versitygw/auth"
-
 	vs3err "github.com/versity/versitygw/s3err"
+
+	"github.com/vladsimachkov/tapegw/internal/meta"
 )
 
 // Смена владельца обязана менять ПРАВА, а не только колонку owner.
@@ -21,7 +21,8 @@ import (
 // возвращающие NotFound.
 func TestChangeBucketOwnerReassignsRights(t *testing.T) {
 	be, m, _ := newBackend(t)
-	ctx := context.Background()
+	// Смена владельца — admin API, под администратором и работаем.
+	ctx := adminCtx()
 
 	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("own")}, nil); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
@@ -73,7 +74,7 @@ func TestChangeBucketOwnerReassignsRights(t *testing.T) {
 	}
 
 	// 3. Инвариант: buckets.owner и acl.Owner не расходятся.
-	bucket, err := m.GetBucket(ctx, "own")
+	bucket, err := m.GetBucket(ctx, meta.NewTenant(testProjectID), "own")
 	if err != nil {
 		t.Fatalf("GetBucket: %v", err)
 	}

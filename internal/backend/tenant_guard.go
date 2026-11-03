@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
@@ -62,4 +63,51 @@ func tenantFromContext(ctx context.Context) (meta.TenantID, error) {
 		return meta.TenantID{}, s3err.GetAPIError(s3err.ErrAccessDenied)
 	}
 	return meta.NewTenant(acct.ProjectID), nil
+}
+
+// bucketErr превращает ошибку слоя meta в код S3 и только здесь различает
+// «бакета нет» и «бакет чужой».
+//
+// ErrNotFound от запроса с фильтром по тенанту означает одно из двух, и по
+// самому запросу они неразличимы. Разбирается вторым, дешёвым запросом — и
+// только на пути «ничего не нашлось»: когда бакет свой, второй запрос не
+// выполняется вовсе (ADR-0017, п. 1).
+//
+// Для обхода по роли фильтр не добавлялся вообще, значит «не найдено» и есть
+// «не найдено».
+func (t *TapeGW) bucketErr(ctx context.Context, bucket string, tenant meta.TenantID, err error) error {
+	if !errors.Is(err, meta.ErrNotFound) {
+		return mapMetaErr(err, bucket)
+	}
+	if tenant.IsBypass() {
+		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
+	}
+	exists, qErr := t.meta.BucketExistsAnyTenant(ctx, bucket)
+	if qErr != nil {
+		return mapMetaErr(qErr, bucket)
+	}
+	if exists {
+		// Бакет есть — просто не наш.
+		return s3err.GetAPIError(s3err.ErrAccessDenied)
+	}
+	return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
+}
+
+// objectErr — та же разборка для операций над объектом. Здесь три разных
+// ответа, и путать их нельзя: «нет такого ключа» в своём бакете — штатный
+// NoSuchKey, а чужой бакет — AccessDenied.
+//
+// Порядок: сначала «бакета мой?», и если да — это NoSuchKey без второго запроса.
+func (t *TapeGW) objectErr(ctx context.Context, bucket string, tenant meta.TenantID, err error) error {
+	if !errors.Is(err, meta.ErrNotFound) {
+		return mapMetaErr(err, bucket)
+	}
+	mine, qErr := t.meta.BucketExists(ctx, tenant, bucket)
+	if qErr != nil {
+		return mapMetaErr(qErr, bucket)
+	}
+	if mine {
+		return s3err.GetBucketErr(s3err.ErrNoSuchKey, bucket)
+	}
+	return t.bucketErr(ctx, bucket, tenant, meta.ErrNotFound)
 }

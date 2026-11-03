@@ -61,13 +61,32 @@ const testProjectID = 1
 // прямым SQL, подставляют его в колонку tenant_id.
 const testTenantID int64 = testProjectID
 
-// ownerCtx имитирует то, что делает versitygw: кладёт аккаунт запроса в контекст.
+// accountCtx имитирует то, что делает versitygw: кладёт учётку запроса в
+// контекст под ключом "account" (см. tenant_guard.go). Ключ — строка, своего
+// типа у versitygw для бэкенда нет.
 //
-// Ключ — строка, а не типизированный struct{}: именно так делает сам versitygw
-// (см. backend/posix/posix.go), а нам нужно прочитать то же значение.
-func ownerCtx(access string) context.Context {
+// Заодно дублируем учётку под "bucket-owner": его читает owner() при создании
+// бакета, и в бою его ставит админский CreateBucket.
+func accountCtx(acct auth.Account) context.Context {
 	//lint:ignore SA1029 ключ диктует versitygw, своего типа у него нет
-	return context.WithValue(context.Background(), "bucket-owner", auth.Account{Access: access})
+	ctx := context.WithValue(context.Background(), "account", acct)
+	//lint:ignore SA1029 ключ диктует versitygw, своего типа у него нет
+	return context.WithValue(ctx, "bucket-owner", acct)
+}
+
+// ownerCtx — обычный ключ тестового тенанта с указанным access.
+func ownerCtx(access string) context.Context {
+	return accountCtx(auth.Account{Access: access, Role: auth.RoleUser, ProjectID: testProjectID})
+}
+
+// testCtx — контекст «просто пользователя» тестового тенанта: большинство
+// тестов работает под ним.
+func testCtx() context.Context { return ownerCtx("tester") }
+
+// adminCtx — учётка администратора. Root в versitygw выглядит ровно так:
+// RoleAdmin при незаполненном ProjectID (authentication.go:44).
+func adminCtx() context.Context {
+	return accountCtx(auth.Account{Access: "root", Role: auth.RoleAdmin})
 }
 
 func ptr[T any](v T) *T { return &v }

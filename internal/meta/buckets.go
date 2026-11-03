@@ -34,8 +34,12 @@ type ListBucketsOpt struct {
 	After string
 }
 
-// CreateBucket вставляет активный бакет. existing различает «уже есть свой» и
-// реальную ошибку.
+// CreateBucket вставляет активный бакет и делает его тенанта `tenant`.
+// existing различает «уже есть свой» и реальную ошибку.
+//
+// Тенант здесь не проверка, а назначение: бакета ещё нет, сравнивать не с чем
+// (ADR-0017, п. 4). Обход по роли сюда не доходит — страж превращает его в
+// AdminTenantID, потому что бакет обязан принадлежать одному тенанту.
 //
 // Теги передаются здесь же, а не отдельным запросом: иначе между вставкой и
 // тегами падение процесса оставляет бакет без тегов, и клиент получит 200 с
@@ -45,15 +49,15 @@ type ListBucketsOpt struct {
 // могут успеть удалить (мягко). Тогда повторный SELECT не находит строки и
 // возвращает ErrNoRows: это не ошибка клиента, а редкая гонка, поэтому
 // вставку повторяем один раз.
-func (m *Meta) CreateBucket(ctx context.Context, name, owner string, acl []byte, tags map[string]string) (bool, error) {
-	existing, err := m.insertBucket(ctx, name, owner, acl, tags)
+func (m *Meta) CreateBucket(ctx context.Context, tenant TenantID, name, owner string, acl []byte, tags map[string]string) (bool, error) {
+	existing, err := m.insertBucket(ctx, tenant, name, owner, acl, tags)
 	if !errors.Is(err, ErrNotFound) {
 		return existing, err
 	}
-	return m.insertBucket(ctx, name, owner, acl, tags)
+	return m.insertBucket(ctx, tenant, name, owner, acl, tags)
 }
 
-func (m *Meta) insertBucket(ctx context.Context, name, owner string, acl []byte, tags map[string]string) (existing bool, err error) {
+func (m *Meta) insertBucket(ctx context.Context, tenant TenantID, name, owner string, acl []byte, tags map[string]string) (existing bool, err error) {
 	var tagsRaw []byte
 	if len(tags) > 0 {
 		if tagsRaw, err = json.Marshal(tags); err != nil {
@@ -66,12 +70,13 @@ func (m *Meta) insertBucket(ctx context.Context, name, owner string, acl []byte,
 	//
 	// tenant_id обязателен явно: колонка NOT NULL без DEFAULT (миграция 0005),
 	// чтобы забитый тенант не превращался в тихую запись в первый тенант.
-	// TODO(T1): до стража тенанта — дальше бакет получает тенанта параметром.
+	// Обход по роли здесь означал бы запись «ничейному бакету»: tenants.id = -1
+	// нарушает FK, то есть ошибка видна сразу, а не тихо расползается по данным.
 	tag, err := m.Pool.Exec(ctx,
 		`INSERT INTO buckets (name, owner, acl, tags, tenant_id)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (name) WHERE deleted_at IS NULL DO NOTHING`,
-		name, owner, acl, tagsRaw, AdminTenantID().arg())
+		name, owner, acl, tagsRaw, tenant.arg())
 	if err != nil {
 		return false, fmt.Errorf("insert bucket %q: %w", name, err)
 	}
@@ -100,31 +105,55 @@ func (m *Meta) insertBucket(ctx context.Context, name, owner string, acl []byte,
 // см. backend/posix/posix.go.
 var ErrBucketOwnedByOther = errors.New("meta: bucket owned by another account")
 
-// GetBucket возвращает активный бакет по имени.
-func (m *Meta) GetBucket(ctx context.Context, name string) (*Bucket, error) {
-	row := m.Pool.QueryRow(ctx,
+// GetBucket возвращает активный бакет по имени, принадлежащий tenant. Чужой
+// бакет — ErrNotFound, отличить его от «бакета нет» может только
+// BucketExistsAnyTenant (см. tenant_guard.go в бэкенде).
+func (m *Meta) GetBucket(ctx context.Context, tenant TenantID, name string) (*Bucket, error) {
+	q, args := withTenant(
 		`SELECT id, name, owner, acl, policy, tags, created_at, deleted_at
-		   FROM buckets WHERE name = $1 AND deleted_at IS NULL`, name)
+		   FROM buckets WHERE name = $1 AND deleted_at IS NULL`, tenant, name)
+	row := m.Pool.QueryRow(ctx, q, args...)
 	return scanBucket(row)
 }
 
 // BucketExists — дешёвая проверка наличия без разбора полей.
-func (m *Meta) BucketExists(ctx context.Context, name string) (bool, error) {
+func (m *Meta) BucketExists(ctx context.Context, tenant TenantID, name string) (bool, error) {
+	// EXISTS оборачивается уже после предиката тенанта: withTenant дописывает
+	// условие в конец, а внутри скобок оно нужнее — снаружи не из чего брать
+	// tenant_id.
+	inner, args := withTenant(
+		`SELECT 1 FROM buckets WHERE name = $1 AND deleted_at IS NULL`, tenant, name)
 	var ok bool
-	err := m.Pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM buckets WHERE name = $1 AND deleted_at IS NULL)`, name).Scan(&ok)
-	if err != nil {
+	if err := m.Pool.QueryRow(ctx, `SELECT EXISTS (`+inner+`)`, args...).Scan(&ok); err != nil {
 		return false, fmt.Errorf("exists bucket %q: %w", name, err)
 	}
 	return ok, nil
 }
 
-// ListBuckets перечисляет активные бакеты в порядке S3 (порядок байтов).
+// BucketExistsAnyTenant — «бакет с таким именем есть вообще, у любого
+// тенанта». Единственное назначение — различить NoSuchBucket и AccessDenied
+// после того, как тенант-ограниченный запрос ничего не нашёл (ADR-0017, п. 1).
+//
+// Вызывать его на обычном пути нельзя: свой бакет находится тенант-фильтром,
+// и второй запрос был бы платой за запрос, который ничего не проверяет.
+func (m *Meta) BucketExistsAnyTenant(ctx context.Context, name string) (bool, error) {
+	var ok bool
+	err := m.Pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM buckets WHERE name = $1 AND deleted_at IS NULL)`, name).Scan(&ok)
+	if err != nil {
+		return false, fmt.Errorf("exists any tenant bucket %q: %w", name, err)
+	}
+	return ok, nil
+}
+
+// ListBuckets перечисляет активные бакеты тенанта в порядке S3 (порядок
+// байтов). Внутри тенанта владельцы будут разные, когда появятся несколько
+// ключей одного тенанта, поэтому фильтр по владельцу остаётся (ADR-0017, п. 4).
 //
 // Префикс и max-buckets фильтруются в SQL, а не в Go: иначе запрос за
 // «первой страницей» вытаскивает все бакеты, а на кластере с десятками тысяч
 // бакетов это ещё и полный прогон индекса на каждый ListBuckets.
-func (m *Meta) ListBuckets(ctx context.Context, opt ListBucketsOpt) ([]Bucket, string, error) {
+func (m *Meta) ListBuckets(ctx context.Context, tenant TenantID, opt ListBucketsOpt) ([]Bucket, string, error) {
 	q := `SELECT id, name, owner, acl, policy, tags, created_at, deleted_at
 	        FROM buckets
 	       WHERE deleted_at IS NULL`
@@ -134,6 +163,9 @@ func (m *Meta) ListBuckets(ctx context.Context, opt ListBucketsOpt) ([]Bucket, s
 		q += ` AND ` + fmt.Sprintf(cond, len(args))
 	}
 
+	if !tenant.IsBypass() {
+		add(`tenant_id = $%d`, tenant.arg())
+	}
 	if opt.Owner != "" {
 		add(`owner = $%d`, opt.Owner)
 	}
@@ -205,11 +237,14 @@ func DecodeToken(token string) (string, error) {
 // Проверка и пометка — одна транзакция, иначе между ними может вставиться PUT.
 // Удаление мягкое: строки objects в deleting/deleted всё ещё ссылаются на бакет
 // по FK, жёсткое удаление дало бы FK violation.
-func (m *Meta) DeleteBucket(ctx context.Context, name string) error {
+func (m *Meta) DeleteBucket(ctx context.Context, tenant TenantID, name string) error {
 	return m.inTx(ctx, func(tx pgx.Tx) error {
 		var id int64
-		err := tx.QueryRow(ctx,
-			`SELECT id FROM buckets WHERE name = $1 AND deleted_at IS NULL FOR UPDATE`, name).Scan(&id)
+		// FOR UPDATE дописывается после предиката тенанта: он обязан идти
+		// после условий, иначе SQL невалиден.
+		lockQ, lockArgs := withTenant(
+			`SELECT id FROM buckets WHERE name = $1 AND deleted_at IS NULL`, tenant, name)
+		err := tx.QueryRow(ctx, lockQ+` FOR UPDATE`, lockArgs...).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -237,10 +272,11 @@ func (m *Meta) DeleteBucket(ctx context.Context, name string) error {
 // ErrBucketNotEmpty — DeleteBucket к непустому бакету (S3 BucketNotEmpty).
 var ErrBucketNotEmpty = errors.New("meta: bucket not empty")
 
-// SetBucketACL обновляет ACL активного бакета.
-func (m *Meta) SetBucketACL(ctx context.Context, name string, acl []byte) error {
-	tag, err := m.Pool.Exec(ctx,
-		`UPDATE buckets SET acl = $2 WHERE name = $1 AND deleted_at IS NULL`, name, acl)
+// SetBucketACL обновляет ACL активного бакета тенанта.
+func (m *Meta) SetBucketACL(ctx context.Context, tenant TenantID, name string, acl []byte) error {
+	q, args := withTenant(
+		`UPDATE buckets SET acl = $2 WHERE name = $1 AND deleted_at IS NULL`, tenant, name, acl)
+	tag, err := m.Pool.Exec(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("set acl %q: %w", name, err)
 	}
@@ -250,8 +286,8 @@ func (m *Meta) SetBucketACL(ctx context.Context, name string, acl []byte) error 
 	return nil
 }
 
-// SetBucketTags заменяет теги активного бакета. nil удаляет их полностью.
-func (m *Meta) SetBucketTags(ctx context.Context, name string, tags map[string]string) error {
+// SetBucketTags заменяет теги активного бакета тенанта. nil удаляет их полностью.
+func (m *Meta) SetBucketTags(ctx context.Context, tenant TenantID, name string, tags map[string]string) error {
 	var raw []byte
 	if tags != nil {
 		b, err := json.Marshal(tags)
@@ -260,8 +296,9 @@ func (m *Meta) SetBucketTags(ctx context.Context, name string, tags map[string]s
 		}
 		raw = b
 	}
-	tag, err := m.Pool.Exec(ctx,
-		`UPDATE buckets SET tags = $2 WHERE name = $1 AND deleted_at IS NULL`, name, raw)
+	q, args := withTenant(
+		`UPDATE buckets SET tags = $2 WHERE name = $1 AND deleted_at IS NULL`, tenant, name, raw)
+	tag, err := m.Pool.Exec(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("set tags %q: %w", name, err)
 	}

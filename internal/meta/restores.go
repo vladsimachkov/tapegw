@@ -61,12 +61,17 @@ func (r *Restore) HeaderValue() *string {
 	return &v
 }
 
-// GetRestore возвращает активный запрос восстановления объекта. ErrNotFound —
-// запроса нет, и это норма для большинства объектов.
-func (m *Meta) GetRestore(ctx context.Context, objectID uuid.UUID) (*Restore, error) {
-	row := m.Pool.QueryRow(ctx,
+// GetRestore возвращает активный запрос восстановления объекта того же
+// тенанта. ErrNotFound — запроса нет, и это норма для большинства объектов.
+//
+// Тенант берётся из restores.tenant_id (миграция 0005) — той же денормализации,
+// что у objects: сверка без JOIN, но и предикат обязан быть, иначе запрос
+// чужого объекта нашёл бы чужую строку.
+func (m *Meta) GetRestore(ctx context.Context, tenant TenantID, objectID uuid.UUID) (*Restore, error) {
+	q, args := withTenant(
 		`SELECT object_id, state, tier, days, requested_at, restored_at, expires_at
-		   FROM restores WHERE object_id = $1`, objectID)
+		   FROM restores WHERE object_id = $1`, tenant, objectID)
+	row := m.Pool.QueryRow(ctx, q, args...)
 
 	var r Restore
 	err := row.Scan(&r.ObjectID, &r.State, &r.Tier, &r.Days,

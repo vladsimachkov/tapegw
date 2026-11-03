@@ -21,11 +21,12 @@ var ErrNoBucketPolicy = errors.New("policy not set")
 // Байты сохраняются дословно: документ к этому моменту уже проверил versitygw
 // (auth.ValidatePolicyDocument), а отдавать мы обязаны ровно то, что прислал
 // клиент.
-func (m *Meta) SetBucketPolicy(ctx context.Context, bucket string, policy []byte) error {
-	tag, err := m.Pool.Exec(ctx,
+func (m *Meta) SetBucketPolicy(ctx context.Context, tenant TenantID, bucket string, policy []byte) error {
+	q, args := withTenant(
 		`UPDATE buckets SET policy = $2
 		  WHERE name = $1 AND deleted_at IS NULL`,
-		bucket, policy)
+		tenant, bucket, policy)
+	tag, err := m.Pool.Exec(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("set policy for %q: %w", bucket, err)
 	}
@@ -37,15 +38,17 @@ func (m *Meta) SetBucketPolicy(ctx context.Context, bucket string, policy []byte
 
 // GetBucketPolicy возвращает сырые байты политики.
 //
-// ErrNotFound — бакета нет (или он удалён). ErrNoBucketPolicy — бакет есть,
+// ErrNotFound — бакета нет (или он удалён, или он чужой: для этого вызывающего
+// они неразличимы, см. BucketExistsAnyTenant). ErrNoBucketPolicy — бакет есть,
 // политики нет. Разделение обязательно: если свести оба к одной ошибке,
 // «бакета нет» начнёт выглядеть как «политики нет», и проверка доступа пойдёт
 // дальше по пути «политика отсутствует» вместо того чтобы отказать.
-func (m *Meta) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error) {
+func (m *Meta) GetBucketPolicy(ctx context.Context, tenant TenantID, bucket string) ([]byte, error) {
 	var policy *string
-	err := m.Pool.QueryRow(ctx,
+	q, args := withTenant(
 		`SELECT policy FROM buckets WHERE name = $1 AND deleted_at IS NULL`,
-		bucket).Scan(&policy)
+		tenant, bucket)
+	err := m.Pool.QueryRow(ctx, q, args...).Scan(&policy)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -60,7 +63,8 @@ func (m *Meta) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, erro
 
 // ChangeBucketOwner передаёт бакет другой учётной записи. Вызывается только из
 // admin API (PATCH /change-bucket-owner), где versitygw уже проверил, что
-// новый владелец существует в IAM.
+// новый владелец существует в IAM. Тенант здесь — обход по роли: админ
+// перекладывает бакет между учётками, и фильтр по тенанту только помешал бы.
 //
 // Одной колонкой owner дело не ограничивается, и это та же форма тихой ошибки,
 // что заглушки с NotFound: versitygw решает, кто владелец, не по buckets.owner,
@@ -76,14 +80,15 @@ func (m *Meta) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, erro
 //
 // acl передаётся собранным извне: формат задают структуры versitygw, а пакет
 // meta про S3-обвязку знать не должен.
-func (m *Meta) ChangeBucketOwner(ctx context.Context, bucket, owner string, acl []byte) error {
-	tag, err := m.Pool.Exec(ctx,
+func (m *Meta) ChangeBucketOwner(ctx context.Context, tenant TenantID, bucket, owner string, acl []byte) error {
+	q, args := withTenant(
 		`UPDATE buckets
 		    SET owner = $2,
 		        acl = $3,
 		        policy = NULL
 		  WHERE name = $1 AND deleted_at IS NULL`,
-		bucket, owner, acl)
+		tenant, bucket, owner, acl)
+	tag, err := m.Pool.Exec(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("change owner of %q: %w", bucket, err)
 	}

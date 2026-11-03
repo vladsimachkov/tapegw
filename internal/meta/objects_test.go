@@ -13,9 +13,14 @@ import (
 	"github.com/vladsimachkov/tapegw/internal/testdb"
 )
 
+// testTenant — единственный тенант тестовой базы (`default` из миграции 0005).
+// Тенант — часть контракта каждой функции meta, работающей с бакетом (ADR-0017),
+// поэтому его нельзя «не указать».
+var testTenant = meta.NewTenant(1)
+
 func mustBucket(t *testing.T, m *meta.Meta, name string) {
 	t.Helper()
-	if _, err := m.CreateBucket(context.Background(), name, "tester", []byte(`{}`), nil); err != nil {
+	if _, err := m.CreateBucket(context.Background(), testTenant, name, "tester", []byte(`{}`), nil); err != nil {
 		t.Fatalf("CreateBucket(%s): %v", name, err)
 	}
 }
@@ -43,7 +48,7 @@ func TestPutGetObject(t *testing.T) {
 	in.Tags = map[string]string{"team": "infra"}
 	in.Checksums = map[string]string{"crc32": "AAAA"}
 
-	got, err := m.PutObject(ctx, in)
+	got, err := m.PutObject(ctx, testTenant, in)
 	if err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
@@ -57,7 +62,7 @@ func TestPutGetObject(t *testing.T) {
 		t.Errorf("online_until не проставлен")
 	}
 
-	back, err := m.GetObject(ctx, "b1", "dir/obj.txt")
+	back, err := m.GetObject(ctx, testTenant, "b1", "dir/obj.txt")
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}
@@ -79,7 +84,7 @@ func TestPutToMissingBucket(t *testing.T) {
 	m := testdb.Connect(t)
 	testdb.Clean(t, m)
 
-	_, err := m.PutObject(context.Background(), putInput("nope", "k"))
+	_, err := m.PutObject(context.Background(), testTenant, putInput("nope", "k"))
 	if !meta.IsNotFound(err) {
 		t.Errorf("ожидали ErrNotFound, получили %v", err)
 	}
@@ -96,17 +101,17 @@ func TestPutOverwriteKeepsOneCurrent(t *testing.T) {
 
 	first := putInput("b1", "k")
 	first.ETag = "first"
-	if _, err := m.PutObject(ctx, first); err != nil {
+	if _, err := m.PutObject(ctx, testTenant, first); err != nil {
 		t.Fatalf("первый PUT: %v", err)
 	}
 
 	second := putInput("b1", "k")
 	second.ETag = "second"
-	if _, err := m.PutObject(ctx, second); err != nil {
+	if _, err := m.PutObject(ctx, testTenant, second); err != nil {
 		t.Fatalf("второй PUT: %v", err)
 	}
 
-	back, err := m.GetObject(ctx, "b1", "k")
+	back, err := m.GetObject(ctx, testTenant, "b1", "k")
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}
@@ -142,11 +147,11 @@ func TestPutOverwriteRetiresOldVersion(t *testing.T) {
 	mustBucket(t, m, "b1")
 
 	first := putInput("b1", "k")
-	if _, err := m.PutObject(ctx, first); err != nil {
+	if _, err := m.PutObject(ctx, testTenant, first); err != nil {
 		t.Fatalf("первый PUT: %v", err)
 	}
 	second := putInput("b1", "k")
-	if _, err := m.PutObject(ctx, second); err != nil {
+	if _, err := m.PutObject(ctx, testTenant, second); err != nil {
 		t.Fatalf("второй PUT: %v", err)
 	}
 
@@ -204,7 +209,7 @@ func TestConcurrentOverwriteOneCurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := m.PutObject(ctx, putInput("b1", "hot")); err != nil {
+			if _, err := m.PutObject(ctx, testTenant, putInput("b1", "hot")); err != nil {
 				errs <- err
 			}
 		}()
@@ -242,7 +247,7 @@ func TestConcurrentDistinctKeys(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			in := putInput("b1", uuid.NewString())
-			if _, err := m.PutObject(ctx, in); err != nil {
+			if _, err := m.PutObject(ctx, testTenant, in); err != nil {
 				errs <- err
 			}
 		}(i)
@@ -268,7 +273,7 @@ func TestGetObjectMissing(t *testing.T) {
 	testdb.Clean(t, m)
 	mustBucket(t, m, "b1")
 
-	if _, err := m.GetObject(context.Background(), "b1", "нет"); !meta.IsNotFound(err) {
+	if _, err := m.GetObject(context.Background(), testTenant, "b1", "нет"); !meta.IsNotFound(err) {
 		t.Errorf("ожидали ErrNotFound, получили %v", err)
 	}
 }
@@ -280,17 +285,17 @@ func TestGetObjectByID(t *testing.T) {
 	mustBucket(t, m, "b1")
 
 	in := putInput("b1", "k")
-	if _, err := m.PutObject(ctx, in); err != nil {
+	if _, err := m.PutObject(ctx, testTenant, in); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
-	back, err := m.GetObjectByID(ctx, in.ID)
+	back, err := m.GetObjectByID(ctx, testTenant, in.ID)
 	if err != nil {
 		t.Fatalf("GetObjectByID: %v", err)
 	}
 	if back.Key != "k" {
 		t.Errorf("ключ разошёлся: %q", back.Key)
 	}
-	if _, err := m.GetObjectByID(ctx, uuid.New()); !meta.IsNotFound(err) {
+	if _, err := m.GetObjectByID(ctx, testTenant, uuid.New()); !meta.IsNotFound(err) {
 		t.Errorf("для неизвестного UUID ожидали ErrNotFound, получили %v", err)
 	}
 }
@@ -375,7 +380,7 @@ func TestOverwriteUnversionedReplacesNullVersion(t *testing.T) {
 	for i, etag := range []string{"v1", "v2", "v3"} {
 		in := putInput("unv", "k")
 		in.ETag = etag
-		if _, err := m.PutObject(ctx, in); err != nil {
+		if _, err := m.PutObject(ctx, testTenant, in); err != nil {
 			t.Fatalf("PUT %d (%s): %v", i+1, etag, err)
 		}
 		current, nulls, states := rowsByKey(t, m, "unv", "k")
@@ -428,12 +433,12 @@ func TestOverwriteVersionedKeepsOldVersion(t *testing.T) {
 
 	first := putInput("ver", "k")
 	first.ETag = "v1"
-	if _, err := m.PutObject(ctx, first); err != nil {
+	if _, err := m.PutObject(ctx, testTenant, first); err != nil {
 		t.Fatalf("первый PUT: %v", err)
 	}
 	second := putInput("ver", "k")
 	second.ETag = "v2"
-	if _, err := m.PutObject(ctx, second); err != nil {
+	if _, err := m.PutObject(ctx, testTenant, second); err != nil {
 		t.Fatalf("второй PUT: %v", err)
 	}
 
@@ -450,7 +455,7 @@ func TestOverwriteVersionedKeepsOldVersion(t *testing.T) {
 	}
 
 	// И GetObject обязан отдавать новую.
-	back, err := m.GetObject(ctx, "ver", "k")
+	back, err := m.GetObject(ctx, testTenant, "ver", "k")
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}
@@ -471,7 +476,7 @@ func TestOverwriteSuspendedReplacesNullVersion(t *testing.T) {
 	for _, etag := range []string{"v1", "v2"} {
 		in := putInput("susp", "k")
 		in.ETag = etag
-		if _, err := m.PutObject(ctx, in); err != nil {
+		if _, err := m.PutObject(ctx, testTenant, in); err != nil {
 			t.Fatalf("PUT %s: %v", etag, err)
 		}
 	}
@@ -503,7 +508,7 @@ func TestConcurrentOverwriteVersionedOneCurrent(t *testing.T) {
 			defer wg.Done()
 			in := putInput("race", "k")
 			in.ETag = fmt.Sprintf("etag-%d", i)
-			_, errs[i] = m.PutObject(ctx, in)
+			_, errs[i] = m.PutObject(ctx, testTenant, in)
 		}(i)
 	}
 	wg.Wait()
@@ -561,14 +566,14 @@ func TestSuspendedDoesNotDeleteNormalVersion(t *testing.T) {
 
 	v1 := putInput("susp2", "k")
 	v1.ETag = "v1-normal"
-	if _, err := m.PutObject(ctx, v1); err != nil {
+	if _, err := m.PutObject(ctx, testTenant, v1); err != nil {
 		t.Fatalf("PUT v1 при enabled: %v", err)
 	}
 
 	setVersioning(t, m, "susp2", meta.VersioningSuspended)
 	v2 := putInput("susp2", "k")
 	v2.ETag = "v2-null"
-	if _, err := m.PutObject(ctx, v2); err != nil {
+	if _, err := m.PutObject(ctx, testTenant, v2); err != nil {
 		t.Fatalf("PUT v2 при suspended: %v", err)
 	}
 
@@ -622,7 +627,7 @@ func TestSuspendedAfterEnabledAfterUnversioned(t *testing.T) {
 		setVersioning(t, m, "cycle", st.state)
 		in := putInput("cycle", "k")
 		in.ETag = st.etag
-		if _, err := m.PutObject(ctx, in); err != nil {
+		if _, err := m.PutObject(ctx, testTenant, in); err != nil {
 			t.Fatalf("PUT %s при %s: %v", st.etag, st.state, err)
 		}
 	}

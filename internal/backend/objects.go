@@ -34,6 +34,13 @@ import (
 // Обратный порядок был бы хуже во всех смыслах: строка без файла даёт 500 на
 // каждом GET и HeadObject.
 func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
+	// Страж — первым делом, до разбора тела и заголовков: отказ не должен
+	// зависеть от того, что именно клиент прислал дальше.
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+
 	// Шифрование клиентским ключом мы не делаем: ключ пришлось бы хранить вместе
 	// с данными, а это уже не «прозрачная лента». Отказ явный, по правилу 4.
 	if vbackend.HasSSEC(po.SSECustomerAlgorithm, po.SSECustomerKey, po.SSECustomerKeyMD5) {
@@ -61,10 +68,11 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrEntityTooLarge)
 	}
 
-	if ok, err := t.meta.BucketExists(ctx, bucket); err != nil {
+	if ok, err := t.meta.BucketExists(ctx, tenant, bucket); err != nil {
 		return s3response.PutObjectOutput{}, tapegwerr.FromMeta(err, bucket)
 	} else if !ok {
-		return s3response.PutObjectOutput{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
+		// Чужой бакет — AccessDenied, а не NoSuchBucket: см. ADR-0017, п. 1.
+		return s3response.PutObjectOutput{}, t.bucketErr(ctx, bucket, tenant, meta.ErrNotFound)
 	}
 
 	tags, err := vbackend.ParseObjectTags(str(po.Tagging))
@@ -84,7 +92,7 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		return vbackend.EvaluateObjectPutPreconditions(curEtag, po.IfMatch, po.IfNoneMatch, exists)
 	}
 	if po.IfMatch != nil || po.IfNoneMatch != nil {
-		switch cur, err := t.meta.GetObject(ctx, bucket, key); {
+		switch cur, err := t.meta.GetObject(ctx, tenant, bucket, key); {
 		case err == nil:
 			if err := precondition(cur.ETag, true); err != nil {
 				return s3response.PutObjectOutput{}, err
@@ -148,7 +156,7 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		return s3response.PutObjectOutput{}, s3err.GetChecksumBadDigestErr(algo)
 	}
 
-	_, err = t.meta.PutObject(ctx, meta.PutObjectInput{
+	_, err = t.meta.PutObject(ctx, tenant, meta.PutObjectInput{
 		ID:           id,
 		Bucket:       bucket,
 		Key:          key,
@@ -199,15 +207,19 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 // клиента ошибкой. В архитектуре то же правило: HEAD и LIST работают только по
 // meta DB, ленту не трогают.
 func (t *TapeGW) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := checkVersionID(input.VersionId); err != nil {
 		return nil, err
 	}
-	obj, err := t.meta.GetObject(ctx, str(input.Bucket), str(input.Key))
+	obj, err := t.meta.GetObject(ctx, tenant, str(input.Bucket), str(input.Key))
 	if err != nil {
-		return nil, objectErr(err, str(input.Bucket), str(input.Key))
+		return nil, t.objectErr(ctx, str(input.Bucket), tenant, err)
 	}
 
-	restore, err := t.restoreHeader(ctx, obj)
+	restore, err := t.restoreHeader(ctx, tenant, obj)
 	if err != nil {
 		return nil, err
 	}
@@ -239,14 +251,18 @@ func (t *TapeGW) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3
 // InvalidObjectState, а не 500.
 func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
 	bucket, key := str(input.Bucket), str(input.Key)
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := checkVersionID(input.VersionId); err != nil {
 		return nil, err
 	}
 
 	for attempt := 0; ; attempt++ {
-		obj, err := t.meta.GetObject(ctx, bucket, key)
+		obj, err := t.meta.GetObject(ctx, tenant, bucket, key)
 		if err != nil {
-			return nil, objectErr(err, bucket, key)
+			return nil, t.objectErr(ctx, bucket, tenant, err)
 		}
 		if !obj.ReadableFromDisk(time.Now()) {
 			return nil, s3err.GetBucketErr(s3err.ErrInvalidObjectState, bucket)
@@ -283,7 +299,7 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 			return nil, fmt.Errorf("open object %s/%s: %w", bucket, key, err)
 		}
 
-		out, err := t.buildGetOutput(ctx, obj, f, str(input.Range))
+		out, err := t.buildGetOutput(ctx, tenant, obj, f, str(input.Range))
 		if err != nil {
 			f.Close()
 			return nil, err
@@ -294,7 +310,7 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 
 // buildGetOutput собирает ответ, включая Range. Файл остаётся открытым:
 // versitygw закрывает Body сам.
-func (t *TapeGW) buildGetOutput(ctx context.Context, obj *meta.Object, f *os.File, rng string) (*s3.GetObjectOutput, error) {
+func (t *TapeGW) buildGetOutput(ctx context.Context, tenant meta.TenantID, obj *meta.Object, f *os.File, rng string) (*s3.GetObjectOutput, error) {
 	start, length, hasRange, err := vbackend.ParseObjectRange(obj.Size, rng)
 	if err != nil {
 		return nil, err
@@ -313,7 +329,7 @@ func (t *TapeGW) buildGetOutput(ctx context.Context, obj *meta.Object, f *os.Fil
 		contentRange = &v
 	}
 
-	restore, err := t.restoreHeader(ctx, obj)
+	restore, err := t.restoreHeader(ctx, tenant, obj)
 	if err != nil {
 		return nil, err
 	}
@@ -340,8 +356,8 @@ func (t *TapeGW) buildGetOutput(ctx context.Context, obj *meta.Object, f *os.Fil
 // restoreHeader — x-amz-restore по ADR-0003. nil, если запроса восстановления
 // не было: для онлайнового объекта заголовок не нужен, а фиктивная дата
 // (как делал scoutfs через 2050 год) обещала бы доступность, которой нет.
-func (t *TapeGW) restoreHeader(ctx context.Context, obj *meta.Object) (*string, error) {
-	r, err := t.meta.GetRestore(ctx, obj.ID)
+func (t *TapeGW) restoreHeader(ctx context.Context, tenant meta.TenantID, obj *meta.Object) (*string, error) {
+	r, err := t.meta.GetRestore(ctx, tenant, obj.ID)
 	if errors.Is(err, meta.ErrNotFound) {
 		return nil, nil
 	}
@@ -361,15 +377,7 @@ type rangeReader struct {
 func (r *rangeReader) Read(p []byte) (int, error) { return r.r.Read(p) }
 func (r *rangeReader) Close() error               { return r.c.Close() }
 
-// objectErr различает «нет такого ключа» и прочие ошибки. Для чужого бакета
-// NoSuchKey был бы неправдой, поэтому бакет подставляется в GetBucketErr.
-func objectErr(err error, bucket, key string) error {
-	if errors.Is(err, meta.ErrNotFound) {
-		return s3err.GetBucketErr(s3err.ErrNoSuchKey, bucket)
-	}
-	return tapegwerr.FromMeta(err, bucket)
-}
-
+// str — распаковать *string из структур versitygw: там каждое поле указатель.
 func str(p *string) string {
 	if p == nil {
 		return ""
