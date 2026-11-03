@@ -64,37 +64,54 @@ func New(m *meta.Meta, keys *KeyRing, opts Options) (*Service, error) {
 // (middlewares/authentication.go:97), и различать эти случаи наружу нельзя —
 // «отозван» и «не существует» для постороннего один ответ.
 func (s *Service) GetUserAccount(access string) (auth.Account, error) {
-	ctx := context.Background()
+	row, err := s.row(context.Background(), access)
+	if err != nil {
+		return auth.Account{}, err
+	}
+	return s.account(row)
+}
 
+// row — строка учётки как она лежит в БД: с обёрнутым секретом и без
+// расшифровки. Отдельно от account() ради кэша (см. cache.go): кэш держит
+// именно строку, поэтому открытый секрет живёт только внутри вызова.
+//
+// Ошибки «учётки нет» и «отозвана» сведены к auth.ErrNoSuchUser здесь, а не в
+// вызывающем: кэш должен кэшировать тот же ответ, что вернул бы сервис без кэша.
+func (s *Service) row(ctx context.Context, access string) (meta.Account, error) {
 	if access == s.rootAccess {
-		return auth.Account{}, auth.ErrNoSuchUser
+		return meta.Account{}, auth.ErrNoSuchUser
 	}
 
 	row, err := s.meta.GetAccount(ctx, access)
 	if errors.Is(err, meta.ErrNotFound) {
-		return auth.Account{}, auth.ErrNoSuchUser
+		return meta.Account{}, auth.ErrNoSuchUser
 	}
 	if err != nil {
-		return auth.Account{}, fmt.Errorf("iam: учётка %q: %w", access, err)
+		return meta.Account{}, fmt.Errorf("iam: учётка %q: %w", access, err)
 	}
 	if row.Status != meta.AccountActive {
-		return auth.Account{}, auth.ErrNoSuchUser
+		return meta.Account{}, auth.ErrNoSuchUser
 	}
+	return row, nil
+}
 
-	secret, err := s.keys.Open(row.SecretWrapped, row.KekVersion, []byte(access))
+// account — развёрнутая строка в auth.Account для versitygw. Расшифровка
+// здесь, а не в row: открытый секрет не задерживается в памяти дольше вызова.
+func (s *Service) account(row meta.Account) (auth.Account, error) {
+	secret, err := s.keys.Open(row.SecretWrapped, row.KekVersion, []byte(row.Access))
 	if err != nil {
 		// Ни байта из обёртки или секрета в тексте: ошибка уходит в лог
 		// versitygw (debuglogger.InternalError) как есть.
-		return auth.Account{}, fmt.Errorf("iam: учётка %q: %w", access, err)
+		return auth.Account{}, fmt.Errorf("iam: учётка %q: %w", row.Access, err)
 	}
 
 	tenant, err := projectID(row.TenantID)
 	if err != nil {
-		return auth.Account{}, fmt.Errorf("iam: учётка %q: %w", access, err)
+		return auth.Account{}, fmt.Errorf("iam: учётка %q: %w", row.Access, err)
 	}
 
 	return auth.Account{
-		Access: access,
+		Access: row.Access,
 		Secret: string(secret),
 		Role:   auth.Role(row.Role),
 		// ProjectID и есть тенант (ADR-0009): бэкенд берёт из него

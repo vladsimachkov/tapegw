@@ -135,12 +135,28 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		// Кэш обязателен: GetUserAccount вызывается на каждом запросе (ADR-0016).
+		// Start не возвращает управление, пока подписка на уведомления не
+		// поднята, — иначе первый же запрос мог бы закешировать учётку, про
+		// изменение которой мы уже никогда не узнаем.
+		cache, err := iam.NewCache(svc, iam.CacheOptions{
+			TTL: cfg.IAM.CacheTTL,
+			Max: cfg.IAM.CacheMaxEntries,
+			DSN: cfg.DB.DSN,
+		})
+		if err != nil {
+			return err
+		}
+		if err := cache.Start(ctx); err != nil {
+			return err
+		}
 		// Поле обходит все прочие IAM-бэкенды versitygw, включая iam_dir
 		// (embedgw.go:199), поэтому рядом оно уже не используется.
-		gwCfg.IAMService = svc
+		gwCfg.IAMService = cache
 		logger.Info("iam: учётки из Postgres",
 			slog.String("kek_file", cfg.IAM.KEKFile),
-			slog.Int("kek_version", cfg.IAM.KEKVersion))
+			slog.Int("kek_version", cfg.IAM.KEKVersion),
+			slog.Duration("cache_ttl", cfg.IAM.CacheTTL))
 	}
 
 	logger.Info("starting s3 gateway",

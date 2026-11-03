@@ -77,6 +77,23 @@ func ConnectSchema(t *testing.T, schema string) *meta.Meta {
 	return m
 }
 
+// DSN возвращает DSN схемы пакета — то же подключение, что поднимает Connect.
+// Нужен тестам кэша IAM: листенер подключается отдельным соединением, а не из
+// пула, и ему нужен свой DSN с той же search_path.
+func DSN(t *testing.T) string {
+	t.Helper()
+
+	raw := os.Getenv(DSNEnv)
+	if raw == "" {
+		t.Skipf("%s не задан — пропускаем тест, которому нужен Postgres", DSNEnv)
+	}
+	dsn, err := withSchema(raw, PackageSchema(t))
+	if err != nil {
+		t.Fatalf("%s: %v", DSNEnv, err)
+	}
+	return dsn
+}
+
 // DropSchema удаляет схему вместе с содержимым, если она есть. Нужен тестам,
 // которые обязаны стартовать с чистой схемы: имя схемы детерминировано, поэтому
 // состояние прошлого прогона иначе переедает в следующий, и падение начнёт

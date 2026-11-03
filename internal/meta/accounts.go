@@ -55,6 +55,29 @@ type AccountPatch struct {
 // IAM: «уже есть» и «нет такого» для админской операции — разные ответы.
 var ErrAccountExists = errors.New("meta: account exists")
 
+// AccountsNotifyChannel — канал LISTEN/NOTIFY, по которому кэш IAM узнаёт об
+// изменении учётки (ADR-0016). Payload — access_key изменившейся учётки.
+const AccountsNotifyChannel = "tapegw_accounts_changed"
+
+// notifyAccountChanged — событие «учётка изменилась», из-за которого кэш
+// сбрасывает запись.
+//
+// Вызывается **в той же транзакции**, что и сама правка, и это не стиль:
+// pg_notify внутри транзакции доставляется только после коммита. Значит
+// листенер не может получить событие про строку, которая так и не изменилась
+// (транзакцию откатили), и не может пропустить изменение, которое уже
+// закоммичено: окна между «данные видны всем» и «событие ушло» нет.
+//
+// Границу надо знать явно: мгновенно сбрасывается кэш изменений, сделанных
+// через tapegw. Правка accounts в обход этих функций — ручной SQL, другой
+// инструмент — события не порождает, и там остаётся TTL-страховка кэша.
+func notifyAccountChanged(ctx context.Context, tx pgx.Tx, access string) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, AccountsNotifyChannel, access); err != nil {
+		return fmt.Errorf("notify account %q: %w", access, err)
+	}
+	return nil
+}
+
 // accountColumns — общий список, чтобы SELECT и ListAccounts не разъезжались.
 const accountColumns = `access_key, secret_wrapped, kek_version, role,
 	tenant_id, tenant_system, status`
@@ -130,7 +153,7 @@ func (m *Meta) CreateAccount(ctx context.Context, a Account) error {
 			}
 			return fmt.Errorf("insert account: %w", err)
 		}
-		return nil
+		return notifyAccountChanged(ctx, tx, a.Access)
 	})
 }
 
@@ -198,7 +221,7 @@ func (m *Meta) UpdateAccount(ctx context.Context, access string, p AccountPatch)
 		if tag.RowsAffected() == 0 {
 			return ErrNotFound
 		}
-		return nil
+		return notifyAccountChanged(ctx, tx, access)
 	})
 }
 
@@ -210,14 +233,16 @@ func (m *Meta) UpdateAccount(ctx context.Context, access string, p AccountPatch)
 // MissingAccounts). Разница между ними появится вместе с админ-API (T4), где
 // status и нужен для аудита.
 func (m *Meta) DeleteAccount(ctx context.Context, access string) error {
-	tag, err := m.Pool.Exec(ctx, `DELETE FROM accounts WHERE access_key = $1`, access)
-	if err != nil {
-		return fmt.Errorf("delete account: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return m.inTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `DELETE FROM accounts WHERE access_key = $1`, access)
+		if err != nil {
+			return fmt.Errorf("delete account: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return notifyAccountChanged(ctx, tx, access)
+	})
 }
 
 // ListAccounts — все учётки, включая отозванные: админский вывод обязан

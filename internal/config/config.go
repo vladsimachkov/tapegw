@@ -81,6 +81,14 @@ type IAM struct {
 	// версии остаются в файле, пока на них ссылается хоть одна строка accounts
 	// (ADR-0014), поэтому номер — настройка, а не «максимальная в файле».
 	KEKVersion int `yaml:"kek_version"`
+	// CacheTTL — срок жизни записи кэша учёток. Инвалидация мгновенная и не по
+	// TTL (LISTEN/NOTIFY, ADR-0016); TTL — страховка на правку accounts мимо
+	// tapegw, поэтому он обязан быть: без него отозванная вручную учётка
+	// работала бы без ограничения по времени.
+	CacheTTL time.Duration `yaml:"cache_ttl"`
+	// CacheMaxEntries — потолок записей в кэше: access_key выбирает клиент,
+	// и без потолка перебор случайных ключей раздувал бы память.
+	CacheMaxEntries int `yaml:"cache_max_entries"`
 }
 
 type DB struct {
@@ -260,7 +268,9 @@ func Default() *Config {
 			AdvisoryLockTimeout: 30 * time.Second,
 		},
 		IAM: IAM{
-			KEKVersion: 1,
+			KEKVersion:      1,
+			CacheTTL:        5 * time.Minute,
+			CacheMaxEntries: 10000,
 		},
 		Spool: Spool{
 			Landing:          "/srv/tapegw/landing",
@@ -498,6 +508,14 @@ func (c *Config) Validate() error {
 	}
 	if c.IAM.KEKFile != "" && c.IAM.KEKVersion < 1 {
 		add("iam.kek_version: %d, должно быть >= 1", c.IAM.KEKVersion)
+	}
+	// Ноль здесь — не «бессрочный кэш», а дыра: правка accounts мимо tapegw
+	// вообще не имела бы границы устаревания.
+	if c.IAM.CacheTTL <= 0 {
+		add("iam.cache_ttl: %v, должно быть больше нуля — это страховка кэша", c.IAM.CacheTTL)
+	}
+	if c.IAM.CacheMaxEntries < 1 {
+		add("iam.cache_max_entries: %d, должно быть >= 1", c.IAM.CacheMaxEntries)
 	}
 	if c.DB.MaxConns < 1 {
 		add("db.max_conns: %d, должно быть >= 1", c.DB.MaxConns)

@@ -99,7 +99,13 @@ func (e *env) get(t *testing.T, access string) meta.Account {
 	return a
 }
 
-func mustCreate(t *testing.T, svc *iam.Service, access, secret string, role auth.Role, tenant int) {
+// accountCreator — то, чем тест заводит учётку: и сервис, и кэш подходят.
+// Интерфейс нужен, чтобы одни и те же помощники работали с обеими поверхностями.
+type accountCreator interface {
+	CreateAccount(auth.Account) error
+}
+
+func mustCreate(t *testing.T, svc accountCreator, access, secret string, role auth.Role, tenant int) {
 	t.Helper()
 	if err := svc.CreateAccount(auth.Account{
 		Access: access, Secret: secret, Role: role, ProjectID: tenant,
