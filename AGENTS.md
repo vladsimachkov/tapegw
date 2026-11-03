@@ -72,6 +72,16 @@ TAPEGW_E2E_ACCESS=testaccess TAPEGW_E2E_SECRET=testsecret \
    Так же с `GetBucketVersioning`: posix возвращает пустую конфигурацию (200),
    потому что GUI-клиенты опрашивают её при просмотре бакета. Прежде чем оставить
    операцию в `BackendUnsupported`, проверьте, не дёргает ли её versitygw сам.
+
+   И обратная сторона той же ловушки, строже: **заглушка, возвращающая `NotFound`,
+   опаснее отсутствия метода, если от этого ответа зависит проверка безопасности.**
+   Пример — Object Lock: `loadObjectLockState` при
+   `ObjectLockConfigurationNotFound` считает бакет разблокированным и пропускает
+   все проверки, а `GetObjectRetention` с `NoSuchObjectLockConfiguration` отключает
+   сверку retention. Заглушка «отвечаю NotFound на всё» не ломает запрос — она молча
+   отключает неизменяемость: всё проходит, ошибок нет, блокировка не работает. Такие
+   методы пишутся сразу вместе с проверкой и покрываются тестом на каждый код
+   контракта (см. [ADR-0015](docs/adr/0015-versioning-and-object-lock.md)).
 5. **Поведение S3 берём из кода versitygw, не выдумываем.** Для обычных операций —
    posix-бэкенд, для Glacier-семантики (`x-amz-restore`, storage class,
    RestoreObject) — `backend/scoutfs/scoutfs_compat.go`.
