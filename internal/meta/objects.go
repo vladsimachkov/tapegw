@@ -99,7 +99,7 @@ type PutObjectInput struct {
 //
 // Локи берём в этом порядке всегда и только в нём: обратный порядок дал бы
 // взаимоблокировку с DeleteBucket, который сначала блокирует бакет.
-func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error) {
+func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput) (*Object, error) {
 	checksums, err := json.Marshal(in.Checksums)
 	if err != nil {
 		return nil, fmt.Errorf("marshal checksums: %w", err)
@@ -127,19 +127,28 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 		}
 
 		// 2. Бакет на чтение: конфликтует с FOR UPDATE у DeleteBucket, но не
-		//    мешает параллельным PUT в тот же бакет.
+		//    мешает параллельным PUT в тот же бакет. Предикат тенанта здесь же:
+		//    писать в чужой бакет не за что проверять, запрос просто не найдёт
+		//    его и отдаст ErrNotFound.
 		var bucketID int64
 		var versioning string
-		err := tx.QueryRow(ctx,
-			`SELECT id, versioning FROM buckets
-			  WHERE name = $1 AND deleted_at IS NULL FOR SHARE`,
-			in.Bucket).Scan(&bucketID, &versioning)
+		var bucketTenant int64
+		bucketQ, bucketArgs := withTenant(
+			`SELECT id, versioning, tenant_id FROM buckets
+			  WHERE name = $1 AND deleted_at IS NULL`, tenant, in.Bucket)
+		err := tx.QueryRow(ctx, bucketQ+` FOR SHARE`, bucketArgs...).Scan(&bucketID, &versioning, &bucketTenant)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
 		if err != nil {
 			return fmt.Errorf("lock bucket %q: %w", in.Bucket, err)
 		}
+
+		// Объект наследует тенанта БАКЕТА, а не учётки (ADR-0017 п. 6). У
+		// учётки с обходом по роли тенанта нет вовсе, и подстановка её значения
+		// в objects.tenant_id означала бы FK violation на tenants — то есть 500
+		// на каждый PUT администратором. Фильтр выше при этом не ослабевает:
+		// чужой бакет запрос просто не находит.
 
 		// Пока версии не включены, у объекта versionId = "null" в смысле AWS.
 		// По этому же признаку прежняя строка уходит в deleting (шаг 4), а не
@@ -235,6 +244,8 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 		//
 		// tenant_id и pool_id передаются явно: колонки NOT NULL без DEFAULT
 		// (миграция 0005), чтобы забытый тенант падал, а не писался в первый.
+		// Объект наследует тенанта бакета, в который он пишется, — страж уже
+		// не дал записать его в чужой.
 		//
 		// is_null_version ставится по состоянию бакета: пока версии не включены,
 		// у объекта versionId = "null" в смысле AWS. Именно эта пометка потом
@@ -250,7 +261,7 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 			           online_until, created_at, archived_at`,
 			in.ID, bucketID, in.Key, in.Size, in.ETag, checksums,
 			in.ContentType, userMeta, in.ACL, tags, in.StorageClass,
-			in.OnlineUntil, DefaultTenantID, DefaultPoolID, nullVersion)
+			in.OnlineUntil, bucketTenant, DefaultPoolID, nullVersion)
 		if err != nil {
 			return fmt.Errorf("insert object %s/%s: %w", in.Bucket, in.Key, err)
 		}
@@ -277,26 +288,32 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 	return out, nil
 }
 
-// GetObject возвращает текущую строку объекта.
-func (m *Meta) GetObject(ctx context.Context, bucket, key string) (*Object, error) {
-	row := m.Pool.QueryRow(ctx,
+// GetObject возвращает текущую строку объекта того же тенанта, что и бакет.
+func (m *Meta) GetObject(ctx context.Context, tenant TenantID, bucket, key string) (*Object, error) {
+	q, args := withTenantCol(
 		`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
 		        o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
 		        o.state, o.landing, o.online_until, o.created_at, o.archived_at
 		   FROM objects o
 		   JOIN buckets b ON b.id = o.bucket_id
 		  WHERE b.name = $1 AND b.deleted_at IS NULL
-		    AND o.key = $2 AND o.is_current`, bucket, key)
+		    AND o.key = $2 AND o.is_current`,
+		"b.tenant_id", tenant, bucket, key)
+	row := m.Pool.QueryRow(ctx, q, args...)
 	return scanObject(row)
 }
 
 // GetObjectByID — строка по UUID. Нужен mover-у: у него в аргументах только id.
-func (m *Meta) GetObjectByID(ctx context.Context, id uuid.UUID) (*Object, error) {
-	row := m.Pool.QueryRow(ctx,
+// Тенант фильтруется по objects.tenant_id — денормализация из миграции 0005
+// ради того, чтобы такие выборки не требовали JOIN с buckets.
+func (m *Meta) GetObjectByID(ctx context.Context, tenant TenantID, id uuid.UUID) (*Object, error) {
+	q, args := withTenantCol(
 		`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
 		        o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
 		        o.state, o.landing, o.online_until, o.created_at, o.archived_at
-		   FROM objects o WHERE o.id = $1`, id)
+		   FROM objects o WHERE o.id = $1`,
+		"o.tenant_id", tenant, id)
+	row := m.Pool.QueryRow(ctx, q, args...)
 	return scanObject(row)
 }
 

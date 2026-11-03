@@ -52,13 +52,41 @@ func newBackendWith(t *testing.T, mutate func(*config.Config)) (*backend.TapeGW,
 	return backend.New(m, land, cfg), m, land
 }
 
-// ownerCtx имитирует то, что делает versitygw: кладёт аккаунт запроса в контекст.
+// testProjectID — ProjectID учётки тестового тенанта, а заодно и tenants.id:
+// миграция 0005 заводит единственный тенант `default` с id = 1 и строит
+// соответствие tenants.id == Account.ProjectID.
+const testProjectID = 1
+
+// testTenantID — то же число в виде bigint: тесты, которые готовят строки
+// прямым SQL, подставляют его в колонку tenant_id.
+const testTenantID int64 = testProjectID
+
+// accountCtx имитирует то, что делает versitygw: кладёт учётку запроса в
+// контекст под ключом "account" (см. tenant_guard.go). Ключ — строка, своего
+// типа у versitygw для бэкенда нет.
 //
-// Ключ — строка, а не типизированный struct{}: именно так делает сам versitygw
-// (см. backend/posix/posix.go), а нам нужно прочитать то же значение.
-func ownerCtx(access string) context.Context {
+// Заодно дублируем учётку под "bucket-owner": его читает owner() при создании
+// бакета, и в бою его ставит админский CreateBucket.
+func accountCtx(acct auth.Account) context.Context {
 	//lint:ignore SA1029 ключ диктует versitygw, своего типа у него нет
-	return context.WithValue(context.Background(), "bucket-owner", auth.Account{Access: access})
+	ctx := context.WithValue(context.Background(), "account", acct)
+	//lint:ignore SA1029 ключ диктует versitygw, своего типа у него нет
+	return context.WithValue(ctx, "bucket-owner", acct)
+}
+
+// ownerCtx — обычный ключ тестового тенанта с указанным access.
+func ownerCtx(access string) context.Context {
+	return accountCtx(auth.Account{Access: access, Role: auth.RoleUser, ProjectID: testProjectID})
+}
+
+// testCtx — контекст «просто пользователя» тестового тенанта: большинство
+// тестов работает под ним.
+func testCtx() context.Context { return ownerCtx("tester") }
+
+// adminCtx — учётка администратора. Root в versitygw выглядит ровно так:
+// RoleAdmin при незаполненном ProjectID (authentication.go:44).
+func adminCtx() context.Context {
+	return accountCtx(auth.Account{Access: "root", Role: auth.RoleAdmin})
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -268,7 +296,7 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 		SELECT gen_random_uuid(), (SELECT id FROM buckets WHERE name='full'),
 		       'a.txt', 3, 'd41d8cd98f00b204e9800998ecf8427e', 'archived',
 		       now() + interval '1 day', $1, $2`,
-		meta.DefaultTenantID, meta.DefaultPoolID); err != nil {
+		testTenantID, meta.DefaultPoolID); err != nil {
 		t.Fatalf("подготовка объекта: %v", err)
 	}
 

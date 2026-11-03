@@ -73,10 +73,17 @@ func owner(ctx context.Context) string {
 	return "anonymous"
 }
 
-// ListBuckets — ListObjects для бакетов. В режиме администратора versitygw
-// просит все бакеты (Owner пустой). Префикс, max-buckets и continuation token
-// обрабатывает SQL — см. meta.ListBuckets.
+// ListBuckets — ListObjects для бакетов. Страж здесь не проверяет, а фильтрует:
+// внутри тенанта владельцы будут разные, когда появятся несколько ключей.
+// В режиме администратора versitygw просит все бакеты (Owner пустой), и
+// обход по роли снимает фильтр тенанта. Префикс, max-buckets и continuation
+// token обрабатывает SQL — см. meta.ListBuckets.
 func (t *TapeGW) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return s3response.ListAllMyBucketsResult{}, err
+	}
+
 	ownerFilter := input.Owner
 	if input.IsAdmin {
 		ownerFilter = ""
@@ -87,7 +94,7 @@ func (t *TapeGW) ListBuckets(ctx context.Context, input s3response.ListBucketsIn
 		return s3response.ListAllMyBucketsResult{}, s3err.GetAPIError(s3err.ErrInvalidToken)
 	}
 
-	buckets, next, err := t.meta.ListBuckets(ctx, meta.ListBucketsOpt{
+	buckets, next, err := t.meta.ListBuckets(ctx, tenant, meta.ListBucketsOpt{
 		Owner:  ownerFilter,
 		Prefix: input.Prefix,
 		Max:    int(input.MaxBuckets),
@@ -117,13 +124,31 @@ func (t *TapeGW) ListBuckets(ctx context.Context, input s3response.ListBucketsIn
 }
 
 func (t *TapeGW) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s3.HeadBucketOutput, error) {
-	if _, err := t.meta.GetBucket(ctx, *input.Bucket); err != nil {
-		return nil, mapMetaErr(err, *input.Bucket)
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := t.meta.GetBucket(ctx, tenant, *input.Bucket); err != nil {
+		return nil, t.bucketErr(ctx, *input.Bucket, tenant, err)
 	}
 	return &s3.HeadBucketOutput{}, nil
 }
 
+// CreateBucket — единственный метод с бакетом, где страж не проверяет, а
+// назначает: бакета ещё нет, сравнивать не с чем. Отказ при этом остаётся:
+// аноним (ProjectID == 0) не получает права заводить бакет.
+//
+// Учётка с обходом по роли не имеет ProjectID, поэтому ей назначается
+// тенант `default` — см. meta.AdminTenantID.
 func (t *TapeGW) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, defaultACL []byte) error {
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if tenant.IsBypass() {
+		tenant = meta.AdminTenantID()
+	}
+
 	name := *input.Bucket
 	if err := validateBucketName(name); err != nil {
 		return err
@@ -142,7 +167,7 @@ func (t *TapeGW) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, 
 
 	// Теги пишутся тем же INSERT, что и бакет: отдельным запросом они бы
 	// потерялись при падении между запросами, а клиент получил бы 200.
-	existing, err := t.meta.CreateBucket(ctx, name, owner(ctx), defaultACL, tags)
+	existing, err := t.meta.CreateBucket(ctx, tenant, name, owner(ctx), defaultACL, tags)
 	switch {
 	case err == nil && existing:
 		// Имя занято нашим же бакетом. В AWS это 409 BucketAlreadyOwnedByYou,
@@ -159,20 +184,31 @@ func (t *TapeGW) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, 
 }
 
 func (t *TapeGW) DeleteBucket(ctx context.Context, bucket string) error {
-	err := t.meta.DeleteBucket(ctx, bucket)
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	err = t.meta.DeleteBucket(ctx, tenant, bucket)
 	if err != nil {
 		if errors.Is(err, meta.ErrBucketNotEmpty) {
 			return s3err.GetBucketErr(s3err.ErrBucketNotEmpty, bucket)
 		}
-		return mapMetaErr(err, bucket)
+		return t.bucketErr(ctx, bucket, tenant, err)
 	}
 	return nil
 }
 
 func (t *TapeGW) GetBucketAcl(ctx context.Context, input *s3.GetBucketAclInput) ([]byte, error) {
-	b, err := t.meta.GetBucket(ctx, *input.Bucket)
+	// Этот метод versitygw вызывает сам в ходе проверки доступа, с тем же
+	// контекстом. Если здесь отказа не будет, чужой бакет станет различим по
+	// тому, на каком шагу пришёл отказ (ADR-0017, п. 4).
+	tenant, err := tenantFromContext(ctx)
 	if err != nil {
-		return nil, mapMetaErr(err, *input.Bucket)
+		return nil, err
+	}
+	b, err := t.meta.GetBucket(ctx, tenant, *input.Bucket)
+	if err != nil {
+		return nil, t.bucketErr(ctx, *input.Bucket, tenant, err)
 	}
 	if len(b.ACL) == 0 {
 		// CreateBucket всегда пишет ACL, который ему передал versitygw, поэтому
@@ -185,16 +221,24 @@ func (t *TapeGW) GetBucketAcl(ctx context.Context, input *s3.GetBucketAclInput) 
 }
 
 func (t *TapeGW) PutBucketAcl(ctx context.Context, bucket string, data []byte) error {
-	if err := t.meta.SetBucketACL(ctx, bucket, data); err != nil {
-		return mapMetaErr(err, bucket)
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if err := t.meta.SetBucketACL(ctx, tenant, bucket, data); err != nil {
+		return t.bucketErr(ctx, bucket, tenant, err)
 	}
 	return nil
 }
 
 func (t *TapeGW) GetBucketTagging(ctx context.Context, bucket string) (map[string]string, error) {
-	b, err := t.meta.GetBucket(ctx, bucket)
+	tenant, err := tenantFromContext(ctx)
 	if err != nil {
-		return nil, mapMetaErr(err, bucket)
+		return nil, err
+	}
+	b, err := t.meta.GetBucket(ctx, tenant, bucket)
+	if err != nil {
+		return nil, t.bucketErr(ctx, bucket, tenant, err)
 	}
 	if len(b.Tags) == 0 {
 		return nil, s3err.GetBucketErr(s3err.ErrBucketTaggingNotFound, bucket)
@@ -203,15 +247,23 @@ func (t *TapeGW) GetBucketTagging(ctx context.Context, bucket string) (map[strin
 }
 
 func (t *TapeGW) PutBucketTagging(ctx context.Context, bucket string, tags map[string]string) error {
-	if err := t.meta.SetBucketTags(ctx, bucket, tags); err != nil {
-		return mapMetaErr(err, bucket)
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if err := t.meta.SetBucketTags(ctx, tenant, bucket, tags); err != nil {
+		return t.bucketErr(ctx, bucket, tenant, err)
 	}
 	return nil
 }
 
 func (t *TapeGW) DeleteBucketTagging(ctx context.Context, bucket string) error {
-	if err := t.meta.SetBucketTags(ctx, bucket, nil); err != nil {
-		return mapMetaErr(err, bucket)
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if err := t.meta.SetBucketTags(ctx, tenant, bucket, nil); err != nil {
+		return t.bucketErr(ctx, bucket, tenant, err)
 	}
 	return nil
 }

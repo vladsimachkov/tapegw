@@ -11,7 +11,6 @@ import (
 	"github.com/versity/versitygw/s3response"
 
 	"github.com/versity/versitygw/auth"
-	tapegwerr "github.com/vladsimachkov/tapegw/internal/s3err"
 )
 
 // Bucket Policy, смена владельца и админское перечисление.
@@ -37,11 +36,15 @@ import (
 // nil вместо документа — это удаление политики, а не «записать пустую»; так же
 // устроен posix. Удаление отсутствующей политики не ошибка.
 func (t *TapeGW) PutBucketPolicy(ctx context.Context, bucket string, policy []byte) error {
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return err
+	}
 	if err := validateBucketName(bucket); err != nil {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	if err := t.meta.SetBucketPolicy(ctx, bucket, policy); err != nil {
-		return tapegwerr.FromMeta(err, bucket)
+	if err := t.meta.SetBucketPolicy(ctx, tenant, bucket, policy); err != nil {
+		return t.bucketErr(ctx, bucket, tenant, err)
 	}
 	return nil
 }
@@ -50,12 +53,19 @@ func (t *TapeGW) PutBucketPolicy(ctx context.Context, bucket string, policy []by
 // Колонка в БД — text именно поэтому: jsonb пересобрал бы документ и
 // переставил ключи.
 func (t *TapeGW) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error) {
+	// Этот метод versitygw дёргает на каждом запросе (auth/access-control.go:421)
+	// и в проверке Object Lock, всегда с тем же контекстом. Без отказа здесь
+	// чужой бакет стал бы различим по тому, на каком шагу пришёл отказ.
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateBucketName(bucket); err != nil {
 		return nil, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	policy, err := t.meta.GetBucketPolicy(ctx, bucket)
+	policy, err := t.meta.GetBucketPolicy(ctx, tenant, bucket)
 	if err != nil {
-		return nil, tapegwerr.FromMeta(err, bucket)
+		return nil, t.bucketErr(ctx, bucket, tenant, err)
 	}
 	return policy, nil
 }
@@ -74,6 +84,14 @@ func (t *TapeGW) DeleteBucketPolicy(ctx context.Context, bucket string) error {
 // в posix, и если versitygw переименует поле — мы узнаем об этом на сборке,
 // а не на первом же GetBucketAcl.
 func (t *TapeGW) ChangeBucketOwner(ctx context.Context, bucket, owner string) error {
+	// Admin API: versitygw не пускает сюда не-администратора (middlewares.IsAdmin),
+	// поэтому страж здесь отдаёт обход по роли. Отказ для обычного ключа —
+	// вторая линия: если маршрут когда-нибудь поедет, метод не должен остаться
+	// «дырявым».
+	tenant, err := tenantFromContext(ctx)
+	if err != nil {
+		return err
+	}
 	if err := validateBucketName(bucket); err != nil {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
@@ -90,8 +108,8 @@ func (t *TapeGW) ChangeBucketOwner(ctx context.Context, bucket, owner string) er
 		return fmt.Errorf("marshal ACL for %q: %w", bucket, err)
 	}
 
-	if err := t.meta.ChangeBucketOwner(ctx, bucket, owner, acl); err != nil {
-		return tapegwerr.FromMeta(err, bucket)
+	if err := t.meta.ChangeBucketOwner(ctx, tenant, bucket, owner, acl); err != nil {
+		return t.bucketErr(ctx, bucket, tenant, err)
 	}
 	return nil
 }

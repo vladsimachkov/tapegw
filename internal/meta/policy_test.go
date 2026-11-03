@@ -23,14 +23,14 @@ func TestBucketPolicyRoundTrip(t *testing.T) {
 	mustBucket(t, m, "pol")
 
 	// До записи — именно «политики нет», а не «бакета нет».
-	if _, err := m.GetBucketPolicy(ctx, "pol"); !errors.Is(err, meta.ErrNoBucketPolicy) {
+	if _, err := m.GetBucketPolicy(ctx, testTenant, "pol"); !errors.Is(err, meta.ErrNoBucketPolicy) {
 		t.Fatalf("без политики получили %v, хотели ErrNoBucketPolicy", err)
 	}
 
-	if err := m.SetBucketPolicy(ctx, "pol", []byte(policyDoc)); err != nil {
+	if err := m.SetBucketPolicy(ctx, testTenant, "pol", []byte(policyDoc)); err != nil {
 		t.Fatalf("SetBucketPolicy: %v", err)
 	}
-	got, err := m.GetBucketPolicy(ctx, "pol")
+	got, err := m.GetBucketPolicy(ctx, testTenant, "pol")
 	if err != nil {
 		t.Fatalf("GetBucketPolicy: %v", err)
 	}
@@ -47,10 +47,10 @@ func TestBucketPolicyMissingBucket(t *testing.T) {
 	testdb.Clean(t, m)
 	ctx := context.Background()
 
-	if _, err := m.GetBucketPolicy(ctx, "nope"); !errors.Is(err, meta.ErrNotFound) {
+	if _, err := m.GetBucketPolicy(ctx, testTenant, "nope"); !errors.Is(err, meta.ErrNotFound) {
 		t.Fatalf("чужой бакет: получили %v, хотели ErrNotFound", err)
 	}
-	if err := m.SetBucketPolicy(ctx, "nope", []byte(policyDoc)); !errors.Is(err, meta.ErrNotFound) {
+	if err := m.SetBucketPolicy(ctx, testTenant, "nope", []byte(policyDoc)); !errors.Is(err, meta.ErrNotFound) {
 		t.Fatalf("запись в чужой бакет: получили %v, хотели ErrNotFound", err)
 	}
 }
@@ -63,16 +63,16 @@ func TestBucketPolicyDelete(t *testing.T) {
 	ctx := context.Background()
 	mustBucket(t, m, "pol")
 
-	if err := m.SetBucketPolicy(ctx, "pol", []byte(policyDoc)); err != nil {
+	if err := m.SetBucketPolicy(ctx, testTenant, "pol", []byte(policyDoc)); err != nil {
 		t.Fatalf("set: %v", err)
 	}
-	if err := m.SetBucketPolicy(ctx, "pol", nil); err != nil {
+	if err := m.SetBucketPolicy(ctx, testTenant, "pol", nil); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if _, err := m.GetBucketPolicy(ctx, "pol"); !errors.Is(err, meta.ErrNoBucketPolicy) {
+	if _, err := m.GetBucketPolicy(ctx, testTenant, "pol"); !errors.Is(err, meta.ErrNoBucketPolicy) {
 		t.Fatalf("после удаления получили %v, хотели ErrNoBucketPolicy", err)
 	}
-	if err := m.SetBucketPolicy(ctx, "pol", nil); err != nil {
+	if err := m.SetBucketPolicy(ctx, testTenant, "pol", nil); err != nil {
 		t.Fatalf("повторное удаление: %v", err)
 	}
 }
@@ -84,10 +84,10 @@ func TestChangeBucketOwnerAndList(t *testing.T) {
 	mustBucket(t, m, "b1")
 	mustBucket(t, m, "b2")
 
-	if err := m.ChangeBucketOwner(ctx, "b2", "userplus", []byte(`{"Owner":"userplus","Grantees":[]}`)); err != nil {
+	if err := m.ChangeBucketOwner(ctx, testTenant, "b2", "userplus", []byte(`{"Owner":"userplus","Grantees":[]}`)); err != nil {
 		t.Fatalf("ChangeBucketOwner: %v", err)
 	}
-	if err := m.ChangeBucketOwner(ctx, "ghost", "userplus", nil); !errors.Is(err, meta.ErrNotFound) {
+	if err := m.ChangeBucketOwner(ctx, testTenant, "ghost", "userplus", nil); !errors.Is(err, meta.ErrNotFound) {
 		t.Fatalf("чужой бакет: получили %v, хотели ErrNotFound", err)
 	}
 

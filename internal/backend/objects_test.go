@@ -2,7 +2,6 @@ package backend_test
 
 import (
 	"bytes"
-	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
@@ -22,7 +21,6 @@ import (
 
 	"github.com/vladsimachkov/tapegw/internal/backend"
 	"github.com/vladsimachkov/tapegw/internal/config"
-	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/spool"
 )
 
@@ -33,7 +31,7 @@ import (
 // mustBucket создаёт бакет «b», который используют почти все тесты файла.
 func mustBucket(t *testing.T, be *backend.TapeGW) {
 	t.Helper()
-	if err := be.CreateBucket(context.Background(),
+	if err := be.CreateBucket(testCtx(),
 		&s3.CreateBucketInput{Bucket: ptr("b")}, []byte(`{}`)); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
@@ -48,7 +46,7 @@ func putBody(t *testing.T, be *backend.TapeGW, bucket, key, body string) s3respo
 		ContentLength: ptr(int64(len(body))),
 		ContentType:   ptr("text/plain"),
 	}
-	out, err := be.PutObject(context.Background(), in)
+	out, err := be.PutObject(testCtx(), in)
 	if err != nil {
 		t.Fatalf("PutObject(%s): %v", key, err)
 	}
@@ -57,7 +55,7 @@ func putBody(t *testing.T, be *backend.TapeGW, bucket, key, body string) s3respo
 
 func TestPutGetObjectRoundTrip(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 
 	body := "сорок два символа для проверки ленты и хэша"
@@ -101,7 +99,7 @@ func TestPutGetObjectRoundTrip(t *testing.T) {
 
 func TestHeadObject(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "12345")
 
@@ -122,7 +120,7 @@ func TestHeadObject(t *testing.T) {
 
 func TestGetMissingKey(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 
 	_, err := be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("нет")})
@@ -136,7 +134,7 @@ func TestGetMissingKey(t *testing.T) {
 // а не содержимое или 500.
 func TestOrphanFileIsInvisible(t *testing.T) {
 	be, _, land := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 
 	// Пишем файл в spuл напрямую, минуя транзакцию — ровно то состояние,
@@ -156,7 +154,7 @@ func TestOrphanFileIsInvisible(t *testing.T) {
 
 func TestPutRejectsOversized(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 
 	// Отдельный бэкенд с маленьким лимитом: проверять EntityTooLarge на 100 GiB
@@ -185,7 +183,7 @@ func TestPutRejectsOversized(t *testing.T) {
 
 func TestPutRejectsForeignStorageClass(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 
 	// ADR-0003: чужой класс отвергается, а не игнорируется молча.
@@ -214,7 +212,7 @@ func TestPutRejectsForeignStorageClass(t *testing.T) {
 
 func TestPutRejectsBadContentMD5(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 
 	wrong := md5.Sum([]byte("другие данные"))
@@ -240,7 +238,7 @@ func TestPutRejectsBadContentMD5(t *testing.T) {
 
 func TestPutAcceptsGoodContentMD5(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 
 	body := "данные"
@@ -258,7 +256,7 @@ func TestPutAcceptsGoodContentMD5(t *testing.T) {
 // GET обязан ответить InvalidObjectState, а HEAD — нет.
 func TestGetOfflineObject(t *testing.T) {
 	be, m, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "данные")
 
@@ -281,7 +279,7 @@ func TestGetOfflineObject(t *testing.T) {
 // как ошибка, а не как объект с ongoing-request="true".
 func TestHeadOfflineObjectIs200(t *testing.T) {
 	be, m, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "данные")
 
@@ -312,7 +310,7 @@ func TestHeadOfflineObjectIs200(t *testing.T) {
 // тот самый сценарий, ради которого HEAD и не должен ошибаться.
 func TestHeadRestoringObjectShowsOngoing(t *testing.T) {
 	be, m, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "данные")
 
@@ -328,7 +326,7 @@ func TestHeadRestoringObjectShowsOngoing(t *testing.T) {
 	}
 	if _, err := m.Pool.Exec(ctx,
 		`INSERT INTO restores (object_id, state, tier, days, requested_at, tenant_id)
-		 VALUES ($1,'requested','Standard',7,now(),$2)`, id, meta.DefaultTenantID); err != nil {
+		 VALUES ($1,'requested','Standard',7,now(),$2)`, id, testTenantID); err != nil {
 		t.Fatalf("insert restore: %v", err)
 	}
 
@@ -345,7 +343,7 @@ func TestHeadRestoringObjectShowsOngoing(t *testing.T) {
 // срок, а не 2050 год.
 func TestArchivedWithCopyIsReadable(t *testing.T) {
 	be, m, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "данные")
 
@@ -369,7 +367,7 @@ func TestArchivedWithCopyIsReadable(t *testing.T) {
 // сколько угодно, объект с диска не исчезнет.
 func TestPendingSurvivesExpiredDate(t *testing.T) {
 	be, m, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "данные")
 
@@ -387,7 +385,7 @@ func TestPendingSurvivesExpiredDate(t *testing.T) {
 // после — реальный срок из restores.expires_at.
 func TestRestoreHeader(t *testing.T) {
 	be, m, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "данные")
 
@@ -408,7 +406,7 @@ func TestRestoreHeader(t *testing.T) {
 		if _, err := m.Pool.Exec(ctx,
 			`INSERT INTO restores (object_id, state, tier, days, requested_at, restored_at, expires_at, tenant_id)
 			 VALUES ($1,$2,'Standard',7,now(), CASE WHEN $3::timestamptz IS NULL THEN NULL ELSE now() END, $3::timestamptz, $4)`,
-			id, state, exp, meta.DefaultTenantID); err != nil {
+			id, state, exp, testTenantID); err != nil {
 			t.Fatalf("insert restore: %v", err)
 		}
 	}
@@ -442,7 +440,7 @@ func TestRestoreHeader(t *testing.T) {
 
 func TestGetObjectRange(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "0123456789")
 
@@ -475,7 +473,7 @@ func TestGetObjectRange(t *testing.T) {
 // (правило 5). А вот неудовлетворимый диапазон — уже ошибка.
 func TestGetObjectRangeSemantics(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "0123456789")
 
@@ -503,7 +501,7 @@ func TestGetObjectRangeSemantics(t *testing.T) {
 // Перезапись через бэкенд: GET обязан отдать новое содержимое, а не старое.
 func TestPutOverwriteThroughBackend(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "первое")
 	putBody(t, be, "b", "k", "второе")
@@ -523,7 +521,7 @@ func TestPutOverwriteThroughBackend(t *testing.T) {
 // нуля, а нулевой срок означал бы «можно вытеснить немедленно».
 func TestPutSetsOnlineUntil(t *testing.T) {
 	be, m, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "x")
 
@@ -541,7 +539,7 @@ func TestPutSetsOnlineUntil(t *testing.T) {
 func putWith(t *testing.T, be *backend.TapeGW, bucket, key, body string,
 	ifMatch, ifNoneMatch *string) error {
 	t.Helper()
-	_, err := be.PutObject(context.Background(), s3response.PutObjectInput{
+	_, err := be.PutObject(testCtx(), s3response.PutObjectInput{
 		Bucket: ptr(bucket), Key: ptr(key), Body: strings.NewReader(body),
 		ContentLength: ptr(int64(len(body))),
 		IfMatch:       ifMatch, IfNoneMatch: ifNoneMatch,
@@ -554,7 +552,7 @@ func putWith(t *testing.T, be *backend.TapeGW, bucket, key, body string,
 // от которых этот заголовок и ставят.
 func TestPutIfNoneMatchStar(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 
 	// На пустом месте проходит.
@@ -615,7 +613,7 @@ func TestPutBothConditionsNotImplemented(t *testing.T) {
 // PreconditionFailed, а не «оба записали, и победил последний».
 func TestPutIfNoneMatchRace(t *testing.T) {
 	be, m, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 
 	const n = 12
@@ -668,7 +666,7 @@ func TestPutIfNoneMatchRace(t *testing.T) {
 // Контроллер versitygw их не вычисляет, решает бэкенд. Проверяем и 304, и 412.
 func TestGetObjectPreconditions(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "данные")
 
@@ -723,7 +721,7 @@ func TestGetObjectPreconditions(t *testing.T) {
 // иначе клиент, который просит конкретную версию, молча получил бы текущую.
 func TestVersionIDRejected(t *testing.T) {
 	be, _, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "данные")
 
@@ -769,7 +767,7 @@ func (f *checksumReaderFake) Checksum() string           { return f.sum }
 // сохраниться вычисленной и вернуться в ответе.
 func TestPutTrailingChecksum(t *testing.T) {
 	be, m, _ := newBackend(t)
-	ctx := context.Background()
+	ctx := testCtx()
 	mustBucket(t, be)
 
 	body := "тело с trailing crc32"
@@ -821,7 +819,7 @@ func TestPutTrailingChecksumMismatch(t *testing.T) {
 	mustBucket(t, be)
 
 	body := "тело с trailing crc32"
-	_, err := be.PutObject(context.Background(), s3response.PutObjectInput{
+	_, err := be.PutObject(testCtx(), s3response.PutObjectInput{
 		Bucket:        ptr("b"),
 		Key:           ptr("k"),
 		Body:          &checksumReaderFake{r: strings.NewReader(body), algo: "crc32", sum: "////"},
