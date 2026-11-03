@@ -21,6 +21,11 @@ s3:
   max_connections: 50000
   max_requests: 50000
   multipart_max_parts: 10000
+  # Верхняя граница размера объекта: крупнее приходит EntityTooLarge. Обязана быть
+  # не больше migrator.batch_max_bytes — иначе объект никогда не влезет в батч,
+  # а батч пишется целиком на один носитель (ADR-0008). Проверка выполняется
+  # при старте.
+  max_object_size: 100GiB
 
 # Ключи root-аккаунта. В продакшене задавайте не файлом, а переменной окружения
 # в systemd-юните (TAPEGW_ROOT_ACCESS / TAPEGW_ROOT_SECRET), чтобы секреты

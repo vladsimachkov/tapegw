@@ -79,6 +79,7 @@ func TestLoadYAMLOverridesDefaults(t *testing.T) {
 s3:
   listen: [":8080", ":8081"]
   region: ru-central-1
+  max_object_size: 1GiB
 db:
   dsn: postgres://u@db/td
   max_conns: 7
@@ -134,6 +135,7 @@ func TestLoadEnvOverridesYAML(t *testing.T) {
 	t.Setenv("TAPEGW_S3_LISTEN", ":1, :2")
 	t.Setenv("TAPEGW_PHOBOS_MAX_INFLIGHT", "3")
 	t.Setenv("TAPEGW_MIGRATOR_BATCH_MAX_BYTES", "12GiB")
+	t.Setenv("TAPEGW_S3_MAX_OBJECT_SIZE", "2GiB")
 	t.Setenv("TAPEGW_DB_MIGRATE_ON_START", "false")
 
 	cfg, err := Load(path)
@@ -181,6 +183,11 @@ func TestValidateRejectsBadWatermarks(t *testing.T) {
 		{"алиас, который и так glacier", func(c *Config) { c.S3.AcceptAsGlacier = []string{"GLACIER"} }},
 		{"bad log format", func(c *Config) { c.Logging.Format = "yaml" }},
 		{"нет listen", func(c *Config) { c.S3.Listen = nil }},
+		{"max_object_size = 0", func(c *Config) { c.S3.MaxObjectSize = 0 }},
+		{"max_object_size больше батча", func(c *Config) {
+			c.S3.MaxObjectSize = 500 * GiB
+			c.Migrator.BatchMaxBytes = 200 * GiB
+		}},
 	}
 
 	for _, tt := range tests {
@@ -192,6 +199,18 @@ func TestValidateRejectsBadWatermarks(t *testing.T) {
 				t.Errorf("ожидали ошибку для %q", tt.name)
 			}
 		})
+	}
+}
+
+// batch_max_bytes = 0 означает «не ограничивать по байтам», поэтому сравнивать
+// max_object_size не с чем и крупный объект законен.
+func TestMaxObjectSizeLegalWhenBatchHasNoByteLimit(t *testing.T) {
+	cfg := Default()
+	cfg.Root.Access, cfg.Root.Secret = "a", "b"
+	cfg.Migrator.BatchMaxBytes = 0
+	cfg.S3.MaxObjectSize = 1 * TiB
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("ошибки быть не должно, получили: %v", err)
 	}
 }
 
