@@ -412,8 +412,9 @@ s3:
   listen: [":7070"]
   region: us-east-1
   tls: {cert: "", key: ""}
-  iam: {dir: /etc/tapegw/iam}          # прокидывается в embedgw.Config
-  default_storage_class: GLACIER
+  iam_dir: /etc/tapegw/iam              # прокидывается в embedgw.Config
+  # Класс хранилища не настраивается: у нас только лента, GLACIER отдаётся всегда
+  # (ADR-0003). Поля вроде default_storage_class в конфиге нет намеренно.
   max_object_size: 100GiB               # <= migrator.batch_max_bytes, проверяется
                                        # при старте; см. ADR-0008 и M0-07
 db:
@@ -427,13 +428,15 @@ spool:
   orphan_grace: 24h
 phobos:
   family: tape                          # dir для CI и разработки
-  library: tape_lib                       # API не читает профиль, задаём явно (ADR-0007)
   layout: raid1
   layout_params: {repl_count: "1"}      # 1 реплика: mover берёт свой драйв
   tags: []
-  movers:
-    migrator: 1                         # процессов mover на архивацию
-    recaller: 1                         # и на restore; сумма <= числа драйвов
+  max_inflight: 1                       # процессов mover с собственным phobos_init
+  # library: tape_lib                   # появляется в M4: API не читает профиль,
+  #                                     # носитель и библиотеку задаём явно (ADR-0007)
+  # movers:                             # M4/M5, вместе с бинарем tapegw-mover
+  #   migrator: 1                       # процессов mover на архивацию
+  #   recaller: 1                       # и на restore; сумма <= числа драйвов
 migrator:
   batch_max_objects: 1000
   batch_max_bytes: 200GiB
@@ -564,10 +567,23 @@ M5 — первый полный Glacier-цикл без железа; M8 пер
 
 ### M2. Онлайн-путь без ленты
 
-- [ ] `spool`: атомарная запись с fsync, MD5 и checksum на лету.
-- [ ] PutObject, HeadObject, GetObject (Range, условные заголовки), CopyObject (только онлайн-источник).
+Разбит на три PR: (1) spuл + Put/Head/Get, (2) ListObjects v1/v2,
+(3) Delete/DeleteObjects/перезапись/CopyObject.
+
+- [x] `spool`: атомарная запись с fsync, MD5 и checksum на лету.
+- [x] Первая миграция M2: `online_until NOT NULL` и сужение `objects_evictable`
+  (пункты ревью PR #1).
+- [x] PutObject, HeadObject, GetObject (Range, условные заголовки).
+- [ ] CopyObject (только онлайн-источник).
 - [ ] ListObjects v1 и v2: префикс, delimiter, пагинация, порядок байтов.
 - [ ] DeleteObject, DeleteObjects, перезапись ключа.
+
+  Примечание к первому PR: чтобы PutObject вообще дошёл до бэкенда, пришлось
+  реализовать `GetObjectLockConfiguration` и `GetBucketVersioning`. Versitygw
+  опрашивает их на пути обычного PUT (`auth.loadObjectLockState`) и терпит
+  только `ObjectLockConfigurationNotFound`; `NotImplemented` из
+  `BackendUnsupported` превращался в 501 на полностью реализованную операцию.
+  См. `internal/backend/capabilities.go`.
 
 * **Готово когда**: `aws s3 cp/sync/ls/rm` и `rclone copy/check` проходят на наборе файлов от 0 байт до нескольких ГБ, ключи с юникодом и пробелами; тест порядка листинга против таблицы ожидаемых значений.
 

@@ -1,0 +1,292 @@
+package meta
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+// Object — строка таблицы objects.
+//
+// ID генерирует вызывающий, а не база: файл в спуле записывается до транзакции
+// (правило 6), и имя файла обязано совпасть со строкой. Путь spool.Path(id)
+// по тому же UUID собирает и mover в другом процессе (ADR-0007).
+type Object struct {
+	ID           uuid.UUID
+	BucketID     int64
+	Key          string
+	Size         int64
+	ETag         string
+	Checksums    map[string]string
+	ContentType  *string
+	UserMeta     map[string]string
+	ACL          []byte
+	Tags         map[string]string
+	StorageClass string
+	State        string
+	// Landing — на диске есть копия, которую можно прочитать без ленты.
+	Landing bool
+	// OnlineUntil — до какой даты копия гарантированно доступна. NOT NULL с
+	// миграции 0004: NULL в этом столбце молча отключал бы вытеснение.
+	OnlineUntil time.Time
+	CreatedAt   time.Time
+	ArchivedAt  *time.Time
+}
+
+// ReadableFromDisk — можно ли отдать содержимое без RestoreObject.
+//
+// pending и archiving защищены состоянием, а не датой: migrator может стоять
+// часами, и объект никуда с диска при этом не денется. Для archived дата и
+// работает — иначе HEAD пообещал бы доступность, а GET отдал бы
+// InvalidObjectState. См. ADR-0003.
+func (o *Object) ReadableFromDisk(now time.Time) bool {
+	switch o.State {
+	case "pending", "archiving":
+		return true
+	case "archived":
+		return o.Landing && o.OnlineUntil.After(now)
+	default:
+		return false
+	}
+}
+
+// PutObjectInput — данные нового текущей строки объекта.
+type PutObjectInput struct {
+	ID           uuid.UUID
+	Bucket       string
+	Key          string
+	Size         int64
+	ETag         string
+	Checksums    map[string]string
+	ContentType  *string
+	UserMeta     map[string]string
+	ACL          []byte
+	Tags         map[string]string
+	StorageClass string
+	// OnlineUntil — конец срока удержания дисковой копии. Считает вызывающий
+	// из spool.landing_min_retention: миграция конфиг не видит, а обещание
+	// клиенту выдаём именно здесь.
+	OnlineUntil time.Time
+	// Precondition — условная запись (If-Match / If-None-Match). Вызывается
+	// внутри транзакции после взятия advisory-лока, на etag текущей строки:
+	// только так проверка атомарна относительно самой записи. nil — условий нет.
+	//
+	// Колбэк, а не готовые заголовки: разбором заголовков и кодами ошибок
+	// владеет versitygw, а пакет meta про него ничего знать не должен.
+	Precondition func(curEtag string, exists bool) error
+}
+
+// PutObject вставляет объект и делает его текущим, вытесняя прежнюю версию
+// того же ключа. Одна транзакция — правило 7 из AGENTS.md.
+//
+// Порядок локаков жёсткий (ADR-0005):
+//
+//  1. pg_advisory_xact_lock(hashtextextended(bucket || '/' || key, 0)) —
+//     сериализует перезапись одного ключа между узлами и внутри узла. Лок
+//     транзакционный, снимется сам на commit.
+//  2. бакет FOR SHARE — чтобы DeleteBucket (берёт FOR UPDATE) не мог закоммититься
+//     между нашей проверкой и вставкой. Иначе PUT в «удаляемый» бакет создал бы
+//     строку-сироту в несуществующем бакете.
+//
+// Advisory-лок выбран вместо retry по unique_violation: при двух параллельных
+// перезаписях одного ключа откатываться и повторять значит дважды писать один и
+// тот же файл, а при горячем ключе это превращается в livelock.
+//
+// Локи берём в этом порядке всегда и только в нём: обратный порядок дал бы
+// взаимоблокировку с DeleteBucket, который сначала блокирует бакет.
+func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error) {
+	checksums, err := json.Marshal(in.Checksums)
+	if err != nil {
+		return nil, fmt.Errorf("marshal checksums: %w", err)
+	}
+	userMeta, err := json.Marshal(in.UserMeta)
+	if err != nil {
+		return nil, fmt.Errorf("marshal user meta: %w", err)
+	}
+	tags, err := json.Marshal(in.Tags)
+	if err != nil {
+		return nil, fmt.Errorf("marshal tags: %w", err)
+	}
+	if in.StorageClass == "" {
+		in.StorageClass = "GLACIER"
+	}
+
+	var out *Object
+	err = m.inTx(ctx, func(tx pgx.Tx) error {
+		// 1. Лок по ключу. hashtextextended даёт bigint из текста и seed;
+		//    seed 0 — константа, смысл только в том, что он не меняется.
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+			in.Bucket+"/"+in.Key); err != nil {
+			return fmt.Errorf("advisory lock %s/%s: %w", in.Bucket, in.Key, err)
+		}
+
+		// 2. Бакет на чтение: конфликтует с FOR UPDATE у DeleteBucket, но не
+		//    мешает параллельным PUT в тот же бакет.
+		var bucketID int64
+		err := tx.QueryRow(ctx,
+			`SELECT id FROM buckets WHERE name = $1 AND deleted_at IS NULL FOR SHARE`,
+			in.Bucket).Scan(&bucketID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock bucket %q: %w", in.Bucket, err)
+		}
+
+		// 3. Условная запись. Проверяем после advisory-лока и до вставки: между
+		//    проверкой и записью никто не успевает сменить текущую версию, и
+		//    гонка двух If-None-Match: * разрешается честно — проигравший
+		//    получает PreconditionFailed, а не «оба записали».
+		if in.Precondition != nil {
+			var curEtag string
+			err := tx.QueryRow(ctx,
+				`SELECT etag FROM objects
+				  WHERE bucket_id = $1 AND key = $2 AND is_current`,
+				bucketID, in.Key).Scan(&curEtag)
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				if err := in.Precondition("", false); err != nil {
+					return err
+				}
+			case err != nil:
+				return fmt.Errorf("etag текущей версии %s/%s: %w", in.Bucket, in.Key, err)
+			default:
+				if err := in.Precondition(curEtag, true); err != nil {
+					return err
+				}
+			}
+		}
+
+		// 4. Прежняя текущая строка теряет актуальность и тут же переходит в
+		//    deleting. Одного is_current = false мало: в состоянии pending её
+		//    заархивировал бы migrator (лишняя запись на ленту), а deleter её
+		//    вообще не увидел бы, и копия осталась бы и в landing, и на ленте
+		//    навсегда. В deleting строку подхватит индекс objects_queue
+		//    (state IN ('pending','deleting')). Удаление из Phobos появится в M6,
+		//    но состояние обязано быть правильным уже сейчас — иначе потом
+		//    придётся разбирать накопившиеся «вечные» строки.
+		//
+		//    retired_at здесь не ставим: по миграции 0001 он помечает терминальные
+		//    строки (deleted/failed) для выгрузки, а deleting — ещё не терминальное.
+		if _, err := tx.Exec(ctx,
+			`UPDATE objects
+			    SET is_current = false,
+			        state = 'deleting'
+			  WHERE bucket_id = $1 AND key = $2 AND is_current`,
+			bucketID, in.Key); err != nil {
+			return fmt.Errorf("retire previous version of %s/%s: %w", in.Bucket, in.Key, err)
+		}
+
+		// 5. Новая версия.
+		created, err := tx.Query(ctx,
+			`INSERT INTO objects (
+			    id, bucket_id, key, is_current, size, etag, checksums,
+			    content_type, user_meta, acl, tags, storage_class,
+			    state, landing, online_until)
+			 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12)
+			 RETURNING id, bucket_id, key, size, etag, checksums, content_type,
+			           user_meta, acl, tags, storage_class, state, landing,
+			           online_until, created_at, archived_at`,
+			in.ID, bucketID, in.Key, in.Size, in.ETag, checksums,
+			in.ContentType, userMeta, in.ACL, tags, in.StorageClass,
+			in.OnlineUntil)
+		if err != nil {
+			return fmt.Errorf("insert object %s/%s: %w", in.Bucket, in.Key, err)
+		}
+		defer created.Close()
+		if !created.Next() {
+			if err := created.Err(); err != nil {
+				return fmt.Errorf("insert object %s/%s: %w", in.Bucket, in.Key, err)
+			}
+			// RETURNING без строки при успешном INSERT невозможен, но пустой
+			// результат не должен превращаться в nil-указатель выше.
+			return fmt.Errorf("insert object %s/%s: RETURNING не вернул строку", in.Bucket, in.Key)
+		}
+
+		obj, err := scanObjectRow(created)
+		if err != nil {
+			return err
+		}
+		out = obj
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetObject возвращает текущую строку объекта.
+func (m *Meta) GetObject(ctx context.Context, bucket, key string) (*Object, error) {
+	row := m.Pool.QueryRow(ctx,
+		`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
+		        o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
+		        o.state, o.landing, o.online_until, o.created_at, o.archived_at
+		   FROM objects o
+		   JOIN buckets b ON b.id = o.bucket_id
+		  WHERE b.name = $1 AND b.deleted_at IS NULL
+		    AND o.key = $2 AND o.is_current`, bucket, key)
+	return scanObject(row)
+}
+
+// GetObjectByID — строка по UUID. Нужен mover-у: у него в аргументах только id.
+func (m *Meta) GetObjectByID(ctx context.Context, id uuid.UUID) (*Object, error) {
+	row := m.Pool.QueryRow(ctx,
+		`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
+		        o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
+		        o.state, o.landing, o.online_until, o.created_at, o.archived_at
+		   FROM objects o WHERE o.id = $1`, id)
+	return scanObject(row)
+}
+
+func scanObject(row pgx.Row) (*Object, error) {
+	return scanObjectRow(row)
+}
+
+// scanObjectRow читает строку objects из любого pgx-источника. Колонки
+// перечислены в одном месте, чтобы запросы из GetObject и из INSERT ... RETURNING
+// не разъехались.
+func scanObjectRow(src interface {
+	Scan(dest ...any) error
+}) (*Object, error) {
+	var (
+		o                              Object
+		checksums, userMeta, tags      []byte
+		storageClass, state, etag, key string
+		onlineUntil                    time.Time
+	)
+	err := src.Scan(
+		&o.ID, &o.BucketID, &key, &o.Size, &etag, &checksums,
+		&o.ContentType, &userMeta, &o.ACL, &tags, &storageClass,
+		&state, &o.Landing, &onlineUntil, &o.CreatedAt, &o.ArchivedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("scan object: %w", err)
+	}
+	o.Key, o.ETag, o.StorageClass, o.State, o.OnlineUntil = key, etag, storageClass, state, onlineUntil
+
+	if len(checksums) > 0 {
+		if err := json.Unmarshal(checksums, &o.Checksums); err != nil {
+			return nil, fmt.Errorf("decode checksums: %w", err)
+		}
+	}
+	if len(userMeta) > 0 {
+		if err := json.Unmarshal(userMeta, &o.UserMeta); err != nil {
+			return nil, fmt.Errorf("decode user meta: %w", err)
+		}
+	}
+	if len(tags) > 0 {
+		if err := json.Unmarshal(tags, &o.Tags); err != nil {
+			return nil, fmt.Errorf("decode tags: %w", err)
+		}
+	}
+	return &o, nil
+}

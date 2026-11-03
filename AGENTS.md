@@ -60,6 +60,18 @@ TAPEGW_E2E_ACCESS=testaccess TAPEGW_E2E_SECRET=testsecret \
    в `go.mod` на свою ветку. Если без патча нельзя — сначала ADR и вопрос ревьюеру.
 4. **Неподдерживаемые S3-операции — `NotImplemented`** через встраивание
    `backend.BackendUnsupported`, а не «молча делаем что-то».
+
+   Уточнение по ловушке из PR #6: `NotImplemented` — про **операцию**, которую
+   бэкенд не умеет. «Операция умеема, но у бакета ничего не включено» — это
+   другой ответ, и отдавать надо его. Ловушка в том, что versitygw сам обращается
+   к таким операциям по пути обычных запросов: `auth.loadObjectLockState` дергает
+   `GetObjectLockConfiguration` перед записью любого объекта и терпит только
+   `ObjectLockConfigurationNotFound`. Оставь его в `BackendUnsupported` — и
+   полностью реализованный `PutObject` отвечает 501.
+
+   Так же с `GetBucketVersioning`: posix возвращает пустую конфигурацию (200),
+   потому что GUI-клиенты опрашивают её при просмотре бакета. Прежде чем оставить
+   операцию в `BackendUnsupported`, проверьте, не дёргает ли её versitygw сам.
 5. **Поведение S3 берём из кода versitygw, не выдумываем.** Для обычных операций —
    posix-бэкенд, для Glacier-семантики (`x-amz-restore`, storage class,
    RestoreObject) — `backend/scoutfs/scoutfs_compat.go`.
