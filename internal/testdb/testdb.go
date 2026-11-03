@@ -17,6 +17,7 @@ package testdb
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/url"
 	"os"
@@ -25,6 +26,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vladsimachkov/tapegw/internal/meta"
 )
@@ -36,13 +39,24 @@ const DSNEnv = "TAPEGW_TEST_DSN"
 // не задан — t.Skip, а не ошибка.
 func Connect(t *testing.T) *meta.Meta {
 	t.Helper()
+	return ConnectSchema(t, PackageSchema(t))
+}
+
+// ConnectSchema — то же, что Connect, но в схему с указанным именем.
+//
+// Нужен тестам самих миграций: они откатывают схему (Down) и применяют её
+// заново, а в общей схеме пакета в этот момент работают другие тесты того же
+// пакета. Для них Down означал бы «пропало окно», и падали бы они уже не по
+// своей вине.
+func ConnectSchema(t *testing.T, schema string) *meta.Meta {
+	t.Helper()
 
 	dsn := os.Getenv(DSNEnv)
 	if dsn == "" {
 		t.Skipf("%s не задан — пропускаем тест, которому нужен Postgres", DSNEnv)
 	}
 
-	dsn, err := withSchema(dsn, packageSchema(t))
+	dsn, err := withSchema(dsn, schema)
 	if err != nil {
 		t.Fatalf("%s: %v", DSNEnv, err)
 	}
@@ -63,6 +77,38 @@ func Connect(t *testing.T) *meta.Meta {
 	return m
 }
 
+// DropSchema удаляет схему вместе с содержимым, если она есть. Нужен тестам,
+// которые обязаны стартовать с чистой схемы: имя схемы детерминировано, поэтому
+// состояние прошлого прогона иначе переедает в следующий, и падение начнёт
+// рассказывать не про текущий запуск.
+func DropSchema(t *testing.T, schema string) {
+	t.Helper()
+
+	raw := os.Getenv(DSNEnv)
+	if raw == "" {
+		t.Skipf("%s не задан — пропускаем тест, которому нужен Postgres", DSNEnv)
+	}
+
+	dsn, err := withSchema(raw, "public")
+	if err != nil {
+		t.Fatalf("%s: %v", DSNEnv, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE",
+		pgx.Identifier{schema}.Sanitize())); err != nil {
+		t.Fatalf("drop schema %s: %v", schema, err)
+	}
+}
+
 // Clean удаляет данные из таблиц, чтобы тесты не зависели от порядка запуска.
 // Схема своя на пакет, поэтому TRUNCATE безопасен.
 func Clean(t *testing.T, m *meta.Meta) {
@@ -74,9 +120,11 @@ func Clean(t *testing.T, m *meta.Meta) {
 	}
 }
 
-// packageSchema даёт схеме имя по имени тестового бинаря: backend.test →
+// PackageSchema даёт схеме имя по имени тестового бинаря: backend.test →
 // tapegw_test_backend. Детерминированно, поэтому схему можно почистить руками.
-func packageSchema(t *testing.T) string {
+// Экспортирована, чтобы тест миграций мог взять свою схему рядом с общей
+// (ConnectSchema) и не откатывать общую.
+func PackageSchema(t *testing.T) string {
 	t.Helper()
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), ".test")
 	base = nonIdent.ReplaceAllString(base, "_")
