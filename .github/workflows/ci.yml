@@ -65,10 +65,14 @@ jobs:
         # контейнер не поднимается с «address already in use». Тесты при этом
         # вообще не запускаются, а retry такую поломку только прячет.
         #
-        # Порт берётся как job.<job_id>.services.postgres.ports['5432'] — с id
-        # задачи. Без id выражение невалидно, и падает не шаг, а весь workflow:
-        # GitHub не может разобрать файл, прогоны заводятся без единого джоба.
-        # Ключ порта в квадратных скобках: имя начинается с цифры.
+        # Порт читается как job.services.postgres.ports[5432] — без id задачи:
+        # job.services уже относится к текущей задаче. Форма job.<id>.services
+        # синтаксически проходит, но резолвится в пустоту, и DSN становится
+        # «localhost:/phobos». Поэтому рядом есть шаг-проверка на пустой порт.
+        #
+        # Выражение допустимо только на уровне шага: в jobs.<id>.env контекста
+        # job нет, и файл workflow целиком не проходит валидацию — прогоны
+        # заводятся без единого джоба и без внятного сообщения.
         ports: ["5432"]
         options: >-
           --health-cmd "pg_isready -U tapegw"
@@ -92,11 +96,11 @@ jobs:
           fi
           echo "postgres на порту ${TAPEGW_PG_PORT}"
         env:
-          TAPEGW_PG_PORT: ${{ job.test.services.postgres.ports['5432'] }}
+          TAPEGW_PG_PORT: ${{ job.services.postgres.ports[5432] }}
 
       - name: unit + integration
         env:
-          TAPEGW_TEST_DSN: postgres://tapegw:tapegw@localhost:${{ job.test.services.postgres.ports['5432'] }}/phobos?search_path=tapegw_test
+          TAPEGW_TEST_DSN: postgres://tapegw:tapegw@localhost:${{ job.services.postgres.ports[5432] }}/phobos?search_path=tapegw_test
         run: go test -race -count=1 ./...
 
   # E2E против живого tapegw: критерий готовности M1 — aws s3 mb / ls / rb.
@@ -132,7 +136,7 @@ jobs:
           TAPEGW_ROOT_ACCESS: ci-access
           TAPEGW_ROOT_SECRET: ci-secret
           # Только на уровне шага: в jobs.<id>.env контекст job недоступен.
-          TAPEGW_PG_PORT: ${{ job.e2e.services.postgres.ports['5432'] }}
+          TAPEGW_PG_PORT: ${{ job.services.postgres.ports[5432] }}
         run: |
           if [ -z "${TAPEGW_PG_PORT}" ]; then
             echo "раннер не вернул порт postgres"; exit 1
