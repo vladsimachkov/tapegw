@@ -795,13 +795,28 @@ Postgres: `embedgw.Config.IAMService` принимает нашу реализа
 
 - [ ] `IAMService` поверх Postgres, мастер-ключ для секретов, свой кэш; `iam_dir` из
   конфига уходит.
-- [ ] Bucket policy: Get/Put/Delete. **Это блокер, а не «потом»:**
+- [x] Bucket policy: Get/Put/Delete. **Это блокер, а не «потом»:**
   `verifyResourceAccess` вызывает `GetBucketPolicy` на каждом обращении и терпит
-  ровно `ErrNoSuchBucketPolicy` (`auth/access-control.go:421`), так что сейчас
-  обычный пользователь получает 501 на любой операции с бакетом. Та же ловушка
+  ровно `ErrNoSuchBucketPolicy` (`auth/access-control.go:421`), так что раньше
+  обычный пользователь получал 501 на любую операцию с бакетом. Та же ловушка
   правила 4, что и с `GetObjectLockConfiguration`.
-- [ ] `ChangeBucketOwner`, `ListBucketsAndOwners` — без них роль `user`
-  неработоспособна.
+  Сделано: `internal/backend/policy.go`. Колонка `buckets.policy` переведена в
+  `text` (миграция 0006) — jsonb пересобрал бы документ, а versitygw отдаёт
+  байты дословно. Тот же `GetBucketPolicy` вызывается и из проверки Object Lock
+  (`auth/object_lock.go:335,349`), поэтому код обязателен и для этапа V.
+- [x] `ChangeBucketOwner`, `ListBucketsAndOwners` — без них роль `user`
+  неработоспособна. Это admin API (`PATCH /change-bucket-owner`,
+  `PATCH /list-buckets`); `FixedBucketOwner` реализует только standalone-IAM,
+  так что бэкенд обязан отвечать сам.
+  **Смена владельца меняет права, а не только колонку `owner`:** versitygw
+  определяет владельца по ACL из `GetBucketAcl`. Поэтому `ChangeBucketOwner`
+  одним `UPDATE` ставит владельца, новый ACL (единственный грант
+  `FULL_CONTROL` — новому владельцу, как в `auth.UpdateBucketACLOwner`) и
+  обнуляет политику. Инвариант `buckets.owner == acl.Owner` под тестом.
+- [ ] При смене владельца проверять, что **новый владелец — из того же тенанта**.
+  Сейчас проверять не на чем: колонка `tenant_id` у бакета есть, но связи
+  учётной записи с тенантом ещё нет. Без этой проверки `change-bucket-owner`
+  позволит передать бакет чужому тенанту.
 - [ ] Страж тенанта во всех методах бэкенда + **тест-перебор всех методов**
   `backend.Backend` на отказе чужому бакету (чтобы новый метод не забыли).
 - [ ] Валидация ACL и политик против межтенантных грантов, включая

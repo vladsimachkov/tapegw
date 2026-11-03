@@ -44,6 +44,24 @@ TAPEGW_E2E_ACCESS=testaccess TAPEGW_E2E_SECRET=testsecret \
   go test -count=1 ./test/e2e -v
 ```
 
+Проверки доступа требуют **обычного** ключа: root и admin в versitygw идут мимо
+политик и ACL, поэтому e2e на root ничего про них не говорит. Для них в стенде
+нужен файловый IAM — `s3.iam_dir` с `users.json`:
+
+```bash
+mkdir -p /tmp/iam
+cat > /tmp/iam/users.json <<'JSON'
+{"accessAccounts":{"userplus":{"access":"userplus","secret":"usersecret","role":"user","userID":1001,"groupID":1001,"projectID":0}}}
+JSON
+# в конфиг tapegw: s3.iam_dir: /tmp/iam
+
+TAPEGW_E2E_USER_ACCESS=userplus TAPEGW_E2E_USER_SECRET=usersecret \
+  go test -count=1 ./test/e2e -run Policy -v
+```
+
+Без этих переменных тесты доступа **пропускаются**, а не падают — поэтому в CI они
+заданы обязательно, иначе проверки тихо перестанут запускаться.
+
 Оба набора с DSN и endpoint гоняет CI (`.github/workflows/ci.yml`) — локально
 прогонять их не обязательно, но перед PR по очередям и транзакциям стоит.
 

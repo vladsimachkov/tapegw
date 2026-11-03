@@ -135,18 +135,26 @@ jobs:
         env:
           TAPEGW_ROOT_ACCESS: ci-access
           TAPEGW_ROOT_SECRET: ci-secret
-          # Только на уровне шага: в jobs.<id>.env контекст job недоступен.
+          # Порт читается только на уровне шага — см. комментарий в джобе test.
           TAPEGW_PG_PORT: ${{ job.services.postgres.ports[5432] }}
         run: |
           if [ -z "${TAPEGW_PG_PORT}" ]; then
             echo "раннер не вернул порт postgres"; exit 1
           fi
-          mkdir -p /tmp/spool/landing /tmp/spool/cache
+          mkdir -p /tmp/spool/landing /tmp/spool/cache /tmp/iam
+          # Файловый IAM: без него versitygw живёт в режиме одной учётки и
+          # знает только root, а проверки доступа на root не проверяются вовсе
+          # (root и admin идут мимо политик и ACL).
+          cat > /tmp/iam/users.json <<'JSON'
+          {"accessAccounts":{"userplus":{"access":"userplus","secret":"usersecret","role":"user","userID":1001,"groupID":1001,"projectID":0}}}
+          JSON
           # Heredoc без кавычек: нужен подстанов port'а. В теле других $
           # нет, и добавлять их сюда не следует — иначе начнут раскрываться.
           cat > /tmp/ci.yaml <<YAML
           s3:
             listen: [":7070"]
+            iam_dir: /tmp/iam
+            health_path: /health
           db:
             dsn: postgres://tapegw:tapegw@localhost:${TAPEGW_PG_PORT}/phobos?search_path=tapegw_ci
           spool:
@@ -165,6 +173,9 @@ jobs:
           TAPEGW_E2E_ENDPOINT: http://127.0.0.1:7070
           TAPEGW_E2E_ACCESS: ci-access
           TAPEGW_E2E_SECRET: ci-secret
+          # Обычный ключ: без него тесты доступа пропускаются, а не падают.
+          TAPEGW_E2E_USER_ACCESS: userplus
+          TAPEGW_E2E_USER_SECRET: usersecret
         run: go test -count=1 ./test/e2e -v
 
   # Сборка с тегом phobos требует EL9 и исходников Phobos — это стенд ci-dir,

@@ -29,6 +29,11 @@ func FromMeta(err error, bucket string) error {
 		return s3err.GetBucketErr(s3err.ErrBucketNotEmpty, bucket)
 	case errors.Is(err, meta.ErrBucketOwnedByOther):
 		return s3err.GetBucketErr(s3err.ErrBucketAlreadyOwnedByYou, bucket)
+	case errors.Is(err, meta.ErrNoBucketPolicy):
+		// Единственная ошибка, которую versitygw терпит от GetBucketPolicy как
+		// штатную: проверка доступа продолжается по пути «политики нет».
+		// Всё остальное обрывает запрос, поэтому маппинг обязателен.
+		return s3err.GetBucketErr(s3err.ErrNoSuchBucketPolicy, bucket)
 	default:
 		return err
 	}
