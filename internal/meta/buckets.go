@@ -63,11 +63,14 @@ func (m *Meta) insertBucket(ctx context.Context, name, owner string, acl []byte,
 
 	// ON CONFLICT по частичному уникальному индексу buckets_name_active:
 	// мягко удалённый бакет имени не занимает.
+	//
+	// tenant_id обязателен явно: колонка NOT NULL без DEFAULT (миграция 0005),
+	// чтобы забитый тенант не превращался в тихую запись в первый тенант.
 	tag, err := m.Pool.Exec(ctx,
-		`INSERT INTO buckets (name, owner, acl, tags)
-		 VALUES ($1, $2, $3, $4)
+		`INSERT INTO buckets (name, owner, acl, tags, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (name) WHERE deleted_at IS NULL DO NOTHING`,
-		name, owner, acl, tagsRaw)
+		name, owner, acl, tagsRaw, DefaultTenantID)
 	if err != nil {
 		return false, fmt.Errorf("insert bucket %q: %w", name, err)
 	}

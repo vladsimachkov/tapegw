@@ -263,10 +263,12 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 	// online_until обязателен с миграции 0004: NULL в этой колонке молча
 	// выключал бы вытеснение, поэтому колонка NOT NULL.
 	if _, err := m.Pool.Exec(ctx, `
-		INSERT INTO objects (id, bucket_id, key, size, etag, state, online_until)
+		INSERT INTO objects (id, bucket_id, key, size, etag, state, online_until,
+		                     tenant_id, pool_id)
 		SELECT gen_random_uuid(), (SELECT id FROM buckets WHERE name='full'),
 		       'a.txt', 3, 'd41d8cd98f00b204e9800998ecf8427e', 'archived',
-		       now() + interval '1 day'`); err != nil {
+		       now() + interval '1 day', $1, $2`,
+		meta.DefaultTenantID, meta.DefaultPoolID); err != nil {
 		t.Fatalf("подготовка объекта: %v", err)
 	}
 

@@ -184,18 +184,29 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 		}
 
 		// 5. Новая версия.
+		//
+		// tenant_id и pool_id передаются явно: колонки NOT NULL без DEFAULT
+		// (миграция 0005), чтобы забытый тенант падал, а не писался в первый.
+		//
+		// is_null_version здесь сознательно НЕ заполняется. Частичный уникальный
+		// индекс objects_null_version разрешает одну null-версию на ключ, а
+		// прежняя версия при перезаписи сейчас остаётся живой в состоянии
+		// deleting — вторая строка с тем же ключом этот индекс уже не пропускает.
+		// Заполнение идёт первым PR этапа V вместе с условным переходом в
+		// deleting по buckets.versioning (ADR-0015): там null-версия корректно
+		// заменяется, а не оставляется.
 		created, err := tx.Query(ctx,
 			`INSERT INTO objects (
 			    id, bucket_id, key, is_current, size, etag, checksums,
 			    content_type, user_meta, acl, tags, storage_class,
-			    state, landing, online_until)
-			 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12)
+			    state, landing, online_until, tenant_id, pool_id)
+			 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12,$13,$14)
 			 RETURNING id, bucket_id, key, size, etag, checksums, content_type,
 			           user_meta, acl, tags, storage_class, state, landing,
 			           online_until, created_at, archived_at`,
 			in.ID, bucketID, in.Key, in.Size, in.ETag, checksums,
 			in.ContentType, userMeta, in.ACL, tags, in.StorageClass,
-			in.OnlineUntil)
+			in.OnlineUntil, DefaultTenantID, DefaultPoolID)
 		if err != nil {
 			return fmt.Errorf("insert object %s/%s: %w", in.Bucket, in.Key, err)
 		}
