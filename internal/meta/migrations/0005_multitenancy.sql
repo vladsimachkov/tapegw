@@ -209,8 +209,14 @@ ALTER TABLE objects
 
 -- Существующие строки (в бою их нет, в dev-базах они есть) лежат в бакетах без
 -- версий, то есть по смыслу AWS и есть null-версии.
+--
+-- Только текущие: прежние версии, оставшиеся в deleting после перезаписей до
+-- этого PR, null-версиями быть не перестают, но две строки с одним ключом и
+-- is_null_version = true не пропустит уникальный индекс objects_null_version —
+-- и миграция упадёт на любой dev-базе, где были перезаписи.
 UPDATE objects SET is_null_version = true
- WHERE bucket_id IN (SELECT id FROM buckets WHERE versioning <> 'enabled');
+ WHERE is_current
+   AND bucket_id IN (SELECT id FROM buckets WHERE versioning <> 'enabled');
 
 -- Не больше одной null-версии на ключ — это и есть «запись в suspended бакет
 -- заменяет предыдущую null-версию», выражённое ограничением, а не кодом.
@@ -263,7 +269,10 @@ ALTER TABLE restores
 -- См. про DROP DEFAULT у buckets/objects: recaller обязан знать тенанта явно.
 ALTER TABLE restores ALTER COLUMN tenant_id DROP DEFAULT;
 
-CREATE INDEX restores_tenant_queue ON restores (tenant_id, tier, requested_at)
+-- Приоритет — числовая колонка priority из миграции 0002, а не tier: текстом
+-- Bulk < Expedited < Standard, то есть Expedited ехал бы вторым вместо первого.
+-- Та же ошибка, что была исправлена в PR #1.
+CREATE INDEX restores_tenant_queue ON restores (tenant_id, priority, requested_at)
   WHERE state = 'requested';
 
 -- ---------------------------------------------------------------------------
