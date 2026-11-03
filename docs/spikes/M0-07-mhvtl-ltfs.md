@@ -196,13 +196,66 @@ No compatible device found for write alloc: No such device (19)
 /dev/tape/by-id/scsi-SSTK_L700_XYZZY_A-changer   # и changer тоже
 ```
 
-### Что остаётся открытым
+### Порядок запуска: phobosd обязан стартовать после phobos_tlc
 
-После череды перезапусков и моих ручных правок таблицы `device` в DSS Phobos
-перестал привязывать драйвы (`device` и `serial` пустые в `drive status`), и
-сценарий с двумя mover я не дожал. Это состояние стенда, а не ограничение
-архитектуры: нужен чистый пересбор стенда с `mktape -s` и путями by-id **с самого
-начала**, без ручного `mkltfs` и без правок DSS.
+Это стоило больше всего времени и в первой версии отчёта выглядело как «Phobos
+сломался». На самом деле всё детерминировано:
+
+```
+<ERROR> Socket connection(localhost:20123) failed: Connection refused (111)
+<ERROR> Cannot contact 'TLC': will abort: Connection refused (111)
+<ERROR> No functional device found: No such device or address (6)
+```
+
+Если `phobosd` стартует раньше, чем `phobos_tlc` начал слушать 20123, он
+**отказывается загружать устройства и не повторяет попытку** — ни `lib refresh`,
+ни `drive unlock` уже не помогают, `drive status` показывает драйвы с пустыми
+`device` и `serial`. Помогает только перезапуск `phobosd`.
+
+Второе обязательное условие: **носитель, физически лежащий в драйве, должен быть
+зарегистрирован в DSS до старта `phobosd`**, иначе поток этого драйва умирает:
+
+```
+Device '/dev/sg3' (S/N '00XYZZY_A2') contains medium (family 'tape', name
+'TST002', library 'vtllib'), but this medium cannot be found: No such device
+or address (6)
+device thread ... terminated with error
+```
+
+Для tapegw это означает конкретные требования к деплою: `phobosd.service` обязан
+иметь `After=phobos_tlc.service` и `Requires=`, а порядок «зарегистрировать
+носители → запустить phobosd» надо зафиксировать в инструкции развёртывания и в
+DR-процедуре.
+
+### Два mover на двух драйвах: работает
+
+После чистой пересборки (DSS через `phobos_db drop_tables/setup_tables`,
+картриджи через `mktape -s 5120`, пути только by-id, TLC раньше phobosd) обе
+ленты отформатировались по 4 GiB, и полный цикл прошёл:
+
+```
+$ phobos put /tmp/t2.bin t/one -f tape -L vtllib
+PUT operation for oid:'t/one' succeeded
+$ phobos extent list -f json -o oid,media_name t/one
+[{"oid": "t/one", "media_name": ["TST001", "TST002"]}]
+$ phobos get t/one /tmp/t2back.bin
+Object 't/one' successfully retrieved        # md5 совпал
+```
+
+Два параллельных put из отдельных процессов — эмуляция двух mover:
+
+```
+два параллельных put: 1.70 s
+PUT operation for oid:'mv/a' succeeded
+PUT operation for oid:'mv/b' succeeded
+mv/a: OK
+mv/b: OK
+```
+
+После этого ленты перешли в `fs_status = used`. Замечание: `media_name` у обоих
+объектов — `["TST001", "TST002"]`, потому что layout `raid1` пишет две реплики.
+Для проверки «каждый mover на своём драйве» нужен одно-репликовый layout, он
+остраётся за рамками спайка.
 
 ### Что из этого остаётся верным
 
@@ -277,11 +330,12 @@ another one». Это ответ на вопрос ревью про очист�
 
 ## Что осталось
 
-- Пересобрать стенд начисто: картриджи через `mktape -s`, пути только
-  `/dev/tape/by-id/`, без ручного `mkltfs` и без правок DSS. На таком стенде
-  добить сценарий двух mover-процессов на двух драйвах.
+- Одно-репликовый layout, чтобы показать «каждый mover пишет на свой драйв»
+  явно, а не через raid1 на обе ленты.
 - Замер на реальном железе, когда оно появится: там цикл — десятки секунд, а
   позиционирование до минуты-двух.
+- Требования к деплою (порядок запуска, `mktape -s`, by-id) оформить в
+  `docs/ops/` при развёртывании M5.
 
 ## Репродукция
 
