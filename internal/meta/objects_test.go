@@ -131,6 +131,62 @@ func TestPutOverwriteKeepsOneCurrent(t *testing.T) {
 	}
 }
 
+// Major ревью PR #6: прежняя версия обязана уйти в deleting в той же
+// транзакции. Иначе migrator заархивирует уже заменённый объект (лишняя
+// запись на ленту), а deleter его никогда не увидит — утечка места.
+func TestPutOverwriteRetiresOldVersion(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "b1")
+
+	first := putInput("b1", "k")
+	if _, err := m.PutObject(ctx, first); err != nil {
+		t.Fatalf("первый PUT: %v", err)
+	}
+	second := putInput("b1", "k")
+	if _, err := m.PutObject(ctx, second); err != nil {
+		t.Fatalf("второй PUT: %v", err)
+	}
+
+	var state string
+	var current bool
+	err := m.Pool.QueryRow(ctx,
+		`SELECT state, is_current FROM objects WHERE id = $1`, first.ID).Scan(&state, &current)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if current {
+		t.Errorf("прежняя версия осталась текущей")
+	}
+	if state != "deleting" {
+		t.Errorf("прежняя версия в состоянии %q, хотели deleting — иначе её "+
+			"заархивирует migrator, а deleter её не увидит", state)
+	}
+
+	// В deleting строку должен подхватывать индекс objects_queue — иначе
+	// deleter до неё никогда не доберётся.
+	var inQueue int
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM objects
+		  WHERE id = $1 AND state IN ('pending','deleting')`, first.ID).Scan(&inQueue); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if inQueue != 1 {
+		t.Errorf("прежняя версия не попадает в очередь deleter'а")
+	}
+
+	// Новая версия, наоборот, обязана быть pending и текущей.
+	var newState string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT state FROM objects WHERE id = $1`, second.ID).Scan(&newState); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if newState != "pending" {
+		t.Errorf("новая версия в состоянии %q, хотели pending", newState)
+	}
+}
+
 // Две параллельные перезаписи одного ключа. Advisory-лок (ADR-0005) обязан
 // сериализовать их так, чтобы в итоге осталась ровно одна текущая строка и
 // ни одна из сторон не получила ошибку.

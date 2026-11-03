@@ -370,6 +370,16 @@ func sameJSON(t *testing.T, got []byte, want string) bool {
 
 // isS3Code сравнивает код S3-ошибки. Сравниваем BaseError с эталоном, а не
 // строку: код в ответе и константа ErrorCode — разные представления одного.
+// isS3CodeString сравнивает строковый код S3-ошибки. Нужно для кодов, которых
+// нет в перечислении versitygw (например InvalidStorageClass).
+func isS3CodeString(err error, code string) bool {
+	var se s3err.S3Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.BaseError().Code == code
+}
+
 func isS3Code(err error, code s3err.ErrorCode) bool {
 	var se s3err.S3Error
 	if !errors.As(err, &se) {

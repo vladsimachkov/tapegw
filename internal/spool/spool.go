@@ -30,6 +30,9 @@ import (
 // записи пропала бы.
 const tmpSubdir = "tmp"
 
+// shards — число каталогов-шардов: по байту префикса UUID.
+const shards = 256
+
 // ErrTooLarge — тело запроса превысило лимит. Бэкенд превращает в EntityTooLarge.
 var ErrTooLarge = errors.New("spool: object exceeds size limit")
 
@@ -68,7 +71,26 @@ func Open(root string) (*Spool, error) {
 			"rename даст EXDEV и запись перестанет быть атомарной",
 			s.root, s.tmp, devRoot, devTmp)
 	}
+
+	// Все шарды создаём здесь и один раз fsync-им корень. Если создавать
+	// каталог шарда лениво при записи, запись о нём в корне буфера остаётся
+	// без fsync: после падения машины каталог может исчезнуть вместе с файлом,
+	// который уже закоммичен в Postgres. Правило 6 тогда формально нарушено,
+	// хотя ошибка проявится только на отказе питания.
+	if err := s.initShards(); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// initShards — каталоги-шарды по всем возможным префиксам UUID.
+func (s *Spool) initShards() error {
+	for i := 0; i < shards; i++ {
+		if err := os.MkdirAll(filepath.Join(s.root, fmt.Sprintf("%02x", i)), 0o750); err != nil {
+			return fmt.Errorf("spool: шард %02x: %w", i, err)
+		}
+	}
+	return fsyncDir(s.root)
 }
 
 // Root — корень буфера на диске.

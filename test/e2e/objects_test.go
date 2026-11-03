@@ -5,11 +5,14 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"errors"
+	"hash/crc32"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -191,11 +194,14 @@ func TestObjectRejectsForeignStorageClass(t *testing.T) {
 	if err == nil {
 		t.Fatalf("STANDARD должны отвергаться (ADR-0003)")
 	}
-	// Код приходит строкой в тексте ошибки API (так же сравнивает buckets_test).
-	// Важен именно NotImplemented: 500 — тоже отказ, но он про баг, а не про
-	// честное «не поддерживаем».
-	if !strings.Contains(err.Error(), "NotImplemented") {
-		t.Errorf("ожидали NotImplemented, получили %T: %v", err, err)
+	// AWS отвечает InvalidStorageClass (400), а не NotImplemented (501): сервер
+	// эту операцию умеет, плохой запрос.
+	if !strings.Contains(err.Error(), "InvalidStorageClass") {
+		t.Errorf("ожидали InvalidStorageClass, получили %T: %v", err, err)
+	}
+	var respErr *smithyhttp.ResponseError
+	if errors.As(err, &respErr) && respErr.Response.StatusCode != 400 {
+		t.Errorf("ожидали 400, получили %d", respErr.Response.StatusCode)
 	}
 }
 
@@ -221,4 +227,172 @@ func hexString(b []byte) string {
 		out = append(out, hexDigits[c>>4], hexDigits[c&0xf])
 	}
 	return string(out)
+}
+
+// Trailing-суммы. Современный SDK по умолчанию считает CRC32/CRC64NVME и
+// кладёт их в трейлер aws-chunked, а не в заголовок, поэтому этот путь надо
+// гонять сквозняком: юнит его не видит, потому что versitygw разбирает трейлер
+// сам.
+//
+// Два прогона: настройки по умолчанию (сумма шлётся почти всегда) и
+// WhenRequired (только когда реально обязательна). Разница между ними — как раз
+// тот случай, когда алгоритм объявлен, а значения в заголовке нет.
+func TestObjectChecksumModes(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		val  aws.RequestChecksumCalculation
+	}{
+		{"по умолчанию", aws.RequestChecksumCalculationWhenSupported},
+		{"when required", aws.RequestChecksumCalculationWhenRequired},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			c := clientOpts(t, func(o *s3.Options) {
+				o.RequestChecksumCalculation = mode.val
+			})
+			ctx := context.Background()
+			bucket := uniqueBucket("m2ck")
+			if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+				t.Fatalf("CreateBucket: %v", err)
+			}
+
+			body := "тело, для которого SDK сам считает контрольную сумму"
+			key := "obj.bin"
+			put, err := c.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: aws.String(bucket), Key: aws.String(key),
+				Body: strings.NewReader(body),
+			})
+			if err != nil {
+				t.Fatalf("PutObject: %v", err)
+			}
+
+			// Что бы SDK ни прислал — заголовком или трейлером — содержимое
+			// обязано читаться, а сумма, если она была, обязана вернуться.
+			// Конкретный алгоритм по умолчанию менялся между версиями SDK,
+			// поэтому сравниваем не его, а согласованность PUT и HEAD.
+			head, err := c.HeadObject(ctx, &s3.HeadObjectInput{
+				Bucket: aws.String(bucket), Key: aws.String(key),
+			})
+			if err != nil {
+				t.Fatalf("HeadObject: %v", err)
+			}
+			putSums := putChecksums(put)
+			headSums := headChecksums(head)
+			if len(putSums) != len(headSums) {
+				t.Errorf("набор сумм разошёлся: PUT %v, HEAD %v", putSums, headSums)
+			}
+			for algo, v := range putSums {
+				if headSums[algo] != v {
+					t.Errorf("сумма %s: PUT %q, HEAD %q", algo, v, headSums[algo])
+				}
+			}
+
+			get, err := c.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucket), Key: aws.String(key),
+			})
+			if err != nil {
+				t.Fatalf("GetObject: %v", err)
+			}
+			defer get.Body.Close()
+			got, err := io.ReadAll(get.Body)
+			if err != nil {
+				t.Fatalf("ReadAll: %v", err)
+			}
+			if string(got) != body {
+				t.Errorf("содержимое разошлось: %q", got)
+			}
+		})
+	}
+}
+
+// Явная проверка: если SDK прислал checksum, она обязана сохраниться и
+// вернуться тем же алгоритмом — иначе «сумма не сохранилась» пройдёт незамеченной.
+func TestObjectChecksumEcho(t *testing.T) {
+	c := client(t)
+	ctx := context.Background()
+	bucket := uniqueBucket("m2ckecho")
+	if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	body := "проверяем, что сумма вернулась тем же алгоритмом"
+	// CRC32 считаем руками и шлём явным заголовком: так проверяется путь
+	// «значение в заголовке», независимо от того, что SDK делает по умолчанию.
+	crc := crc32IEEE([]byte(body))
+	put, err := c.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"),
+		Body: strings.NewReader(body), ChecksumCRC32: aws.String(crc),
+	})
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	if aws.ToString(put.ChecksumCRC32) != crc {
+		t.Errorf("Put вернул ChecksumCRC32=%q, ожидали %q", aws.ToString(put.ChecksumCRC32), crc)
+	}
+
+	head, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("k")})
+	if err != nil {
+		t.Fatalf("HeadObject: %v", err)
+	}
+	if aws.ToString(head.ChecksumCRC32) != crc {
+		t.Errorf("HEAD вернул ChecksumCRC32=%q, ожидали %q", aws.ToString(head.ChecksumCRC32), crc)
+	}
+}
+
+// clientOpts — тот же клиент, но с дополнительными настройками: нужен, чтобы
+// проверить RequestChecksumCalculation.
+func clientOpts(t *testing.T, opts ...func(*s3.Options)) *s3.Client {
+	t.Helper()
+
+	ep := os.Getenv("TAPEGW_E2E_ENDPOINT")
+	if ep == "" {
+		t.Skip("TAPEGW_E2E_ENDPOINT не задан — пропускаем e2e")
+	}
+	access, secret := os.Getenv("TAPEGW_E2E_ACCESS"), os.Getenv("TAPEGW_E2E_SECRET")
+	if access == "" || secret == "" {
+		t.Fatal("TAPEGW_E2E_ACCESS / TAPEGW_E2E_SECRET обязательны, когда задан endpoint")
+	}
+
+	base := s3.Options{
+		Region:       "us-east-1",
+		Credentials:  credentials.NewStaticCredentialsProvider(access, secret, ""),
+		BaseEndpoint: aws.String(ep),
+		UsePathStyle: true,
+	}
+	return s3.New(base, opts...)
+}
+
+// putChecksums / headChecksums — непустые контрольные суммы ответа, map
+// алгоритм → значение. Нужны, чтобы сравнить PUT и HEAD, не привязываясь к
+// конкретному алгоритму по умолчанию.
+func putChecksums(o *s3.PutObjectOutput) map[string]string {
+	return nonEmptySums(map[string]string{
+		"CRC32": aws.ToString(o.ChecksumCRC32), "CRC32C": aws.ToString(o.ChecksumCRC32C),
+		"SHA1": aws.ToString(o.ChecksumSHA1), "SHA256": aws.ToString(o.ChecksumSHA256),
+		"CRC64NVME": aws.ToString(o.ChecksumCRC64NVME), "SHA512": aws.ToString(o.ChecksumSHA512),
+	})
+}
+
+func headChecksums(o *s3.HeadObjectOutput) map[string]string {
+	return nonEmptySums(map[string]string{
+		"CRC32": aws.ToString(o.ChecksumCRC32), "CRC32C": aws.ToString(o.ChecksumCRC32C),
+		"SHA1": aws.ToString(o.ChecksumSHA1), "SHA256": aws.ToString(o.ChecksumSHA256),
+		"CRC64NVME": aws.ToString(o.ChecksumCRC64NVME), "SHA512": aws.ToString(o.ChecksumSHA512),
+	})
+}
+
+func nonEmptySums(m map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range m {
+		if v != "" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// crc32IEEE — CRC32 (Castagnoli нет, обычный IEEE) в base64, как требует S3.
+func crc32IEEE(b []byte) string {
+	h := crc32.NewIEEE()
+	h.Write(b)
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }

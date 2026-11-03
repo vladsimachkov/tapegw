@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -243,5 +244,27 @@ func TestWrittenFileIsCompleteBeforeReturn(t *testing.T) {
 	}
 	if !bytes.Equal(got, body) {
 		t.Errorf("содержимое на диске разошлось")
+	}
+}
+
+// Minor ревью PR #6: все шарды обязаны существовать сразу после Open, иначе
+// ленивое создание оставило бы запись о каталоге в корне без fsync, и после
+// отказа питания каталог мог бы исчезнуть вместе с уже закоммиченным в Postgres
+// файлом.
+func TestAllShardsExistAfterOpen(t *testing.T) {
+	s := newSpool(t)
+
+	for i := 0; i < 256; i++ {
+		dir := filepath.Join(s.Root(), fmt.Sprintf("%02x", i))
+		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+			t.Fatalf("шард %02x отсутствует: %v", i, err)
+		}
+	}
+
+	// Путь любого UUID обязан попадать в существующий каталог.
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(filepath.Dir(s.Path(uuid.New()))); err != nil {
+			t.Fatalf("шарда нет для случайного UUID: %v", err)
+		}
 	}
 }

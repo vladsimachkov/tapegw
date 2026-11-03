@@ -7,6 +7,7 @@ package s3err
 
 import (
 	"errors"
+	"net/http"
 
 	"github.com/versity/versitygw/s3err"
 
@@ -30,6 +31,24 @@ func FromMeta(err error, bucket string) error {
 		return s3err.GetBucketErr(s3err.ErrBucketAlreadyOwnedByYou, bucket)
 	default:
 		return err
+	}
+}
+
+// ErrInvalidStorageClass — AWS отвечает на чужой x-amz-storage-class кодом
+// InvalidStorageClass (400), а не NotImplemented (501). В s3err у versitygw
+// v1.10.0 такой константы нет (проверено по всему пакету), поэтому собираем
+// APIError напрямую: поля экспортируемые, а контроллер трактует его так же,
+// как любой встроенный код.
+//
+// 501 означает «сервер этого не умеет», и клиент на него может откатиться на
+// другую операцию или перестать ретраить. 400 говорит правду: запрос плохой,
+// с другим storage class повторить можно и он сработает.
+func InvalidStorageClass(class string) error {
+	return s3err.APIError{
+		Code: "InvalidStorageClass",
+		Description: "The storage class you specified is not supported by this " +
+			"gateway: tapegw хранит всё на ленте и отвечает GLACIER (" + class + ")",
+		HTTPStatusCode: http.StatusBadRequest,
 	}
 }
 

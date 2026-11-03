@@ -72,6 +72,13 @@ type PutObjectInput struct {
 	// из spool.landing_min_retention: миграция конфиг не видит, а обещание
 	// клиенту выдаём именно здесь.
 	OnlineUntil time.Time
+	// Precondition — условная запись (If-Match / If-None-Match). Вызывается
+	// внутри транзакции после взятия advisory-лока, на etag текущей строки:
+	// только так проверка атомарна относительно самой записи. nil — условий нет.
+	//
+	// Колбэк, а не готовые заголовки: разбором заголовков и кодами ошибок
+	// владеет versitygw, а пакет meta про него ничего знать не должен.
+	Precondition func(curEtag string, exists bool) error
 }
 
 // PutObject вставляет объект и делает его текущим, вытесняя прежнюю версию
@@ -132,16 +139,51 @@ func (m *Meta) PutObject(ctx context.Context, in PutObjectInput) (*Object, error
 			return fmt.Errorf("lock bucket %q: %w", in.Bucket, err)
 		}
 
-		// 3. Прежняя текущая строка перестаёт быть текущей. Не удаляем: история
-		//    нужна для мягкого удаления и для разбора сбоев.
+		// 3. Условная запись. Проверяем после advisory-лока и до вставки: между
+		//    проверкой и записью никто не успевает сменить текущую версию, и
+		//    гонка двух If-None-Match: * разрешается честно — проигравший
+		//    получает PreconditionFailed, а не «оба записали».
+		if in.Precondition != nil {
+			var curEtag string
+			err := tx.QueryRow(ctx,
+				`SELECT etag FROM objects
+				  WHERE bucket_id = $1 AND key = $2 AND is_current`,
+				bucketID, in.Key).Scan(&curEtag)
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				if err := in.Precondition("", false); err != nil {
+					return err
+				}
+			case err != nil:
+				return fmt.Errorf("etag текущей версии %s/%s: %w", in.Bucket, in.Key, err)
+			default:
+				if err := in.Precondition(curEtag, true); err != nil {
+					return err
+				}
+			}
+		}
+
+		// 4. Прежняя текущая строка теряет актуальность и тут же переходит в
+		//    deleting. Одного is_current = false мало: в состоянии pending её
+		//    заархивировал бы migrator (лишняя запись на ленту), а deleter её
+		//    вообще не увидел бы, и копия осталась бы и в landing, и на ленте
+		//    навсегда. В deleting строку подхватит индекс objects_queue
+		//    (state IN ('pending','deleting')). Удаление из Phobos появится в M6,
+		//    но состояние обязано быть правильным уже сейчас — иначе потом
+		//    придётся разбирать накопившиеся «вечные» строки.
+		//
+		//    retired_at здесь не ставим: по миграции 0001 он помечает терминальные
+		//    строки (deleted/failed) для выгрузки, а deleting — ещё не терминальное.
 		if _, err := tx.Exec(ctx,
-			`UPDATE objects SET is_current = false
+			`UPDATE objects
+			    SET is_current = false,
+			        state = 'deleting'
 			  WHERE bucket_id = $1 AND key = $2 AND is_current`,
 			bucketID, in.Key); err != nil {
 			return fmt.Errorf("retire previous version of %s/%s: %w", in.Bucket, in.Key, err)
 		}
 
-		// 4. Новая версия.
+		// 5. Новая версия.
 		created, err := tx.Query(ctx,
 			`INSERT INTO objects (
 			    id, bucket_id, key, is_current, size, etag, checksums,

@@ -23,10 +23,18 @@ import (
 type SumSpec struct {
 	// ContentMD5 — значение заголовка Content-MD5 (base64). Пусто — не сверяем.
 	ContentMD5 string
-	// Algorithm — x-amz-checksum-algorithm из запроса. Пусто — не сверяем.
+	// Algorithm — x-amz-checksum-algorithm из запроса. Пусто — не считаем.
 	Algorithm types.ChecksumAlgorithm
-	// Expected — значение x-amz-checksum-<algorithm> из запроса.
+	// Expected — значение x-amz-checksum-<algorithm> из заголовка. Пустое
+	// допустимо и означает «не сверяй, просто посчитай»: так приходит современный
+	// SDK, который объявляет алгоритм в x-amz-sdk-checksum-algorithm, а значение
+	// кладёт в трейлер aws-chunked.
 	Expected string
+	// SkipAlgorithmValidation — не оборачивать тело сверителем Algorithm.
+	// Ставится для trailing-сумм: их уже проверил чанк-ридер versitygw, и
+	// валидировать второй раз бессмысленно. Сумму при этом всё равно считаем
+	// сами — она нужна в ответе и в метаданных.
+	SkipAlgorithmValidation bool
 }
 
 // ObjectInfo — итог записи: что легло на диск и какие суммы получились.
@@ -36,8 +44,10 @@ type ObjectInfo struct {
 	MD5Hex string
 	// MD5B64 — base64 того же MD5: его кладём в заголовок Content-MD5 ответа.
 	MD5B64 string
-	// Algorithm и Checksum — эхо запрошенного клиентом checksum. Пустой Algorithm
-	// означает, что контрольный суммы клиент не присылал.
+	// Algorithm и Checksum — эхо запрошенного клиентом checksum. Значение
+	// ВСЕГДА вычислено здесь, а не взято из заголовка: заголовок может
+	// отсутствовать (trailing-сумма), а вернуть клиенту надо то, что реально
+	// посчитано по байтам.
 	Algorithm types.ChecksumAlgorithm
 	Checksum  string
 }
@@ -70,6 +80,10 @@ func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (Obj
 	md5h := md5.New()
 	src = io.TeeReader(src, md5h)
 
+	// Ссылка на сверитель алгоритма, чтобы после чтения забрать вычисленное
+	// значение: оно нужно в ответе даже когда клиент значения не присылал.
+	var algoReader *utils.HashReader
+
 	if spec.ContentMD5 != "" {
 		hr, err := utils.NewHashReader(src, spec.ContentMD5, utils.HashTypeContentMD5)
 		if err != nil {
@@ -82,17 +96,23 @@ func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (Obj
 		if !ok {
 			return info, fmt.Errorf("spool: неизвестный checksum-алгоритм %q", spec.Algorithm)
 		}
-		hr, err := utils.NewHashReader(src, spec.Expected, ht)
+		expected := spec.Expected
+		if spec.SkipAlgorithmValidation {
+			// Трейлер проверил чанк-ридер; нам остаётся только посчитать.
+			expected = ""
+		}
+		hr, err := utils.NewHashReader(src, expected, ht)
 		if err != nil {
 			return info, fmt.Errorf("spool: checksum %q: %w", spec.Algorithm, err)
 		}
 		src = hr
+		algoReader = hr
 	}
 
 	final := s.Path(id)
-	if err := os.MkdirAll(filepath.Dir(final), 0o750); err != nil {
-		return info, fmt.Errorf("spool: каталог под объект: %w", err)
-	}
+	// Каталог-шард здесь не создаём: все 256 созданы при Open и корень
+	// fsync-нут один раз. Ленивое создание оставило бы запись о каталоге
+	// в корне без fsync — см. Spool.initShards.
 
 	tmp, err := os.CreateTemp(s.tmp, "obj-*")
 	if err != nil {
@@ -125,9 +145,12 @@ func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (Obj
 	}
 	if spec.Algorithm != "" {
 		info.Algorithm = spec.Algorithm
-		// Значение уже проверено HashReader-ом при чтении; берём его из spec,
-		// потому что для составных (multipart) сумм оно может прийти заранее.
-		info.Checksum = spec.Expected
+		// Берём вычисленное значение, а не эхо заголовка: при trailing-сумме
+		// заголовка нет вовсе, а вернуть клиенту надо то, что посчитано по
+		// фактическим байтам.
+		if algoReader != nil {
+			info.Checksum = algoReader.Sum()
+		}
 	}
 
 	// fsync файла до rename: иначе после падения машины в каталоге может
