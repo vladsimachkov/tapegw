@@ -31,12 +31,20 @@ import (
 // виртуальные хосты требуют DNS и в стенде не настроены.
 func client(t *testing.T) *s3.Client {
 	t.Helper()
+	return clientWith(t, os.Getenv("TAPEGW_E2E_ACCESS"), os.Getenv("TAPEGW_E2E_SECRET"))
+}
+
+// clientWith — клиент под конкретные ключи. Нужен, чтобы проверять доступ не
+// только от root: путь root в versitygw идёт мимо политик и ACL вообще
+// (authorizationApplies возвращает false для root/admin), поэтому e2e на root
+// ничего про проверки доступа не говорит.
+func clientWith(t *testing.T, access, secret string) *s3.Client {
+	t.Helper()
 
 	ep := os.Getenv("TAPEGW_E2E_ENDPOINT")
 	if ep == "" {
 		t.Skip("TAPEGW_E2E_ENDPOINT не задан — пропускаем e2e")
 	}
-	access, secret := os.Getenv("TAPEGW_E2E_ACCESS"), os.Getenv("TAPEGW_E2E_SECRET")
 	if access == "" || secret == "" {
 		t.Fatal("TAPEGW_E2E_ACCESS / TAPEGW_E2E_SECRET обязательны, когда задан endpoint")
 	}
@@ -47,6 +55,32 @@ func client(t *testing.T) *s3.Client {
 		BaseEndpoint: aws.String(ep),
 		UsePathStyle: true,
 	})
+}
+
+// userClient — обычный ключ без прав администратора. Стенд обязан поднять
+// tapegw с s3.iam_dir и положить в ту директорию users.json с этим
+// пользователем. Иначе никак: в режиме одной учётки versitygw знает только
+// root, и политика на другого principal не прошла бы даже валидацию —
+// ResolveAccounts в single-account режиме считает любой не-root ключ
+// несуществующим, а это MalformedPolicy.
+func userClient(t *testing.T) *s3.Client {
+	t.Helper()
+	access, secret := os.Getenv("TAPEGW_E2E_USER_ACCESS"), os.Getenv("TAPEGW_E2E_USER_SECRET")
+	if access == "" || secret == "" {
+		t.Skip("TAPEGW_E2E_USER_ACCESS / TAPEGW_E2E_USER_SECRET не заданы — пропускаем проверку доступа")
+	}
+	return clientWith(t, access, secret)
+}
+
+// userAccess — имя principal для политики: в файловом IAM им считается access
+// key, а не ARN (ARN умеет только standalone-IAM).
+func userAccess(t *testing.T) string {
+	t.Helper()
+	access := os.Getenv("TAPEGW_E2E_USER_ACCESS")
+	if access == "" {
+		t.Skip("TAPEGW_E2E_USER_ACCESS не задан")
+	}
+	return access
 }
 
 // uniqueBucket даёт уникальное имя, чтобы тесты можно было запускать повторно
