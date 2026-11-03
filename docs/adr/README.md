@@ -24,3 +24,5 @@ Architectural Decision Records. Порядок задан в `docs/ARCHITECTURE.
 | [0014](0014-encryption-per-tenant.md) | Шифрование данных, ключ на тенанта, крипто-уничтожение | принято |
 | [0015](0015-versioning-and-object-lock.md) | Версионирование и Object Lock, совместимые с AWS | принято |
 | [0016](0016-thousands-of-tenants.md) | Решения под тысячи тенантов | принято |
+| [0017](0017-tenant-guard.md) | Страж тенанта: AccessDenied, тенант параметром meta | принято |
+| [0018](0018-system-tenant.md) | Системный тенант: id = 1 закрыт для клиентов | принято |
