@@ -60,7 +60,20 @@ jobs:
           POSTGRES_USER: tapegw
           POSTGRES_PASSWORD: tapegw
           POSTGRES_DB: phobos
-        ports: ["55432:5432"]
+        # Порт выбирает раннер, а не мы. Фиксированный «55432:5432» ловит гонку
+        # за ресурс хоста: на общего раннера уже кто-то держит этот порт, и
+        # контейнер не поднимается с «address already in use». Тесты при этом
+        # вообще не запускаются, а retry такую поломку только прячет.
+        #
+        # Порт читается как job.services.postgres.ports[5432] — без id задачи:
+        # job.services уже относится к текущей задаче. Форма job.<id>.services
+        # синтаксически проходит, но резолвится в пустоту, и DSN становится
+        # «localhost:/phobos». Поэтому рядом есть шаг-проверка на пустой порт.
+        #
+        # Выражение допустимо только на уровне шага: в jobs.<id>.env контекста
+        # job нет, и файл workflow целиком не проходит валидацию — прогоны
+        # заводятся без единого джоба и без внятного сообщения.
+        ports: ["5432"]
         options: >-
           --health-cmd "pg_isready -U tapegw"
           --health-interval 5s
@@ -74,9 +87,20 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Порт пустым быть не может, но если выражение развалится, DSN станет
+      # «localhost:/phobos» и падение будет совсем не про то.
+      - name: postgres ready
+        run: |
+          if [ -z "${TAPEGW_PG_PORT}" ]; then
+            echo "раннер не вернул порт postgres"; exit 1
+          fi
+          echo "postgres на порту ${TAPEGW_PG_PORT}"
+        env:
+          TAPEGW_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+
       - name: unit + integration
         env:
-          TAPEGW_TEST_DSN: postgres://tapegw:tapegw@localhost:55432/phobos?search_path=tapegw_test
+          TAPEGW_TEST_DSN: postgres://tapegw:tapegw@localhost:${{ job.services.postgres.ports[5432] }}/phobos?search_path=tapegw_test
         run: go test -race -count=1 ./...
 
   # E2E против живого tapegw: критерий готовности M1 — aws s3 mb / ls / rb.
@@ -89,7 +113,8 @@ jobs:
           POSTGRES_USER: tapegw
           POSTGRES_PASSWORD: tapegw
           POSTGRES_DB: phobos
-        ports: ["55432:5432"]
+        # Порт выбирает раннер — см. комментарий в джобе test.
+        ports: ["5432"]
         options: >-
           --health-cmd "pg_isready -U tapegw"
           --health-interval 5s
@@ -110,13 +135,20 @@ jobs:
         env:
           TAPEGW_ROOT_ACCESS: ci-access
           TAPEGW_ROOT_SECRET: ci-secret
+          # Только на уровне шага: в jobs.<id>.env контекст job недоступен.
+          TAPEGW_PG_PORT: ${{ job.services.postgres.ports[5432] }}
         run: |
+          if [ -z "${TAPEGW_PG_PORT}" ]; then
+            echo "раннер не вернул порт postgres"; exit 1
+          fi
           mkdir -p /tmp/spool/landing /tmp/spool/cache
-          cat > /tmp/ci.yaml <<'YAML'
+          # Heredoc без кавычек: нужен подстанов port'а. В теле других $
+          # нет, и добавлять их сюда не следует — иначе начнут раскрываться.
+          cat > /tmp/ci.yaml <<YAML
           s3:
             listen: [":7070"]
           db:
-            dsn: postgres://tapegw:tapegw@localhost:55432/phobos?search_path=tapegw_ci
+            dsn: postgres://tapegw:tapegw@localhost:${TAPEGW_PG_PORT}/phobos?search_path=tapegw_ci
           spool:
             landing: /tmp/spool/landing
             cache: /tmp/spool/cache
