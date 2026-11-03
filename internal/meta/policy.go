@@ -61,11 +61,29 @@ func (m *Meta) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, erro
 // ChangeBucketOwner передаёт бакет другой учётной записи. Вызывается только из
 // admin API (PATCH /change-bucket-owner), где versitygw уже проверил, что
 // новый владелец существует в IAM.
-func (m *Meta) ChangeBucketOwner(ctx context.Context, bucket, owner string) error {
+//
+// Одной колонкой owner дело не ограничивается, и это та же форма тихой ошибки,
+// что заглушки с NotFound: versitygw решает, кто владелец, не по buckets.owner,
+// а по ACL, который мы отдаём через GetBucketAcl. Если обновить только owner,
+// операция снаружи выглядит успешной, а права остаются старыми — новый владелец
+// (роль user, ради которой метод и нужен) доступа не получает, а прежний
+// сохраняет FULL_CONTROL и через ACL, и через старую политику.
+//
+// Posix (auth.UpdateBucketACLOwner) делает три шага: пишет ACL, где владелец —
+// новый аккаунт и единственный грант FULL_CONTROL тоже ему, затем удаляет
+// политику бакета. Мы делаем то же одним UPDATE: сбой посередине не оставит
+// бакет с новым владельцем и старым ACL, что при трёх вызовах бэкенда возможно.
+//
+// acl передаётся собранным извне: формат задают структуры versitygw, а пакет
+// meta про S3-обвязку знать не должен.
+func (m *Meta) ChangeBucketOwner(ctx context.Context, bucket, owner string, acl []byte) error {
 	tag, err := m.Pool.Exec(ctx,
-		`UPDATE buckets SET owner = $2
+		`UPDATE buckets
+		    SET owner = $2,
+		        acl = $3,
+		        policy = NULL
 		  WHERE name = $1 AND deleted_at IS NULL`,
-		bucket, owner)
+		bucket, owner, acl)
 	if err != nil {
 		return fmt.Errorf("change owner of %q: %w", bucket, err)
 	}

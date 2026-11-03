@@ -2,11 +2,15 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
+	stypes "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	vbackend "github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 
+	"github.com/versity/versitygw/auth"
 	tapegwerr "github.com/vladsimachkov/tapegw/internal/s3err"
 )
 
@@ -63,12 +67,30 @@ func (t *TapeGW) DeleteBucketPolicy(ctx context.Context, bucket string) error {
 
 // ChangeBucketOwner — admin API (PATCH /change-bucket-owner). versitygw перед
 // вызовом проверяет по IAM, что новый владелец существует, так что здесь
-// остаётся только переписать строку.
+// остаётся привести права в соответствие.
+//
+// ACL собирается из структур самого versitygw (auth.ACL / auth.Grantee), а не
+// строкой: json.Marshal даёт ровно те байты, что даёт auth.UpdateBucketACLOwner
+// в posix, и если versitygw переименует поле — мы узнаем об этом на сборке,
+// а не на первом же GetBucketAcl.
 func (t *TapeGW) ChangeBucketOwner(ctx context.Context, bucket, owner string) error {
 	if err := validateBucketName(bucket); err != nil {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	if err := t.meta.ChangeBucketOwner(ctx, bucket, owner); err != nil {
+
+	acl, err := json.Marshal(auth.ACL{
+		Owner: owner,
+		Grantees: []auth.Grantee{{
+			Permission: auth.PermissionFullControl,
+			Access:     owner,
+			Type:       stypes.TypeCanonicalUser,
+		}},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal ACL for %q: %w", bucket, err)
+	}
+
+	if err := t.meta.ChangeBucketOwner(ctx, bucket, owner, acl); err != nil {
 		return tapegwerr.FromMeta(err, bucket)
 	}
 	return nil

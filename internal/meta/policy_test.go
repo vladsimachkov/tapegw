@@ -84,10 +84,10 @@ func TestChangeBucketOwnerAndList(t *testing.T) {
 	mustBucket(t, m, "b1")
 	mustBucket(t, m, "b2")
 
-	if err := m.ChangeBucketOwner(ctx, "b2", "userplus"); err != nil {
+	if err := m.ChangeBucketOwner(ctx, "b2", "userplus", []byte(`{"Owner":"userplus","Grantees":[]}`)); err != nil {
 		t.Fatalf("ChangeBucketOwner: %v", err)
 	}
-	if err := m.ChangeBucketOwner(ctx, "ghost", "userplus"); !errors.Is(err, meta.ErrNotFound) {
+	if err := m.ChangeBucketOwner(ctx, "ghost", "userplus", nil); !errors.Is(err, meta.ErrNotFound) {
 		t.Fatalf("чужой бакет: получили %v, хотели ErrNotFound", err)
 	}
 

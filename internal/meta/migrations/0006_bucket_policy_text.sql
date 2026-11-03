@@ -23,5 +23,9 @@ ALTER TABLE buckets ALTER COLUMN policy TYPE text USING policy::text;
 -- Обратный ход требует, чтобы в policy лежал валидный JSON. Иначе не было бы
 -- что раскатывать: до этого PR колонка была jsonb, а значит пустые значения —
 -- NULL, и они же приходят за неимением политики.
+--
+-- Ссылка на столбец в USING — просто по имени, без алиаса таблицы: в ALTER TABLE
+-- нет FROM-предложения, и NULLIF(b.policy, '') падает на
+-- «missing FROM-clause entry for table "b"».
 ALTER TABLE buckets
-  ALTER COLUMN policy TYPE jsonb USING NULLIF(b.policy, '')::jsonb;
+  ALTER COLUMN policy TYPE jsonb USING NULLIF(policy, '')::jsonb;
