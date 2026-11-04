@@ -130,8 +130,12 @@ func DropSchema(t *testing.T, schema string) {
 // Схема своя на пакет, поэтому TRUNCATE безопасен.
 func Clean(t *testing.T, m *meta.Meta) {
 	t.Helper()
+	// accounts тоже: тесты вставляют учётки с фиксированными access_key, и
+	// между прогонами в одной схеме они накапливаются — второй прогон падал на
+	// accounts_pkey. Тест, который проходит или падает в зависимости от
+	// предыдущего, подрывает доверие к зелёному CI.
 	_, err := m.Pool.Exec(context.Background(), `
-		TRUNCATE upload_parts, uploads, restores, objects, buckets CASCADE`)
+		TRUNCATE upload_parts, uploads, restores, objects, buckets, accounts CASCADE`)
 	if err != nil {
 		t.Fatalf("truncate: %v", err)
 	}

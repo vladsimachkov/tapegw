@@ -325,3 +325,58 @@ func TestMarkerStateConstraints(t *testing.T) {
 		}
 	}
 }
+
+// Удаление маркера по versionId — штатный способ S3 вернуть удалённый объект.
+// Пока маркер переводился в 'deleted', эта операция падала на CHECK
+// (is_delete_marker = (state='marker')), и клиент получал 500.
+func TestDeleteMarkerRestoresObject(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "rest")
+	setBucketVersioning(t, m, "rest", meta.VersioningEnabled)
+
+	v1 := insertVersion(t, m, "rest", "k", versionOpts{size: 5, current: true})
+	del, err := m.DeleteObject(ctx, testTenant, meta.DeleteObjectInput{Bucket: "rest", Key: "k"})
+	if err != nil {
+		t.Fatalf("создание маркера: %v", err)
+	}
+	markerID := del.VersionID
+
+	if _, err := m.DeleteObject(ctx, testTenant, meta.DeleteObjectInput{
+		Bucket: "rest", Key: "k", VersionID: markerID,
+	}); err != nil {
+		t.Fatalf("удаление маркера по versionId: %v", err)
+	}
+
+	if got := currentVersionID(t, m, "rest", "k"); got != v1 {
+		t.Errorf("после удаления маркера текущая = %s, хотели v1 = %s", got, v1)
+	}
+
+	// Строки маркера не должно оставаться: у него нет данных, и «удалённая
+	// версия нулевого размера» — сущность, которой никогда не существовало.
+	var left int
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM objects WHERE id = $1::uuid`, markerID).Scan(&left); err != nil {
+		t.Fatalf("спрос про строку маркера: %v", err)
+	}
+	if left != 0 {
+		t.Errorf("строка маркера осталась в базе (%d шт.) — маркер удаляется физически", left)
+	}
+
+	// GET и листинг видят восстановленный объект.
+	obj, err := m.GetObject(ctx, testTenant, "rest", "k")
+	if err != nil {
+		t.Fatalf("GET после удаления маркера: %v", err)
+	}
+	if obj.ID.String() != v1 {
+		t.Errorf("GET отдал версию %s, хотели v1 = %s", obj.ID, v1)
+	}
+	live, err := m.ListObjectsCurrent(ctx, testTenant, "rest", "", "", "", 10)
+	if err != nil {
+		t.Fatalf("листинг: %v", err)
+	}
+	if keys := keysOf(live); len(keys) != 1 || keys[0] != "k" {
+		t.Errorf("листинг дал %v, хотели [k]", keys)
+	}
+}

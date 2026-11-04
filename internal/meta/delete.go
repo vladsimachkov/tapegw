@@ -243,18 +243,25 @@ func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID int64,
 		}
 	}
 
-	// Маркер удаления — версия без данных: она просто исчезает, deleter для неё
-	// не нужен. Обычная версия уходит в deleting, и копия снимается с диска и
-	// с ленты.
-	newState := "deleting"
-	retired := "NULL"
+	// Маркер удаления по versionId — стандартный способ вернуть удалённый
+	// объект в S3: удаляешь маркер, и предыдущая версия снова становится
+	// текущей. Строка маркера исчезает физически.
+	//
+	// Перевод в 'deleted' не годится дважды. Во-первых, он нарушает
+	// CHECK (is_delete_marker = (state = 'marker')) — то есть клиент получил бы
+	// 500 на штатную операцию. Во-вторых, «удалённая версия нулевого размера»
+	// — сущность, которой никогда не существовало: данных у маркера нет ни на
+	// диске, ни на ленте, deleter ему не нужен. Для аудита хватит журнала (T4).
+	//
+	// Если на T3 появится квота на число объектов, здесь же нужно уменьшать
+	// счётчик: по ADR-0015 маркеры в квоту входят.
 	if isMarker {
-		newState = "deleted"
-		retired = "now()"
-	}
-	if _, err := tx.Exec(ctx,
-		fmt.Sprintf(`UPDATE objects SET is_current = false, state = '%s', retired_at = %s
-		              WHERE id = $1`, newState, retired), verID); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM objects WHERE id = $1`, verID); err != nil {
+			return fmt.Errorf("delete marker %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
+		}
+	} else if _, err := tx.Exec(ctx,
+		`UPDATE objects SET is_current = false, state = 'deleting', retired_at = NULL
+		  WHERE id = $1`, verID); err != nil {
 		return fmt.Errorf("delete version %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
 	}
 

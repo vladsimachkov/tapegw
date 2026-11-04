@@ -915,6 +915,23 @@ func TestReadDeleteMarker(t *testing.T) {
 	if got := readAll(t, g); got != "данные" {
 		t.Errorf("версия под маркером отдала %q", got)
 	}
+
+	// Удаление самого маркера — штатный способ S3 вернуть объект.
+	if _, err := be.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: ptr("b"), Key: ptr("k"),
+		VersionId: ptr(markerID)}); err != nil {
+		t.Fatalf("удаление маркера по versionId: %v", err)
+	}
+	g, err = be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k")})
+	if err != nil {
+		t.Fatalf("GET после удаления маркера: %v", err)
+	}
+	if got := readAll(t, g); got != "данные" {
+		t.Errorf("после удаления маркера GET отдал %q, хотели «данные»", got)
+	}
+	if aws.ToString(g.VersionId) != dataID {
+		t.Errorf("x-amz-version-id = %q, хотели id восстановленной версии %s",
+			aws.ToString(g.VersionId), dataID)
+	}
 }
 
 // mustCurrentID — id текущей версии ключа.
