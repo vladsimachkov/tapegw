@@ -128,6 +128,32 @@ func TestGovernanceBypassNeedsRight(t *testing.T) {
 
 	// И без заголовка, и с ним — отказ: права на обход у ключа нет ни в
 	// политике бакета, ни в роли.
+
+	// То же удаление тем же ключом после того, как право появилось. Меняется
+	// одно право — значит, отказ выше был про право, а не про личность.
+	//
+	// Про с3:DeleteObjectVersion отдельно: удаление по versionId — это именно
+	// оно, а не s3:DeleteObject (object-delete.go:175). Политика с одним только
+	// s3:DeleteObject отклоняет удаление конкретной версии ещё до проверки
+	// блокировки, и отказ — общий AccessDenied, а не ErrObjectLocked. По этому
+	// различию и видно, какой слой отказал.
+	withBypass := fmt.Sprintf(
+		`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"%s"},`+
+			`"Action":["s3:PutObject","s3:GetObject","s3:DeleteObject",`+
+			`"s3:DeleteObjectVersion","s3:BypassGovernanceRetention"],`+
+			`"Resource":["arn:aws:s3:::%s/*"]}]}`,
+		plainAccess, bucket)
+	if _, err := owner.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+		Bucket: aws.String(bucket), Policy: aws.String(withBypass),
+	}); err != nil {
+		t.Fatalf("PutBucketPolicy с правом обхода: %v", err)
+	}
+	if _, err := plain.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"), VersionId: aws.String(vid),
+		BypassGovernanceRetention: aws.Bool(true),
+	}); err != nil {
+		t.Errorf("обход GOVERNANCE с правом из политики бакета не прошёл: %v", err)
+	}
 }
 
 // Обход GOVERNANCE работает, когда право есть. Root получает его по роли, и

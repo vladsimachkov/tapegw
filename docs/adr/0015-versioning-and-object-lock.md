@@ -202,13 +202,15 @@ COMPLIANCE. С виду это неотличимо от отказа самог
 Право на обход (`s3:BypassGovernanceRetention`) бэкенд по-прежнему не
 проверяет: это делает versitygw до вызова.
 
-**Открытый вопрос, не связанный с нашим бэкендом.** Обход через роль работает
-(`TestGovernanceBypassWorksForAdmin`: root с заголовком удаляет версию под
-GOVERNANCE). А выдача `s3:BypassGovernanceRetention` в политике бакета обычному
-ключу права не добавляет: versitygw отказывает сам, ещё до вызова бэкенда, и
-текст отказа — общий `AccessDenied`, а не `ErrObjectLocked`. Разбираться, какой
-слой versitygw требует здесь больше, чем политика бакета, — отдельная задача; к
-нашему бэкенду она отношения не имеет.
+Обычный ключ тоже обходит — через политику бакета
+(`TestGovernanceBypassNeedsRight`). Право там должно быть **двумя** действиями:
+`s3:BypassGovernanceRetention` и `s3:DeleteObjectVersion`. Удаление по
+`versionId` — это `s3:DeleteObjectVersion`, а не `s3:DeleteObject`
+(`object-delete.go:175`), и политика с одним только `s3:DeleteObject`
+отклоняет удаление конкретной версии ещё до проверки блокировки. Отказ при этом
+— общий `AccessDenied`, а не `ErrObjectLocked`, и по этой разнице как раз и
+видно, какой слой отказал: `ErrObjectLocked` значит «дошли до блокировки»,
+`AccessDenied` значит «не дали даже пытаться».
 
 ## Судьба маркера удаления
 
