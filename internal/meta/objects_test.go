@@ -38,6 +38,9 @@ func putInput(bucket, key string) meta.PutObjectInput {
 		// обязана быть: CHECK objects_dek_present из миграции 0013 не различает
 		// «тест без тела» и «боевой путь, который про ключ забыл».
 		WrappedDEK: []byte("wrapped-dek-для-теста"),
+		// Соль обязательна там же, где обёртка DEK: с миграции 0014 у версии с
+		// данными есть часть, а у части — соль.
+		Salt: testSalt(),
 	}
 }
 
@@ -327,6 +330,9 @@ func TestOnlineUntilNotNull(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// testSalt — соль для тестов, которые пишут только строку, без тела.
+func testSalt() []byte { return make([]byte, 16) }
 
 // --- Версионирование и null-версия (этап V, ADR-0015) ---
 

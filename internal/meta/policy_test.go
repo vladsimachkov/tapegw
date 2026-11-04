@@ -150,6 +150,7 @@ func TestChangeBucketOwnerMovesTenant(t *testing.T) {
 	if _, err := m.PutObject(ctx, testTenant, meta.PutObjectInput{
 		Bucket: "mv-full", Key: "k", Size: 3,
 		OnlineUntil: time.Now().Add(time.Hour), WrappedDEK: []byte("x"),
+		Salt: make([]byte, 16),
 	}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
@@ -160,8 +161,12 @@ func TestChangeBucketOwnerMovesTenant(t *testing.T) {
 	// 3. Незавершённая multipart-загрузка — тоже «не пусто».
 	mustBucket(t, m, "mv-mpu")
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO uploads (upload_id, bucket_id, key, meta)
-		 SELECT 'u1', id, 'mp', '{}'::jsonb FROM buckets WHERE name = 'mv-mpu'`); err != nil {
+		// wrapped_dek обязателен с миграции 0014: без него части нечем
+		// шифровать, и заглушить эту колонку в тесте значило бы проверить
+		// перенос бакета с загрузкой, которой в реальности не существует.
+		`INSERT INTO uploads (upload_id, bucket_id, key, meta, wrapped_dek, object_id)
+		 SELECT 'u1', id, 'mp', '{}'::jsonb, decode('00','hex'), gen_random_uuid()
+		   FROM buckets WHERE name = 'mv-mpu'`); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
 	if err := m.ChangeBucketOwner(ctx, testTenant, "mv-mpu", "bob", tenant77, nil); !errors.Is(err, meta.ErrBucketNotEmpty) {
@@ -206,6 +211,7 @@ func TestChangeOwnerRacesWithPut(t *testing.T) {
 			_, putErr = m.PutObject(ctx, testTenant, meta.PutObjectInput{
 				Bucket: bucket, Key: "k", Size: 1,
 				OnlineUntil: time.Now().Add(time.Hour), WrappedDEK: []byte("x"),
+				Salt: make([]byte, 16),
 			})
 		}()
 		go func() {

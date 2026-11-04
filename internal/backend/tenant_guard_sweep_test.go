@@ -99,10 +99,10 @@ var backendMethodCases = map[string]guardCase{
 	"ValidateUploadID":     {class: noBucket, reason: "формат uploadId, бакета в аргументах нет"},
 
 	// --- заглушки BackendUnsupported ----------------------------------------
-	"AbortMultipartUpload":          {class: unimplemented, reason: "multipart вне MVP"},
-	"CompleteMultipartUpload":       {class: unimplemented, reason: "multipart вне MVP"},
+	"AbortMultipartUpload":          {class: guarded, reason: "T2 PR#2: отмена загрузки — по бакету загрузки"},
+	"CompleteMultipartUpload":       {class: guarded, reason: "T2 PR#2: завершение загрузки — по бакету загрузки"},
 	"CopyObject":                    {class: unimplemented, reason: "копирование вне MVP; при реализации — проверять оба бакета"},
-	"CreateMultipartUpload":         {class: unimplemented, reason: "multipart вне MVP"},
+	"CreateMultipartUpload":         {class: guarded, reason: "T2 PR#2: заведение загрузки — по бакету"},
 	"DeleteBucketCors":              {class: unimplemented, reason: "CORS вне MVP"},
 	"DeleteBucketOwnershipControls": {class: unimplemented, reason: "ownership controls вне MVP"},
 	"DeleteBucketWebsite":           {class: unimplemented, reason: "static website вне MVP"},
@@ -117,11 +117,11 @@ var backendMethodCases = map[string]guardCase{
 	"GetObjectLegalHold":            {class: guarded, reason: "этап V: читает legal hold версии"},
 	"GetObjectRetention":            {class: guarded, reason: "этап V: читает retention версии"},
 	"GetObjectTagging":              {class: unimplemented, reason: "теги объектов появятся с M3"},
-	"ListMultipartUploads":          {class: unimplemented, reason: "multipart вне MVP"},
+	"ListMultipartUploads":          {class: guarded, reason: "T2 PR#2: список загрузок бакета"},
 	"ListObjectVersions":            {class: guarded, reason: "листинг версий: чужой бакет — AccessDenied"},
 	"ListObjects":                   {class: guarded, reason: "листинг v1: чужой бакет — AccessDenied"},
 	"ListObjectsV2":                 {class: guarded, reason: "листинг v2: чужой бакет — AccessDenied"},
-	"ListParts":                     {class: unimplemented, reason: "multipart вне MVP"},
+	"ListParts":                     {class: guarded, reason: "T2 PR#2: части загрузки — по бакету загрузки"},
 	"PutBucketCors":                 {class: unimplemented, reason: "CORS вне MVP"},
 	"PutBucketOwnershipControls":    {class: unimplemented, reason: "ownership controls вне MVP"},
 	"PutBucketVersioning":           {class: guarded, reason: "этап V: меняет версионирование бакета"},
@@ -132,8 +132,8 @@ var backendMethodCases = map[string]guardCase{
 	"PutObjectRetention":            {class: guarded, reason: "этап V: ставит retention версии"},
 	"PutObjectTagging":              {class: unimplemented, reason: "теги объектов появятся с M3"},
 	"RestoreObject":                 {class: unimplemented, reason: "восстановление с ленты появится с M5"},
-	"UploadPart":                    {class: unimplemented, reason: "multipart вне MVP"},
-	"UploadPartCopy":                {class: unimplemented, reason: "multipart вне MVP; при реализации — проверять оба бакета"},
+	"UploadPart":                    {class: guarded, reason: "T2 PR#2: запись части — по бакету загрузки"},
+	"UploadPartCopy":                {class: guarded, reason: "T2 PR#2: копия в часть — под стражом оба бакета: загрузки (GetUpload) и источника (GetObject)"},
 	// Отказ доставляется внутри потока ответов, error в сигнатуре нет.
 	"SelectObjectContent": {class: noErrorResult, reason: "S3 Select вне MVP, а отказ возвращается потоком, а не error"},
 }

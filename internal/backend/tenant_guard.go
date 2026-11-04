@@ -111,3 +111,29 @@ func (t *TapeGW) objectErr(ctx context.Context, bucket string, tenant meta.Tenan
 	}
 	return t.bucketErr(ctx, bucket, tenant, meta.ErrNotFound)
 }
+
+// uploadErr — та же разборка для multipart-загрузок.
+//
+// uploadId сам по себе ничего не говорит о бакете, поэтому ориентир — бакет из
+// запроса. Если он мой, то и загрузка не нашлась по-настоящему: страж свои
+// бакеты не фильтрует, так что скрывать там нечего. Если бакет не мой —
+// AccessDenied, а не NoSuchUpload: по коду «загрузки нет» клиент узнал бы, что
+// uploadId существует у другого тенанта.
+func (t *TapeGW) uploadErr(ctx context.Context, bucket string, tenant meta.TenantID, err error) error {
+	if !errors.Is(err, meta.ErrNotFound) {
+		return mapMetaErr(err, bucket)
+	}
+	if bucket == "" {
+		// Бакета в запросе нет вовсе — сравнивать не с чем, отвечаем общим
+		// кодом и ничего не утверждаем.
+		return s3err.GetAPIError(s3err.ErrNoSuchUpload)
+	}
+	mine, qErr := t.meta.BucketExists(ctx, tenant, bucket)
+	if qErr != nil {
+		return mapMetaErr(qErr, bucket)
+	}
+	if mine {
+		return s3err.GetAPIError(s3err.ErrNoSuchUpload)
+	}
+	return t.bucketErr(ctx, bucket, tenant, meta.ErrNotFound)
+}

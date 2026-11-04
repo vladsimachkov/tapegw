@@ -284,9 +284,17 @@ func TestShrunkSizeInMetadataIsRejected(t *testing.T) {
 	putBytes(t, be, "b", "k", filler(n))
 
 	obj := currentObject(t, m, "b", "k")
+	// Уменьшать надо и размер объекта, и размер его части: с миграции 0014 у
+	// обычного PUT тоже есть строка в object_parts, и расхождение только в
+	// objects.size поймал бы конструктор читателя, а не AAD.
 	if _, err := m.Pool.Exec(context.Background(),
 		`UPDATE objects SET size = $2 WHERE id = $1`, obj.ID, 2*encrypt.SegmentSize); err != nil {
 		t.Fatalf("уменьшение размера: %v", err)
+	}
+	if _, err := m.Pool.Exec(context.Background(),
+		`UPDATE object_parts SET plain_size = $2 WHERE version_id = $1`,
+		obj.ID, 2*encrypt.SegmentSize); err != nil {
+		t.Fatalf("уменьшение размера части: %v", err)
 	}
 
 	out, err := be.GetObject(testCtx(), &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k")})
@@ -295,7 +303,11 @@ func TestShrunkSizeInMetadataIsRejected(t *testing.T) {
 	}
 	got, rerr := readBody(t, out.Body)
 	if rerr == nil {
-		t.Errorf("усечённый объект прочитался: %d байт вместо %d", len(got), 2*encrypt.SegmentSize)
+		// Числа в сообщении нарочно разные: прочитано ровно столько, сколько
+		// осталось после порчи метаданных, а настоящих байт было больше.
+		// Одинаковые числа в тексте ошибки читались как «всё совпало».
+		t.Errorf("усечённый объект прочитался целиком как настоящий: %d байт, хотя данных было %d",
+			len(got), n)
 	}
 }
 

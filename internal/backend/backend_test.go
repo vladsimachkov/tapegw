@@ -394,12 +394,16 @@ func TestBucketACL(t *testing.T) {
 }
 
 // Неподдержанные операции обязаны отвечать NotImplemented, а не «молча
-// что-то делать» (правило 4). Проверяем на multipart: он появится только в M3.
+// что-то делать» (правило 4).
+//
+// Проверяем на CopyObject. Метод выбирается по одному критерию: он обязан
+// оставаться заглушкой. Multipart для этой роли больше не годится — его
+// реализовали в T2 PR#2, и тест проверял бы не заглушку, а реализацию.
 func TestUnsupportedOperationsReportNotImplemented(t *testing.T) {
 	be, _, _ := newBackend(t)
 
-	_, err := be.CreateMultipartUpload(context.Background(), s3response.CreateMultipartUploadInput{
-		Bucket: ptr("any"), Key: ptr("k"),
+	_, err := be.CopyObject(context.Background(), s3response.CopyObjectInput{
+		Bucket: ptr("any"), Key: ptr("k"), CopySource: ptr("any/k"),
 	})
 	if err == nil {
 		t.Fatal("ожидали NotImplemented")

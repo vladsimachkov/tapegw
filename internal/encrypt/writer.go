@@ -18,6 +18,10 @@ type Writer struct {
 	key     []byte
 	version uuid.UUID
 	part    uint32
+	// salt — соль этой части: входит в nonce каждого сегмента и делает
+	// переотправку части с тем же номером новым набором nonce. Копируется
+	// внутрь, как ключ: вызывающий вправе обнулить свой массив сразу.
+	salt []byte
 	// plainSize — полный размер открытого текста части. Он входит в AAD каждого
 	// сегмента, поэтому писатель обязан знать его заранее: отсюда требование к
 	// PutObject объявлять длину до тела.
@@ -35,9 +39,12 @@ type Writer struct {
 //
 // Ключ копируется внутрь, поэтому вызывающий волен обнулить свой массив сразу
 // после записи: обёрнутый DEK он уже получил, а писателю ключ больше не нужен.
-func NewWriter(dst io.Writer, key []byte, version uuid.UUID, part uint32, plainSize int64) (*Writer, error) {
+func NewWriter(dst io.Writer, key []byte, version uuid.UUID, part uint32, salt []byte, plainSize int64) (*Writer, error) {
 	if len(key) != KeySize {
 		return nil, fmt.Errorf("encrypt: ключ %d байт, нужно %d", len(key), KeySize)
+	}
+	if len(salt) != SaltSize {
+		return nil, fmt.Errorf("encrypt: соль %d байт, нужно %d", len(salt), SaltSize)
 	}
 	if plainSize < 0 {
 		return nil, fmt.Errorf("encrypt: отрицательный размер %d", plainSize)
@@ -47,11 +54,16 @@ func NewWriter(dst io.Writer, key []byte, version uuid.UUID, part uint32, plainS
 	// в Reader.
 	own := make([]byte, KeySize)
 	copy(own, key)
+	// Соль копируется так же, как ключ: вызывающий вправе обнулить свой массив
+	// сразу после конструктора.
+	ownSalt := make([]byte, SaltSize)
+	copy(ownSalt, salt)
 	return &Writer{
 		dst:       dst,
 		key:       own,
 		version:   version,
 		part:      part,
+		salt:      ownSalt,
 		plainSize: plainSize,
 		buf:       make([]byte, 0, SegmentSize),
 		tmp:       make([]byte, 0, CipherSegmentSize),
@@ -89,7 +101,7 @@ func (w *Writer) flush() error {
 	if len(w.buf) == 0 {
 		return nil
 	}
-	ct, err := SealSegment(w.tmp, w.key, w.version, w.part, w.seg, w.plainSize, w.buf)
+	ct, err := SealSegment(w.tmp, w.key, w.version, w.part, w.salt, w.seg, w.plainSize, w.buf)
 	if err != nil {
 		return err
 	}

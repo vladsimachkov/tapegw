@@ -163,12 +163,17 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 
 	// UUID генерируем здесь, а не в базе: имя файла в спуле обязано совпасть со
 	// строкой, и mover потом соберёт тот же путь по UUID из строки (ADR-0007).
+	// Соль — на каждую запись версии своя, она входит в nonce сегментов.
+	salt, err := newSalt()
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
 	info, err := t.spool.WriteEncrypted(id, po.Body, spool.SumSpec{
 		ContentMD5:              str(po.ContentMD5),
 		Algorithm:               algo,
 		Expected:                checksumExpected(&po, algo),
 		SkipAlgorithmValidation: trailing,
-	}, limit, dek, declared)
+	}, limit, dek, declared, salt)
 	if err != nil {
 		if errors.Is(err, spool.ErrTooLarge) {
 			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrEntityTooLarge)
@@ -227,6 +232,7 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		RetainUntil:   lockUntil,
 		LegalHold:     lockHold,
 		WrappedDEK:    wrappedDEK,
+		Salt:          salt,
 	})
 	if err != nil {
 		// Файл уже на диске, а строки нет. Убираем сразу: janitor разберёт
