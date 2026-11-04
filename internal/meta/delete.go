@@ -154,8 +154,15 @@ func (m *Meta) deleteCurrent(ctx context.Context, tx pgx.Tx, bucketID int64,
 	}
 }
 
-// insertDeleteMarker — версия без тела. state = 'deleted': данных нет, в
-// deleting ей делать нечего — deleter искал бы то, чего не существует.
+// insertDeleteMarker — версия без тела: state = 'marker', retired_at = NULL.
+//
+// Не 'deleted' по двум причинам. Во-первых, фильтры вида
+// `state NOT IN ('deleting','deleted')` должны видеть маркер как живую версию:
+// иначе удаление текущей версии воскрешает объект, спрятанный маркером.
+// Во-вторых, janitor (M6) физически удаляет строки в 'deleted' старше
+// meta.terminal_retention, и маркеры исчезли бы вместе с защитой от
+// «воскрешения». В 'deleting' маркеру делать нечего — deleter искал бы то,
+// чего не существует.
 func insertDeleteMarker(ctx context.Context, tx pgx.Tx, bucketID int64,
 	in DeleteObjectInput, nullVersion bool) (string, error) {
 
@@ -167,10 +174,10 @@ func insertDeleteMarker(ctx context.Context, tx pgx.Tx, bucketID int64,
 	_, err := tx.Exec(ctx,
 		`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class,
 		                      state, landing, online_until, tenant_id, pool_id,
-		                      is_current, is_delete_marker, is_null_version, retired_at)
-		  VALUES ($1,$2,$3,0,'','GLACIER','deleted',false,now(),
+		                      is_current, is_delete_marker, is_null_version)
+		  VALUES ($1,$2,$3,0,'','GLACIER','marker',false,now(),
 		          (SELECT tenant_id FROM buckets WHERE id = $2), $5,
-		          true, true, $4, now())`,
+		          true, true, $4)`,
 		id, bucketID, in.Key, nullVersion, DefaultPoolID)
 	if err != nil {
 		return "", fmt.Errorf("insert delete marker %s/%s: %w", in.Bucket, in.Key, err)
@@ -313,7 +320,7 @@ func (m *Meta) LookupVersion(ctx context.Context, tenant TenantID,
 			           JOIN buckets b ON b.id = o.bucket_id
 			          WHERE b.name = $1 AND b.deleted_at IS NULL
 			            AND o.key = $2 AND %s
-			            AND (o.is_delete_marker OR o.state NOT IN ('deleting','deleted'))`, cond)
+			            AND o.state NOT IN ('deleting','deleted')`, cond)
 	q, qargs := withTenantCol(base, "b.tenant_id", tenant, args...)
 
 	obj, err := scanObject(m.Pool.QueryRow(ctx, q, qargs...))

@@ -35,13 +35,20 @@ func insertVersion(t *testing.T, m *meta.Meta, bucket, key string, o versionOpts
 		t.Fatalf("id бакета %s: %v", bucket, err)
 	}
 	id := uuid.New()
+	// Маркер — не 'deleted': иначе он не пережил бы чистку терминальных строк,
+	// и CHECK на схеме не позволил бы такой дрейф.
+	state := "pending"
+	if o.deleteMarker {
+		state = "marker"
+	}
 	if _, err := m.Pool.Exec(context.Background(),
 		`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class,
 		                      state, landing, online_until, tenant_id, pool_id,
 		                      is_current, is_delete_marker, is_null_version)
-		  VALUES ($1,$2,$3,$4,'etag','GLACIER','pending',true,
+		  VALUES ($1,$2,$3,$4,'etag','GLACIER',$8,true,
 		          now() + interval '1 day', 1, 1, $5, $6, $7)`,
-		id, bucketID, key, o.size, o.current, o.deleteMarker, o.nullVersion); err != nil {
+		id, bucketID, key, o.size, o.current, o.deleteMarker, o.nullVersion,
+		state); err != nil {
 		t.Fatalf("вставка версии %s/%s: %v", bucket, key, err)
 	}
 	return id.String()

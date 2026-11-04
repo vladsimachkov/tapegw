@@ -57,7 +57,7 @@ tapegw — S3-сервис с Glacier-семантикой, где данные 
 Все S3-метаданные и очереди живут в схеме `tapegw` того же Postgres, где Phobos держит свою DSS (в своей схеме). Один инстанс — один бэкап. Миграции только вперёд, встроены в бинарь (`embed` + goose или tern).
 
 ```sql
-CREATE TYPE obj_state AS ENUM ('pending','archiving','archived','failed','deleting','deleted');
+CREATE TYPE obj_state AS ENUM ('pending','archiving','archived','failed','deleting','deleted','marker');
 CREATE TYPE restore_state AS ENUM ('requested','in_progress','restored','failed');
 
 CREATE TABLE buckets (
@@ -303,7 +303,7 @@ CREATE TABLE upload_parts (
 - Удаляет истёкшие restore: строка из `restores`, файл из cache.
 - Удаляет незавершённые multipart старше `mpu.ttl`.
 - Orphan GC: файлы в landing, cache, mpu без соответствующей строки старше `orphan.grace`.
-- Чистка терминальных строк: `objects` в состояниях `deleted` и `failed` помечаются `retired_at` и физически удаляются старше `meta.terminal_retention` (по умолчанию 90 дней). Без этого таблица растёт всю жизнь системы: каждая перезапись ключа добавляет строку, а по `objects` построены индексы очередей и листинга. `admin verify` на ретайрных строках не ругается, но проверяет, что файлов у них уже нет.
+- Чистка терминальных строк: `objects` в состояниях `deleted` и `failed` помечаются `retired_at` и физически удаляются старше `meta.terminal_retention` (по умолчанию 90 дней). Маркеры удаления (`state = 'marker'`) к терминальным не относятся и `retired_at` не носят: удаление маркера по `versionId` переводит его в `deleted`, а живой маркер исчезнуть по сроку не может, иначе похороненные под ним версии воскреснут. Без этого таблица растёт всю жизнь системы: каждая перезапись ключа добавляет строку, а по `objects` построены индексы очередей и листинга. `admin verify` на ретайрных строках не ругается, но проверяет, что файлов у них уже нет.
 
 ## Интеграция с Phobos
 
