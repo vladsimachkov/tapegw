@@ -130,9 +130,17 @@ func DropSchema(t *testing.T, schema string) {
 // Схема своя на пакет, поэтому TRUNCATE безопасен.
 func Clean(t *testing.T, m *meta.Meta) {
 	t.Helper()
+	ctx := context.Background()
 	q := "TRUNCATE " + strings.Join(CleanTables, ", ") + " CASCADE"
-	if _, err := m.Pool.Exec(context.Background(), q); err != nil {
+	if _, err := m.Pool.Exec(ctx, q); err != nil {
 		t.Fatalf("truncate: %v", err)
+	}
+
+	for _, seed := range SeedTables {
+		d := fmt.Sprintf("DELETE FROM %s WHERE %s <> %d", seed.Table, seed.Column, SeedID)
+		if _, err := m.Pool.Exec(ctx, d); err != nil {
+			t.Fatalf("зачистка %s до строк сида: %v", seed.Table, err)
+		}
 	}
 }
 
@@ -151,14 +159,44 @@ var CleanTables = []string{
 	"accounts",
 }
 
-// SeedTables — таблицы, которые Clean НЕ чистит: их содержимое создают
-// миграции, и оно нужно тестам (внешние ключи на tenants/pools, квота
-// тенанта 1). Значение — имя колонки, по которой проверяется единственная
-// сид-строка.
-var SeedTables = map[string]string{
-	"tenants":      "id",
-	"pools":        "id",
-	"tenant_usage": "tenant_id",
+// SeedID — id строк, которые в таблицы сида кладут миграции: системный
+// тенант 1, пул 1, tenant_usage для тенанта 1.
+const SeedID = 1
+
+// SeedTable — таблица сида и колонка, по которой опознаётся сид-строка.
+type SeedTable struct {
+	Table  string
+	Column string
+}
+
+// SeedTables — таблицы, которые Clean неtruncate-ит целиком: их наполняют
+// миграции, и эти строки нужны тестам (внешние ключи на tenants/pools, квота
+// тенанта 1).
+//
+// Но «не трогать целиком» — слишком широко: тесты кладут сюда и свои строки
+// (тенанты 2 и 3, их tenant_usage, позже — свои пулы). Между прогонами они
+// копятся, а тесты держатся только на ON CONFLICT — та же форма, в которой
+// флейк с accounts молчал до второго прогона. Поэтому Clean оставляет в каждой
+// такой таблице ровно строку сида.
+//
+// Порядок значим: это порядок удаления не-сид-строк по внешним ключам, от
+// зависимых к родителю (tenant_usage → tenants → pools).
+// IsSeedTable — проверяет, объявлена ли таблица как сид. Держать список и
+// проверку в одном месте нужно затем, чтобы TestCleanCoversEveryTable не мог
+// разойтись с Clean.
+func IsSeedTable(name string) bool {
+	for _, s := range SeedTables {
+		if s.Table == name {
+			return true
+		}
+	}
+	return false
+}
+
+var SeedTables = []SeedTable{
+	{"tenant_usage", "tenant_id"},
+	{"tenants", "id"},
+	{"pools", "id"},
 }
 
 // PackageSchema даёт схеме имя по имени тестового бинаря: backend.test →

@@ -48,7 +48,7 @@ func TestCleanCoversEveryTable(t *testing.T) {
 		cleaned[tbl] = true
 	}
 	for _, tbl := range tables {
-		if cleaned[tbl] || testdb.SeedTables[tbl] != "" {
+		if cleaned[tbl] || testdb.IsSeedTable(tbl) {
 			continue
 		}
 		t.Errorf("таблица %s не покрыта testdb.Clean: допишите её в testdb.CleanTables "+
@@ -119,14 +119,80 @@ func TestCleanEmptiesDataTables(t *testing.T) {
 		}
 	}
 
-	for tbl, col := range testdb.SeedTables {
+	// Строки сида обязаны пережить Clean: на них висят внешние ключи тестов.
+	for _, seed := range testdb.SeedTables {
 		var n int
 		if err := m.Pool.QueryRow(ctx,
-			`SELECT count(*) FROM `+tbl+` WHERE `+col+` = 1`).Scan(&n); err != nil {
-			t.Fatalf("спрос про сид %s: %v", tbl, err)
+			`SELECT count(*) FROM `+seed.Table+` WHERE `+seed.Column+` = $1`,
+			testdb.SeedID).Scan(&n); err != nil {
+			t.Fatalf("спрос про сид %s: %v", seed.Table, err)
 		}
 		if n != 1 {
-			t.Errorf("сид-строка %s (%s = 1) пропала после Clean", tbl, col)
+			t.Errorf("сид-строка %s (%s = %d) пропала после Clean",
+				seed.Table, seed.Column, testdb.SeedID)
+		}
+	}
+}
+
+// Clean оставляет в таблицах сида ровно строку сида.
+//
+// Тесты сеют тенанты 2 и 3, их строки tenant_usage, позже появятся свои пулы.
+// Если их не зачищать, они копятся между прогонами, а тесты держатся только на
+// ON CONFLICT — та же форма, в которой флейк с accounts молчал до второго
+// прогона.
+func TestCleanKeepsOnlySeedRows(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+
+	// Посев — зависимые строки в порядке внешних ключей: пул, тенант, usage.
+	// Иначе вставка тенанта с id ≠ 1 упала бы на FK к pools.
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO pools (id, name, phobos_tag, repl_count, kind)
+		  VALUES (91, 'probe', 'pool:probe', 1, 'dedicated')
+		  ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("посев пула: %v", err)
+	}
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO tenants (id, name, status, pool_id) VALUES (92, 'probe', 'active', 91)
+		  ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("посев тенанта: %v", err)
+	}
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO tenant_usage (tenant_id) VALUES (92)
+		  ON CONFLICT (tenant_id) DO NOTHING`); err != nil {
+		t.Fatalf("посев tenant_usage: %v", err)
+	}
+
+	// Посев обязан быть виден, иначе «ровно одна строка» ничего не проверяет.
+	for _, seed := range testdb.SeedTables {
+		var n int
+		if err := m.Pool.QueryRow(ctx,
+			`SELECT count(*) FROM `+seed.Table+` WHERE `+seed.Column+` <> $1`,
+			testdb.SeedID).Scan(&n); err != nil {
+			t.Fatalf("проверка посева %s: %v", seed.Table, err)
+		}
+		if n == 0 {
+			t.Errorf("в %s нет ни одной не-сид строки до Clean — проверка пуста",
+				seed.Table)
+		}
+	}
+
+	testdb.Clean(t, m)
+
+	for _, seed := range testdb.SeedTables {
+		var total, seedRows int
+		if err := m.Pool.QueryRow(ctx,
+			`SELECT count(*) FROM `+seed.Table).Scan(&total); err != nil {
+			t.Fatalf("подсчёт %s: %v", seed.Table, err)
+		}
+		if err := m.Pool.QueryRow(ctx,
+			`SELECT count(*) FROM `+seed.Table+` WHERE `+seed.Column+` = $1`,
+			testdb.SeedID).Scan(&seedRows); err != nil {
+			t.Fatalf("подсчёт сида в %s: %v", seed.Table, err)
+		}
+		if total != 1 || seedRows != 1 {
+			t.Errorf("после Clean в %s строк %d, из них сида %d — хотели ровно 1 и 1",
+				seed.Table, total, seedRows)
 		}
 	}
 }
