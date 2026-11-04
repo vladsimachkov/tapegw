@@ -49,7 +49,10 @@ func (t *TapeGW) DeleteObject(ctx context.Context,
 	res, err := t.meta.DeleteObject(ctx, tenant, in)
 	if err != nil {
 		if errors.Is(err, meta.ErrObjectLocked) {
-			return nil, s3err.GetBucketErr(s3err.ErrAccessDenied, bucket)
+			// Не голый AccessDenied: у versitygw есть ErrObjectLocked с
+			// описанием «объект защищён локом», и клиент по нему понимает,
+			// что делать дальше (обойти GOVERNANCE или смириться).
+			return nil, s3err.GetBucketErr(s3err.ErrObjectLocked, bucket)
 		}
 		return nil, t.objectErr(ctx, bucket, tenant, err)
 	}

@@ -44,6 +44,12 @@ type Object struct {
 	// бакете без версий или на приостановленном). По ней чтение решает, что
 	// положить в x-amz-version-id: id или "null".
 	IsNullVersion bool
+	// RetentionMode/RetainUntil/LegalHold — Object Lock версии. nil/false —
+	// настройки нет; HEAD и GET обязаны отдавать их, иначе клиент не узнает,
+	// что объект защищён, и не сможет проверить себя.
+	RetentionMode *string
+	RetainUntil   *time.Time
+	LegalHold     bool
 	// Versioning — состояние версионирования бакета на момент вставки.
 	// Заполняет только PutObject: по нему бэкенд решает, какой x-amz-version-id
 	// поставить в ответ. Для unversioned заголовка нет, для suspended — "null",
@@ -92,6 +98,13 @@ type PutObjectInput struct {
 	// Колбэк, а не готовые заголовки: разбором заголовков и кодами ошибок
 	// владеет versitygw, а пакет meta про него ничего знать не должен.
 	Precondition func(curEtag string, exists bool) error
+	// RetentionMode и RetainUntil — Object Lock, проставленный при записи:
+	// явные заголовки PUT либо правило бакета по умолчанию. Пустой режим —
+	// retentions нет.
+	RetentionMode string
+	RetainUntil   *time.Time
+	// LegalHold — x-amz-object-lock-legal-hold: ON на момент записи.
+	LegalHold bool
 }
 
 // PutObject вставляет объект и делает его текущим, вытесняя прежнюю версию
@@ -267,15 +280,18 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 			`INSERT INTO objects (
 			    id, bucket_id, key, is_current, size, etag, checksums,
 			    content_type, user_meta, acl, tags, storage_class,
-			    state, landing, online_until, tenant_id, pool_id, is_null_version)
-			 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12,$13,$14,$15)
+			    state, landing, online_until, tenant_id, pool_id, is_null_version,
+			    retention_mode, retain_until, legal_hold)
+			 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12,$13,$14,$15,
+			         $16::retention_mode,$17,$18)
 			 RETURNING id, bucket_id, key, size, etag, checksums, content_type,
 			           user_meta, acl, tags, storage_class, state, landing,
 			           online_until, created_at, archived_at, is_delete_marker,
-			           is_null_version`,
+			           is_null_version, retention_mode::text, retain_until, legal_hold`,
 			in.ID, bucketID, in.Key, in.Size, in.ETag, checksums,
 			in.ContentType, userMeta, in.ACL, tags, in.StorageClass,
-			in.OnlineUntil, bucketTenant, DefaultPoolID, nullVersion)
+			in.OnlineUntil, bucketTenant, DefaultPoolID, nullVersion,
+			retentionModeArg(in.RetentionMode), in.RetainUntil, in.LegalHold)
 		if err != nil {
 			return fmt.Errorf("insert object %s/%s: %w", in.Bucket, in.Key, err)
 		}
@@ -309,7 +325,8 @@ func (m *Meta) GetObject(ctx context.Context, tenant TenantID, bucket, key strin
 		`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
 		        o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
 		        o.state, o.landing, o.online_until, o.created_at, o.archived_at,
-		        o.is_delete_marker, o.is_null_version
+		        o.is_delete_marker, o.is_null_version,
+		        o.retention_mode::text, o.retain_until, o.legal_hold
 		   FROM objects o
 		   JOIN buckets b ON b.id = o.bucket_id
 		  WHERE b.name = $1 AND b.deleted_at IS NULL
@@ -327,11 +344,21 @@ func (m *Meta) GetObjectByID(ctx context.Context, tenant TenantID, id uuid.UUID)
 		`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
 		        o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
 		        o.state, o.landing, o.online_until, o.created_at, o.archived_at,
-		        o.is_delete_marker, o.is_null_version
+		        o.is_delete_marker, o.is_null_version,
+		        o.retention_mode::text, o.retain_until, o.legal_hold
 		   FROM objects o WHERE o.id = $1`,
 		"o.tenant_id", tenant, id)
 	row := m.Pool.QueryRow(ctx, q, args...)
 	return scanObject(row)
+}
+
+// retentionModeArg переводит пустой режим в NULL: CHECK в схеме требует, чтобы
+// режим и дата существовали вместе, и пустая строка туда не годится.
+func retentionModeArg(mode string) any {
+	if mode == "" {
+		return nil
+	}
+	return mode
 }
 
 func scanObject(row pgx.Row) (*Object, error) {
@@ -354,7 +381,8 @@ func scanObjectRow(src interface {
 		&o.ID, &o.BucketID, &key, &o.Size, &etag, &checksums,
 		&o.ContentType, &userMeta, &o.ACL, &tags, &storageClass,
 		&state, &o.Landing, &onlineUntil, &o.CreatedAt, &o.ArchivedAt,
-		&o.IsDeleteMarker, &o.IsNullVersion)
+		&o.IsDeleteMarker, &o.IsNullVersion,
+		&o.RetentionMode, &o.RetainUntil, &o.LegalHold)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

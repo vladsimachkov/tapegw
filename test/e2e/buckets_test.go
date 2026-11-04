@@ -208,19 +208,14 @@ func TestUnsupportedIsNotImplemented(t *testing.T) {
 		_, _ = c.DeleteBucket(context.Background(), &s3.DeleteBucketInput{Bucket: aws.String(bucket)})
 	})
 
-	_, err := c.PutObjectRetention(context.Background(), &s3.PutObjectRetentionInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String("a.txt"),
-		// Дату контроллер versitygw валидирует до обращения к бэкенду, и с
-		// пустой датой мы получили бы InvalidArgument вместо NotImplemented —
-		// то есть проверяли бы не то.
-		Retention: &types.ObjectLockRetention{
-			Mode:            types.ObjectLockRetentionModeGovernance,
-			RetainUntilDate: aws.Time(time.Now().Add(24 * time.Hour)),
-		},
-	})
+	// Multipart появится в M3, и до него CreateMultipartUpload обязана быть
+	// честным NotImplemented. PutObjectRetention сюда был до этапа V: теперь
+	// Object Lock реализован, и тест переехал на то, что действительно осталось
+	// заглушкой.
+	_, err := c.CreateMultipartUpload(context.Background(),
+		&s3.CreateMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String("a.txt")})
 	if err == nil {
-		t.Fatal("Object Lock вне MVP (см. «Чего нет в MVP»), а операция вернула успех")
+		t.Fatal("multipart вне MVP (см. «Чего нет в MVP»), а операция вернула успех")
 	}
 	// Код в aws-sdk-go-v2 приходит не типизированным типом, а строкой ошибки
 	// API, поэтому сравниваем строку. Важно именно «NotImplemented», а не любой

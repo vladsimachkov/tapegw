@@ -491,8 +491,8 @@ func TestDeleteObjectBackend(t *testing.T) {
 	}
 	if _, err := be.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: ptr(bucket), Key: ptr("k2"), VersionId: ptr(lockedID),
-	}); !isS3Code(err, vs3err.ErrAccessDenied) {
-		t.Errorf("удаление заблокированной версии: %v, хотели AccessDenied", err)
+	}); !isS3Code(err, vs3err.ErrObjectLocked) {
+		t.Errorf("удаление заблокированной версии: %v, хотели ObjectLocked", err)
 	}
 
 	// 3. Тот же запрос с обходом GOVERNANCE проходит.
