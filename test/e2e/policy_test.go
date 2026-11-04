@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Проверка доступа под обычным ключом.
@@ -186,5 +188,105 @@ func TestBucketPolicyOwnerNotLockedOut(t *testing.T) {
 		Bucket: aws.String(bucket),
 	}); err != nil {
 		t.Fatalf("владелец не может удалить политику: %v", err)
+	}
+}
+
+// standDB — подключение к базе стенда. Нужно затем, чтобы писать ACL и политику
+// мимо API: через API межтенантный грант не пройдёт валидацию ADR-0010, и это
+// правильно. Без прямой записи в БД тест проверял бы ACL versitygw, а не страж
+// тенанта — на PR#2a именно так и выходило.
+func standDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("TAPEGW_E2E_DSN")
+	if dsn == "" {
+		if os.Getenv("TAPEGW_REQUIRE_ACCESS_TESTS") == "1" {
+			t.Fatal("TAPEGW_E2E_DSN не задан, а доступ обязателен")
+		}
+		t.Skip("TAPEGW_E2E_DSN не задан — пропускаем")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+func standUser(t *testing.T, access, secret, label string) *s3.Client {
+	t.Helper()
+	if access == "" || secret == "" {
+		if os.Getenv("TAPEGW_REQUIRE_ACCESS_TESTS") == "1" {
+			t.Fatalf("%s обязателен в CI", label)
+		}
+		t.Skipf("%s не задан — пропускаем", label)
+	}
+	return clientWith(t, access, secret)
+}
+
+// Единственный барьер — страж тенанта (находка 1 к PR#2a).
+//
+// Предыдущая версия межтенантного теста проходила и при снятом страже: отказ
+// приходил от ACL versitygw ещё до стража, то есть тест проверял ACL, а не
+// изоляцию тенантов. Чтобы оставить стража одного, убираются ВСЕ остальные
+// барьеры: бакет в тенанте 2, ключ из тенанта 3, а грант в ACL и разрешающая
+// политика пишутся прямо в БД.
+//
+// Сначала тест обязан показать, что гранты из БД работают: ключ своего тенанта
+// после них читает. Иначе «отказ» чужого ключа ничего не значил бы.
+func TestCrossTenantGuardIsTheOnlyBarrier(t *testing.T) {
+	owner := ownerClient(t) // тенант 2, роль userplus
+	mine := standUser(t, os.Getenv("TAPEGW_E2E_USER_ACCESS"),
+		os.Getenv("TAPEGW_E2E_USER_SECRET"), "ключ своего тенанта")
+	foreign := standUser(t, os.Getenv("TAPEGW_E2E_FOREIGN_ACCESS"),
+		os.Getenv("TAPEGW_E2E_FOREIGN_SECRET"), "ключ чужого тенанта")
+	foreignAccess := os.Getenv("TAPEGW_E2E_FOREIGN_ACCESS")
+	db := standDB(t)
+
+	ctx := context.Background()
+	bucket := uniqueBucket("tbar")
+
+	if _, err := owner.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	if _, err := owner.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"), Body: bytes.NewReader([]byte("payload")),
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	// Пишем ACL и политику прямо в БД: ACL даёт FULL_CONTROL обоим ключам,
+	// политика разрешает GetObject обоим.
+	acl := fmt.Sprintf(
+		`{"Owner":%q,"Grantees":[{"Permission":"FULL_CONTROL","Access":%q,"Type":"CanonicalUser"},`+
+			`{"Permission":"FULL_CONTROL","Access":%q,"Type":"CanonicalUser"}]}`,
+		os.Getenv("TAPEGW_E2E_OWNER_ACCESS"),
+		os.Getenv("TAPEGW_E2E_OWNER_ACCESS"), foreignAccess)
+	policy := fmt.Sprintf(
+		`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["%s","%s"]},`+
+			`"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::%s/*"]}]}`,
+		os.Getenv("TAPEGW_E2E_USER_ACCESS"), foreignAccess, bucket)
+	tag, err := db.Exec(ctx, `UPDATE buckets SET acl = $2::jsonb, policy = $3 WHERE name = $1`,
+		bucket, acl, policy)
+	if err != nil {
+		t.Fatalf("записать ACL/policy: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("бакет %s не найден в базе стенда", bucket)
+	}
+
+	// 1. Свой ключ читает: значит гранты из БД действительно работают, и отказ
+	//    чужого нельзя списать на криво записанные ACL или политику.
+	if _, err := mine.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"),
+	}); err != nil {
+		t.Fatalf("свой ключ не читает при выданных грантах: %v — тест ничего не доказал бы", err)
+	}
+
+	// 2. Чужой ключ — отказ, и отказать ему может только страж: ACL и политика
+	//    разрешают, бакет существует, объект на месте.
+	if _, err := foreign.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"),
+	}); !isAccessDenied(err) {
+		t.Fatalf("чужой тенант получил доступ при снятом барьере: %v — страж не работает", err)
 	}
 }
