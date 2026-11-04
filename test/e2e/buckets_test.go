@@ -208,14 +208,15 @@ func TestUnsupportedIsNotImplemented(t *testing.T) {
 		_, _ = c.DeleteBucket(context.Background(), &s3.DeleteBucketInput{Bucket: aws.String(bucket)})
 	})
 
-	// Multipart появится в M3, и до него CreateMultipartUpload обязана быть
-	// честным NotImplemented. PutObjectRetention сюда был до этапа V: теперь
-	// Object Lock реализован, и тест переехал на то, что действительно осталось
-	// заглушкой.
-	_, err := c.CreateMultipartUpload(context.Background(),
-		&s3.CreateMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String("a.txt")})
+	// Метод выбирается по одному критерию: он обязан оставаться заглушкой.
+	// PutObjectRetention переехал на multipart, когда реализовали Object Lock,
+	// multipart — на CopyObject, когда реализовали M3+T2 PR#2. Иначе тест
+	// проверял бы не «честное NotImplemented», а отказ уже готовой операции.
+	_, err := c.CopyObject(context.Background(),
+		&s3.CopyObjectInput{Bucket: aws.String(bucket), Key: aws.String("b.txt"),
+			CopySource: aws.String(bucket + "/a.txt")})
 	if err == nil {
-		t.Fatal("multipart вне MVP (см. «Чего нет в MVP»), а операция вернула успех")
+		t.Fatal("CopyObject вне MVP, а операция вернула успех")
 	}
 	// Код в aws-sdk-go-v2 приходит не типизированным типом, а строкой ошибки
 	// API, поэтому сравниваем строку. Важно именно «NotImplemented», а не любой
