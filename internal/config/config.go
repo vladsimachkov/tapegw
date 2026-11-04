@@ -24,6 +24,7 @@ import (
 type Config struct {
 	S3       S3      `yaml:"s3"`
 	DB       DB      `yaml:"db"`
+	IAM      IAM     `yaml:"iam"`
 	Spool    Spool   `yaml:"spool"`
 	Phobos   Phobos  `yaml:"phobos"`
 	Migrator Worker  `yaml:"migrator"`
@@ -67,6 +68,27 @@ type S3 struct {
 type TLS struct {
 	Cert string `yaml:"cert"`
 	Key  string `yaml:"key"`
+}
+
+// IAM — учётки versitygw поверх Postgres (ADR-0009). Пустой kek_file означает
+// «Postgres-IAM выключён»: остаются s3.iam_dir и режим одной учётки. Оба
+// источника сразу запрещены — Validate объясняет почему.
+type IAM struct {
+	// KEKFile — файл с кольцом KEK (версия → base64-ключ, 0400). Вне БД
+	// нарочно: KEK рядом с обёртками секретов обесценивает и то, и другое.
+	KEKFile string `yaml:"kek_file"`
+	// KEKVersion — какая версия кольца заворачивает новые секреты. Старые
+	// версии остаются в файле, пока на них ссылается хоть одна строка accounts
+	// (ADR-0014), поэтому номер — настройка, а не «максимальная в файле».
+	KEKVersion int `yaml:"kek_version"`
+	// CacheTTL — срок жизни записи кэша учёток. Инвалидация мгновенная и не по
+	// TTL (LISTEN/NOTIFY, ADR-0016); TTL — страховка на правку accounts мимо
+	// tapegw, поэтому он обязан быть: без него отозванная вручную учётка
+	// работала бы без ограничения по времени.
+	CacheTTL time.Duration `yaml:"cache_ttl"`
+	// CacheMaxEntries — потолок записей в кэше: access_key выбирает клиент,
+	// и без потолка перебор случайных ключей раздувал бы память.
+	CacheMaxEntries int `yaml:"cache_max_entries"`
 }
 
 type DB struct {
@@ -244,6 +266,11 @@ func Default() *Config {
 			ConnectTimeout:      10 * time.Second,
 			MigrateOnStart:      &yes,
 			AdvisoryLockTimeout: 30 * time.Second,
+		},
+		IAM: IAM{
+			KEKVersion:      1,
+			CacheTTL:        5 * time.Minute,
+			CacheMaxEntries: 10000,
 		},
 		Spool: Spool{
 			Landing:          "/srv/tapegw/landing",
@@ -471,6 +498,24 @@ func (c *Config) Validate() error {
 	}
 	if c.DB.DSN == "" {
 		add("db.dsn обязателен")
+	}
+	// Два источника учёток означают «непонятно, кто настоящий»: embedgw берёт
+	// внешний IAMService и молча игнорирует iam_dir (embedgw.go:178). Лучше
+	// ошибка запуска, чем стенд, где учётки правятся в одном месте, а читаются
+	// из другого.
+	if c.IAM.KEKFile != "" && c.S3.IAMDir != "" {
+		add("iam.kek_file и s3.iam_dir заданы вместе: учётки либо в Postgres, либо в каталоге")
+	}
+	if c.IAM.KEKFile != "" && c.IAM.KEKVersion < 1 {
+		add("iam.kek_version: %d, должно быть >= 1", c.IAM.KEKVersion)
+	}
+	// Ноль здесь — не «бессрочный кэш», а дыра: правка accounts мимо tapegw
+	// вообще не имела бы границы устаревания.
+	if c.IAM.CacheTTL <= 0 {
+		add("iam.cache_ttl: %v, должно быть больше нуля — это страховка кэша", c.IAM.CacheTTL)
+	}
+	if c.IAM.CacheMaxEntries < 1 {
+		add("iam.cache_max_entries: %d, должно быть >= 1", c.IAM.CacheMaxEntries)
 	}
 	if c.DB.MaxConns < 1 {
 		add("db.max_conns: %d, должно быть >= 1", c.DB.MaxConns)
