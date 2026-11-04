@@ -160,8 +160,12 @@ func TestChangeBucketOwnerMovesTenant(t *testing.T) {
 	// 3. Незавершённая multipart-загрузка — тоже «не пусто».
 	mustBucket(t, m, "mv-mpu")
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO uploads (upload_id, bucket_id, key, meta)
-		 SELECT 'u1', id, 'mp', '{}'::jsonb FROM buckets WHERE name = 'mv-mpu'`); err != nil {
+		// wrapped_dek обязателен с миграции 0014: без него части нечем
+		// шифровать, и заглушить эту колонку в тесте значило бы проверить
+		// перенос бакета с загрузкой, которой в реальности не существует.
+		`INSERT INTO uploads (upload_id, bucket_id, key, meta, wrapped_dek)
+		 SELECT 'u1', id, 'mp', '{}'::jsonb, decode('00','hex')
+		   FROM buckets WHERE name = 'mv-mpu'`); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
 	if err := m.ChangeBucketOwner(ctx, testTenant, "mv-mpu", "bob", tenant77, nil); !errors.Is(err, meta.ErrBucketNotEmpty) {

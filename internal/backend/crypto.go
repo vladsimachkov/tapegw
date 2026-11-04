@@ -52,7 +52,7 @@ func (t *TapeGW) plainReader(ctx context.Context, obj *meta.Object, f *os.File, 
 		// «объекта нет» — данные есть, прочитать их нельзя.
 		return nil, fmt.Errorf("ключ версии %s: %w", obj.ID, err)
 	}
-	r, err := encrypt.NewReader(f, dek, obj.ID, 0, obj.Size)
+	r, err := t.partsReader(ctx, obj, f, dek)
 	encrypt.Zero(dek)
 	if err != nil {
 		return nil, fmt.Errorf("читатель %s: %w", obj.ID, err)
@@ -89,4 +89,27 @@ func (c *closingReader) Close() error {
 		}
 	}
 	return err
+}
+
+// partsReader — читатель открытых данных: по таблице частей либо, если частей
+// нет, одной частью нулевого номера.
+//
+// Без таблицы частей Range по multipart не вычислит, в какой части лежит
+// запрошенный диапазон: у каждой части своё смещение шифротекста и свой размер
+// в AAD. Один путь для обоих случаев — multipart с одной частью.
+func (t *TapeGW) partsReader(ctx context.Context, obj *meta.Object, f *os.File, dek []byte) (*encrypt.Reader, error) {
+	parts, err := t.meta.ObjectParts(ctx, obj.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts) == 0 {
+		return encrypt.NewReader(f, dek, obj.ID, 0, obj.Size)
+	}
+	enc := make([]encrypt.Part, 0, len(parts))
+	for _, p := range parts {
+		enc = append(enc, encrypt.Part{
+			Number: uint32(p.Number), PlainSize: p.PlainSize, CipherOffset: p.CipherOffset,
+		})
+	}
+	return encrypt.NewPartsReader(f, dek, obj.ID, enc, obj.Size)
 }

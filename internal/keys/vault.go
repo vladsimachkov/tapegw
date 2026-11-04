@@ -231,3 +231,68 @@ func gcmFor(key []byte) (cipher.AEAD, error) {
 	}
 	return gcm, nil
 }
+
+// uploadAAD — AAD обёртки DEK незавершённой загрузки.
+//
+// Отдельный домен и отдельный материал нужны затем, чтобы обёртку из
+// uploads.wrapped_dek нельзя было вставить в objects.wrapped_dek: там AAD
+// строится от UUID версии. Разные домены делают такую подмену ошибкой
+// разворачивания, а не «ключ подошёл, данные чужие».
+func uploadAAD(uploadID string) []byte {
+	out := make([]byte, 0, len(dekDomain)+len(uploadID)+1)
+	out = append(out, dekDomain...)
+	out = append(out, 'U')
+	return append(out, uploadID...)
+}
+
+// NewUploadDEK — DEK для multipart-загрузки: один на все части (ADR-0014,
+// различают части nonce и AAD, а не ключи).
+func (v *Vault) NewUploadDEK(ctx context.Context, tenant int64, uploadID string) (dek, wrapped []byte, err error) {
+	tek, err := v.tek(ctx, tenant)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer encrypt.Zero(tek)
+
+	dek = make([]byte, encrypt.KeySize)
+	if _, err := rand.Read(dek); err != nil {
+		return nil, nil, fmt.Errorf("keys: генерация DEK загрузки: %w", err)
+	}
+	wrapped, err = sealWithTEK(tek, dek, uploadAAD(uploadID))
+	if err != nil {
+		encrypt.Zero(dek)
+		return nil, nil, fmt.Errorf("keys: обёртка DEK загрузки: %w", err)
+	}
+	return dek, wrapped, nil
+}
+
+// OpenUploadDEK — DEK загрузки по её обёртке.
+func (v *Vault) OpenUploadDEK(ctx context.Context, tenant int64, wrapped []byte, uploadID string) ([]byte, error) {
+	tek, err := v.tek(ctx, tenant)
+	if err != nil {
+		return nil, err
+	}
+	defer encrypt.Zero(tek)
+	return sealWithTEKOpen(tek, wrapped, uploadAAD(uploadID))
+}
+
+// RewrapUploadDEKForVersion — переобёртка DEK загрузки под UUID версии.
+//
+// Данные частей при этом не перешифровываются: ключ тот же, меняется только
+// обёртка. После Complete обёртка живёт в objects.wrapped_dek и привязана к
+// версии, поэтому переставить её в другой объект нельзя.
+func (v *Vault) RewrapUploadDEKForVersion(ctx context.Context, tenant int64,
+	uploadWrapped []byte, uploadID string, version uuid.UUID) ([]byte, error) {
+	tek, err := v.tek(ctx, tenant)
+	if err != nil {
+		return nil, err
+	}
+	defer encrypt.Zero(tek)
+
+	dek, err := sealWithTEKOpen(tek, uploadWrapped, uploadAAD(uploadID))
+	if err != nil {
+		return nil, fmt.Errorf("keys: развернуть DEK загрузки: ключ тенанта не подошёл")
+	}
+	defer encrypt.Zero(dek)
+	return sealWithTEK(tek, dek, dekAAD(version))
+}

@@ -69,7 +69,7 @@ type ObjectInfo struct {
 //
 // limit > 0 ограничивает размер; превышение — ErrTooLarge, файл не остаётся.
 func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (ObjectInfo, error) {
-	return s.write(id, r, spec, limit, nil, 0)
+	return s.write(id, r, spec, limit, nil, 0, 0)
 }
 
 // WriteEncrypted — то же, что Write, но на диск ложится шифротекст (ADR-0014).
@@ -86,10 +86,20 @@ func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (Obj
 // каждого сегмента (ADR-0014), поэтому шифровать можно только зная длину
 // заранее. Факт несовпадения с фактическими байтами — ErrSizeMismatch.
 func (s *Spool) WriteEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, key []byte, plainSize int64) (ObjectInfo, error) {
-	return s.write(id, r, spec, limit, key, plainSize)
+	return s.write(id, r, spec, limit, key, plainSize, 0)
 }
 
-func (s *Spool) write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, encKey []byte, plainSize int64) (ObjectInfo, error) {
+// WritePartEncrypted — та же запись для одной части multipart: part — номер
+// части, он входит в nonce и AAD каждого сегмента (ADR-0014).
+//
+// Файл части — обычный файл спула, ничем не отличается от файла объекта: при
+// Complete они просто склеиваются.
+func (s *Spool) WritePartEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit int64,
+	key []byte, plainSize int64, part uint32) (ObjectInfo, error) {
+	return s.write(id, r, spec, limit, key, plainSize, part)
+}
+
+func (s *Spool) write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, encKey []byte, plainSize int64, part uint32) (ObjectInfo, error) {
 	var info ObjectInfo
 
 	// Ограничитель ставим ниже сверителей, чтобы HashReader увидел EOF и успел
@@ -156,7 +166,7 @@ func (s *Spool) write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, encK
 	var dst io.Writer = tmp
 	var enc *encrypt.Writer
 	if encKey != nil {
-		enc, err = encrypt.NewWriter(tmp, encKey, id, 0, plainSize)
+		enc, err = encrypt.NewWriter(tmp, encKey, id, part, plainSize)
 		if err != nil {
 			tmp.Close()
 			return info, err
@@ -260,4 +270,62 @@ func hashTypeFor(a types.ChecksumAlgorithm) (utils.HashType, bool) {
 	default:
 		return "", false
 	}
+}
+
+// Concatenate собирает файл объекта из файлов частей (CompleteMultipartUpload).
+//
+// Шифротексты частей просто склеиваются: все части зашифрованы одним DEK, а
+// различаются номером части в nonce и AAD, поэтому перешифрования не нужно —
+// ровно это и обещает ADR-0014 («итоговый файл собирается без перешифрования»).
+//
+// Порядок жёсткий, как и в Write: склейка → fsync → rename → fsync каталога, и
+// только после возврата разрешена транзакция Postgres (правило 6).
+//
+// Копирование идёт через io.Copy: между двумя os.File ядро использует
+// copy_file_range, а на reflink-файловой системе это почти clone. Posix-бэкенд
+// versitygw делает так же (posix.go:2975-2990), изобретать своё нет причины.
+func (s *Spool) Concatenate(dst uuid.UUID, srcs []uuid.UUID) (int64, error) {
+	tmp, err := os.CreateTemp(s.tmp, "cat-*")
+	if err != nil {
+		return 0, fmt.Errorf("spool: временный файл склейки: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if tmpName != "" {
+			os.Remove(tmpName)
+		}
+	}()
+
+	var total int64
+	for _, src := range srcs {
+		f, err := s.Open(src)
+		if err != nil {
+			tmp.Close()
+			return total, fmt.Errorf("spool: часть %s: %w", src, err)
+		}
+		n, err := io.Copy(tmp, f)
+		f.Close()
+		if err != nil {
+			tmp.Close()
+			return total, fmt.Errorf("spool: склейка %s: %w", src, err)
+		}
+		total += n
+	}
+
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return total, fmt.Errorf("spool: fsync склейки: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return total, fmt.Errorf("spool: закрыть склейку: %w", err)
+	}
+	final := s.Path(dst)
+	if err := os.Rename(tmpName, final); err != nil {
+		return total, fmt.Errorf("spool: rename склейки на %s: %w", final, err)
+	}
+	tmpName = ""
+	if err := fsyncDir(filepath.Dir(final)); err != nil {
+		return total, err
+	}
+	return total, nil
 }
