@@ -149,7 +149,7 @@ func TestChangeBucketOwnerMovesTenant(t *testing.T) {
 	// 2. Бакет с объектом не переезжает.
 	if _, err := m.PutObject(ctx, testTenant, meta.PutObjectInput{
 		Bucket: "mv-full", Key: "k", Size: 3,
-		OnlineUntil: time.Now().Add(time.Hour),
+		OnlineUntil: time.Now().Add(time.Hour), WrappedDEK: []byte("x"),
 	}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestChangeOwnerRacesWithPut(t *testing.T) {
 			<-start
 			_, putErr = m.PutObject(ctx, testTenant, meta.PutObjectInput{
 				Bucket: bucket, Key: "k", Size: 1,
-				OnlineUntil: time.Now().Add(time.Hour),
+				OnlineUntil: time.Now().Add(time.Hour), WrappedDEK: []byte("x"),
 			})
 		}()
 		go func() {

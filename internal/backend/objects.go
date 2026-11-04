@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 
+	"github.com/vladsimachkov/tapegw/internal/encrypt"
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	tapegwerr "github.com/vladsimachkov/tapegw/internal/s3err"
 	"github.com/vladsimachkov/tapegw/internal/spool"
@@ -80,6 +80,28 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		return s3response.PutObjectOutput{}, err
 	}
 
+	// Ключ шифрования версии — до записи на диск. Обёртка нужна в той же
+	// транзакции, что и строка объекта: файл без обёртки прочитать нельзя, а
+	// обёртка без файла — это то, что остаётся после падения между rename и
+	// commit, и оно безвредно (правило 6).
+	//
+	// DEK берётся от тенанта бакета, а не учётки: у root ProjectID не заполнен,
+	// и ключ «-1» не существует.
+	ownerTenant, err := t.meta.BucketTenantID(ctx, tenant, bucket)
+	if err != nil {
+		return s3response.PutObjectOutput{}, t.bucketErr(ctx, bucket, tenant, err)
+	}
+	// UUID версии генерируется здесь, а не прямо перед записью: он входит и в
+	// nonce сегментов, и в AAD обёртки DEK, и в имя файла спула — всё это должно
+	// быть одним и тем же значением.
+	id := uuid.New()
+	dek, wrappedDEK, err := t.versionKey(ctx, ownerTenant, id)
+	if err != nil {
+		return s3response.PutObjectOutput{}, fmt.Errorf("ключ версии: %w", err)
+	}
+	// Ключ больше не нужен: писатель скопировал его себе, а обёртка уже в руках.
+	defer encrypt.Zero(dek)
+
 	// Условная запись (If-Match / If-None-Match). Разбирает и оценивает
 	// versitygw — мы только передаём ему etag текущей строки.
 	//
@@ -123,18 +145,38 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		algo = types.ChecksumAlgorithm(strings.ToUpper(chRdr.Algorithm()))
 	}
 
+	// Объявленный размер тела обязан быть. Он входит в AAD каждого сегмента
+	// (ADR-0014), поэтому шифровать можно только зная длину заранее — а без
+	// привязки к длине отрезанный по границе сегмента хвост прошёл бы проверку
+	// аутентичности.
+	//
+	// Для aws-chunked versitygw кладёт в ContentLength декодированную длину
+	// (object-put.go:941, x-amz-decoded-content-length), а не длину кадра,
+	// поэтому поле годится и для чанкованных загрузок.
+	declared := int64(0)
+	if po.ContentLength != nil {
+		declared = *po.ContentLength
+	}
+	if declared <= 0 {
+		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrMissingContentLength)
+	}
+
 	// UUID генерируем здесь, а не в базе: имя файла в спуле обязано совпасть со
 	// строкой, и mover потом соберёт тот же путь по UUID из строки (ADR-0007).
-	id := uuid.New()
-	info, err := t.spool.Write(id, po.Body, spool.SumSpec{
+	info, err := t.spool.WriteEncrypted(id, po.Body, spool.SumSpec{
 		ContentMD5:              str(po.ContentMD5),
 		Algorithm:               algo,
 		Expected:                checksumExpected(&po, algo),
 		SkipAlgorithmValidation: trailing,
-	}, limit)
+	}, limit, dek, declared)
 	if err != nil {
 		if errors.Is(err, spool.ErrTooLarge) {
 			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrEntityTooLarge)
+		}
+		if errors.Is(err, spool.ErrSizeMismatch) {
+			// Объявили одно, пришло другое. AWS за это же отвечает
+			// IncompleteBody: недосланный под видом целого объект хуже отказа.
+			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrIncompleteBody)
 		}
 		// Ошибку сверки контрольной суммы HashReader уже вернул типизированной
 		// ошибкой versitygw (BadDigest и родственные) — оборачивать её в
@@ -184,6 +226,7 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		RetentionMode: lockMode,
 		RetainUntil:   lockUntil,
 		LegalHold:     lockHold,
+		WrappedDEK:    wrappedDEK,
 	})
 	if err != nil {
 		// Файл уже на диске, а строки нет. Убираем сразу: janitor разберёт
@@ -267,6 +310,10 @@ func (t *TapeGW) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3
 		// у нас другой класс был бы ложью. См. ADR-0003.
 		StorageClass: types.StorageClassGlacier,
 		VersionId:    strPtr(vid),
+		// Как в GET: шифрование включено всегда (ADR-0014), и HEAD обязан
+		// сообщать об этом — клиент сверяет способ хранения по HEAD так же,
+		// как по GET.
+		ServerSideEncryption: types.ServerSideEncryptionAes256,
 	}
 	if mode, until, hold := lockHeaders(obj); mode != "" || hold != "" {
 		out.ObjectLockMode = mode
@@ -360,14 +407,20 @@ func (t *TapeGW) buildGetOutput(ctx context.Context, tenant meta.TenantID, obj *
 		return nil, err
 	}
 
-	var body io.ReadCloser = f
 	contentRange := (*string)(nil)
 	size := obj.Size
+	// Один вызов на оба случая: Range или весь объект — различие только в
+	// аргументах, а открывать ключ дважды было бы лишней работой на каждом
+	// Range-запросе.
+	rstart, rlen := int64(0), int64(-1)
 	if hasRange {
-		if _, err := f.Seek(start, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("seek %s: %w", obj.ID, err)
-		}
-		body = &rangeReader{r: io.LimitReader(f, length), c: f}
+		rstart, rlen = start, length
+	}
+	body, err := t.plainReader(ctx, obj, f, rstart, rlen)
+	if err != nil {
+		return nil, err
+	}
+	if hasRange {
 		size = length
 		v := fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, obj.Size)
 		contentRange = &v
@@ -390,6 +443,10 @@ func (t *TapeGW) buildGetOutput(ctx context.Context, tenant meta.TenantID, obj *
 		Body:          body,
 		StorageClass:  types.StorageClassGlacier,
 		VersionId:     strPtr(vid),
+		// Шифрование включено всегда, поэтому заголовок ставится безусловно:
+		// клиент по нему видит, что сервер шифрует сам, и не пытается передать
+		// свой ключ (SSE-C у нас NotImplemented).
+		ServerSideEncryption: types.ServerSideEncryptionAes256,
 	}
 	if mode, until, hold := lockHeaders(obj); mode != "" || hold != "" {
 		out.ObjectLockMode = mode
@@ -416,16 +473,6 @@ func (t *TapeGW) restoreHeader(ctx context.Context, tenant meta.TenantID, obj *m
 	}
 	return r.HeaderValue(), nil
 }
-
-// rangeReader закрывает файл вместе с ограниченным читателем: иначе дескриптор
-// утечёт на каждом Range-запросе.
-type rangeReader struct {
-	r io.Reader
-	c io.Closer
-}
-
-func (r *rangeReader) Read(p []byte) (int, error) { return r.r.Read(p) }
-func (r *rangeReader) Close() error               { return r.c.Close() }
 
 // str — распаковать *string из структур versitygw: там каждое поле указатель.
 func str(p *string) string {

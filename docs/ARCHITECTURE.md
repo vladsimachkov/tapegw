@@ -417,13 +417,18 @@ s3:
   listen: [":7070"]
   region: us-east-1
   tls: {cert: "", key: ""}
-  iam_dir: /etc/tapegw/iam              # прокидывается в embedgw.Config;
-                                        # заменяется на Postgres-IAM в T1, после
-                                        # чего из конфига уходит
+  # Файловые учётки уходят с T1: Postgres-IAM обязателен, а два источника
+  # учёток сразу запрещены.
+  # iam_dir: /etc/tapegw/iam
   # Класс хранилища не настраивается: у нас только лента, GLACIER отдаётся всегда
   # (ADR-0003). Поля вроде default_storage_class в конфиге нет намеренно.
   max_object_size: 100GiB               # <= migrator.batch_max_bytes, проверяется
                                        # при старте; см. ADR-0008 и M0-07
+iam:
+  kek_file: /etc/tapegw/kek.json        # кольцо KEK (версия -> base64-ключ, 0400).
+                                        # Обязателен с T2: шифрование тела включено
+                                        # всегда, а без KEK нечем завернуть ключ
+                                        # тенанта (ADR-0014)
 db:
   dsn: postgres://tapegw@localhost/phobos?search_path=tapegw
 spool:

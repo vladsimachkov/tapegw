@@ -22,6 +22,7 @@ import (
 	"github.com/vladsimachkov/tapegw/internal/backend"
 	"github.com/vladsimachkov/tapegw/internal/config"
 	"github.com/vladsimachkov/tapegw/internal/iam"
+	"github.com/vladsimachkov/tapegw/internal/keys"
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/spool"
 )
@@ -99,7 +100,16 @@ func run(args []string) error {
 		return fmt.Errorf("landing: %w", err)
 	}
 
-	be := backend.New(pool, land, cfg)
+	// Кольцо KEK загружается ДО бэкенда и независимо от того, включён ли
+	// Postgres-IAM: шифрование тела объекта обязательное (ADR-0014), и без
+	// кольца нечем завернуть TEK. Раньше KEK был нужен только для разворота
+	// секретов учёток и поле было опциональным.
+	ring, err := iam.LoadKeyRing(cfg.IAM.KEKFile, cfg.IAM.KEKVersion)
+	if err != nil {
+		return err
+	}
+
+	be := backend.New(pool, land, cfg, keys.New(pool, ring))
 
 	gwCfg := &embedgw.Config{
 		Ports:             cfg.S3.Listen,
@@ -127,10 +137,6 @@ func run(args []string) error {
 	// это отказ, который не видно. Пока поля нет, живёт прежний s3.iam_dir
 	// (или режим одной учётки), поэтому переход в продакшене — один конфиг.
 	if cfg.IAM.KEKFile != "" {
-		ring, err := iam.LoadKeyRing(cfg.IAM.KEKFile, cfg.IAM.KEKVersion)
-		if err != nil {
-			return err
-		}
 		svc, err := iam.New(pool, ring, iam.Options{RootAccess: cfg.Root.Access})
 		if err != nil {
 			return err

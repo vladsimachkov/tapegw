@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -11,11 +12,32 @@ import (
 // по умолчанию, иначе бинарь стартует с известными кредшнлами. Проверяем, что
 // валидность достигается одной лишь их подстановкой — то есть всё остальное
 // в дефолтах согласовано.
+// testKEKFile — путь, который проходит Validate. Файл не читается: Validate
+// проверяет наличие настройки, а не её содержимое.
+const testKEKFile = "/etc/tapegw/kek.json"
+
 func TestDefaultIsValid(t *testing.T) {
 	cfg := Default()
 	cfg.Root.Access, cfg.Root.Secret = "test-access", "test-secret"
+	cfg.IAM.KEKFile = testKEKFile
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("конфиг по умолчанию невалиден: %v", err)
+	}
+}
+
+// Кольцо KEK обязательно с T2: шифрование тела включено всегда (ADR-0014).
+// Проверка обязана быть именно на пустом значении, а не «подставить путь по
+// умолчанию в Default()» — иначе поле перестало бы быть обязательным.
+func TestKEKFileRequired(t *testing.T) {
+	cfg := Default()
+	cfg.Root.Access, cfg.Root.Secret = "a", "b"
+	cfg.IAM.KEKFile = ""
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("конфиг без iam.kek_file прошёл проверку")
+	}
+	if !strings.Contains(err.Error(), "iam.kek_file") {
+		t.Errorf("в ошибке нет имени поля: %v", err)
 	}
 }
 
@@ -83,6 +105,8 @@ s3:
 db:
   dsn: postgres://u@db/td
   max_conns: 7
+iam:
+  kek_file: /etc/tapegw/kek.json
 spool:
   landing: /tmp/landing
   landing_watermark: {high: 90, low: 70}
@@ -224,6 +248,7 @@ func TestValidateRejectsBadWatermarks(t *testing.T) {
 func TestMaxObjectSizeLegalWhenBatchHasNoByteLimit(t *testing.T) {
 	cfg := Default()
 	cfg.Root.Access, cfg.Root.Secret = "a", "b"
+	cfg.IAM.KEKFile = testKEKFile
 	cfg.Migrator.BatchMaxBytes = 0
 	cfg.S3.MaxObjectSize = 1 * TiB
 	if err := cfg.Validate(); err != nil {
@@ -262,6 +287,7 @@ func TestLoadMissingFile(t *testing.T) {
 func TestLoadEmptyPathIsEnvOnly(t *testing.T) {
 	t.Setenv("TAPEGW_ROOT_ACCESS", "acc")
 	t.Setenv("TAPEGW_ROOT_SECRET", "sec")
+	t.Setenv("TAPEGW_IAM_KEK_FILE", testKEKFile)
 
 	cfg, err := Load("")
 	if err != nil {
@@ -301,6 +327,7 @@ func TestIsGlacierClass(t *testing.T) {
 func TestLoadEmptyFileIsNotAnError(t *testing.T) {
 	t.Setenv("TAPEGW_ROOT_ACCESS", "acc")
 	t.Setenv("TAPEGW_ROOT_SECRET", "sec")
+	t.Setenv("TAPEGW_IAM_KEK_FILE", testKEKFile)
 
 	for name, body := range map[string]string{
 		"совсем пустой":      "",

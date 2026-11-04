@@ -3,6 +3,7 @@ package spool
 import (
 	"crypto/md5"
 	"encoding/hex"
+
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
 	"github.com/versity/versitygw/s3api/utils"
+
+	"github.com/vladsimachkov/tapegw/internal/encrypt"
 )
 
 // SumSpec — что считаем и что сверяем при записи.
@@ -66,6 +69,27 @@ type ObjectInfo struct {
 //
 // limit > 0 ограничивает размер; превышение — ErrTooLarge, файл не остаётся.
 func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (ObjectInfo, error) {
+	return s.write(id, r, spec, limit, nil, 0)
+}
+
+// WriteEncrypted — то же, что Write, но на диск ложится шифротекст (ADR-0014).
+//
+// Шифрование стоит ПОСЛЕ всех сверителей, а не до них: ETag и x-amz-checksum-*
+// считаются по открытым данным, то есть по тому, что видит клиент. Если
+// поставить его в начало цепочки, ETag станет суммой шифротекста, и клиент
+// перестанет сверять загрузки — молча, потому что сумма «сошлась бы» сама с
+// собой.
+//
+// version — UUID версии объекта (он же id файла спула), part = 0: у обычного PUT
+// частей нет.
+// plainSize — объявленный размер открытого тела. Он обязателен: входит в AAD
+// каждого сегмента (ADR-0014), поэтому шифровать можно только зная длину
+// заранее. Факт несовпадения с фактическими байтами — ErrSizeMismatch.
+func (s *Spool) WriteEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, key []byte, plainSize int64) (ObjectInfo, error) {
+	return s.write(id, r, spec, limit, key, plainSize)
+}
+
+func (s *Spool) write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, encKey []byte, plainSize int64) (ObjectInfo, error) {
 	var info ObjectInfo
 
 	// Ограничитель ставим ниже сверителей, чтобы HashReader увидел EOF и успел
@@ -127,14 +151,49 @@ func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (Obj
 		}
 	}()
 
-	n, err := io.Copy(tmp, src)
+	// dst — файл или поток шифрования поверх файла. src при этом остаётся
+	// цепочкой над открытыми данными, и все суммы считаются по ней.
+	var dst io.Writer = tmp
+	var enc *encrypt.Writer
+	if encKey != nil {
+		enc, err = encrypt.NewWriter(tmp, encKey, id, 0, plainSize)
+		if err != nil {
+			tmp.Close()
+			return info, err
+		}
+		dst = enc
+	}
+
+	n, err := io.Copy(dst, src)
 	if err != nil {
 		tmp.Close()
 		return info, err
 	}
+	if enc != nil {
+		// Последний сегмент дописывается только в Close. Без него файл был бы
+		// короче, чем обещает info.Size, и чтение упало бы на ErrShortRead.
+		if cerr := enc.Close(); cerr != nil {
+			tmp.Close()
+			return info, cerr
+		}
+		// Размер для клиента — байты открытого текста, а не шифротекста:
+		// Content-Length, ETag и колонка size должны описывать то, что клиент
+		// и загрузил.
+		n = enc.Wrote()
+	}
+	// Порядок проверок: сначала лимит. Если тело больше допустимого, ответ
+	// EntityTooLarge полезнее, чем «длина не совпала с объявленной»: клиенту
+	// важно, что объект слишком большой, а не то, что он ещё и наврал про длину.
 	if limit > 0 && n > limit {
 		tmp.Close()
 		return info, ErrTooLarge
+	}
+	if enc != nil && n != plainSize {
+		// Тело не совпало с объявленной длиной. Молча записать то, что пришло,
+		// нельзя: AAD сегментов завернут под plainSize, и такой файл потом всё
+		// равно не расшифруется, а ошибка через месяц чтения хуже отказа сейчас.
+		tmp.Close()
+		return info, fmt.Errorf("%w: объявлено %d, записано %d", ErrSizeMismatch, plainSize, n)
 	}
 
 	sum := md5h.Sum(nil)

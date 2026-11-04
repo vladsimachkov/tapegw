@@ -36,6 +36,9 @@ const shards = 256
 // ErrTooLarge — тело запроса превысило лимит. Бэкенд превращает в EntityTooLarge.
 var ErrTooLarge = errors.New("spool: object exceeds size limit")
 
+// ErrSizeMismatch — тело не совпало с объявленным размером (шифрованная запись).
+var ErrSizeMismatch = errors.New("spool: размер тела не совпал с объявленным")
+
 // Spool — один дисковый буфер (landing или cache). Методы безопасны для
 // конкурентного вызова: общего изменяемого состояния у типа нет.
 type Spool struct {

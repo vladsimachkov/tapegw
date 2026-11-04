@@ -34,6 +34,10 @@ func putInput(bucket, key string) meta.PutObjectInput {
 		ETag:        "5d41402abc4b2a76b9719d911017c592",
 		UserMeta:    map[string]string{"author": "tester"},
 		OnlineUntil: time.Now().Add(24 * time.Hour),
+		// Тело в этих тестах не пишется — только строка. Обёртка DEK при этом
+		// обязана быть: CHECK objects_dek_present из миграции 0013 не различает
+		// «тест без тела» и «боевой путь, который про ключ забыл».
+		WrappedDEK: []byte("wrapped-dek-для-теста"),
 	}
 }
 

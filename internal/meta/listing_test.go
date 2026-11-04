@@ -44,9 +44,11 @@ func insertVersion(t *testing.T, m *meta.Meta, bucket, key string, o versionOpts
 	if _, err := m.Pool.Exec(context.Background(),
 		`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class,
 		                      state, landing, online_until, tenant_id, pool_id,
-		                      is_current, is_delete_marker, is_null_version)
+		                      is_current, is_delete_marker, is_null_version,
+		                      wrapped_dek)
 		  VALUES ($1,$2,$3,$4,'etag','GLACIER',$8,true,
-		          now() + interval '1 day', 1, 1, $5, $6, $7)`,
+		          now() + interval '1 day', 1, 1, $5, $6, $7,
+		          CASE WHEN $6 THEN NULL ELSE 'x'::bytea END)`,
 		id, bucketID, key, o.size, o.current, o.deleteMarker, o.nullVersion,
 		state); err != nil {
 		t.Fatalf("вставка версии %s/%s: %v", bucket, key, err)
