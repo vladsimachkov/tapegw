@@ -283,55 +283,69 @@ func TestCacheKekRotationAcrossRestart(t *testing.T) {
 // соединение листенера рвётся со стороны сервера, в этот момент учётку меняют
 // через сервис (уведомление уходит в пустоту), и спастись кэш может только
 // одним — полным сбросом при переподписке. TTL здесь час, надежды на него нет.
+//
+// Окно «слушателя нет» нельзя ни гарантировать, ни проспать: листенер
+// переподписывается по бэкоффу, и если это случится между обрывом и изменением,
+// уведомление дойдёт, кэш опустеет сам — и тест зелёничал бы без всякой
+// инвалидации. Поэтому тест не предполагает окно, а **требует** его: после
+// изменения он читает сквозь кэш и смотрит, остался ли устаревший отпечаток.
+// Не остался — окно не открылось, попытка повторяется (с новым ключом: отзыв —
+// надгробие, тем же access_key его не создать). Если окно не откроется ни в
+// одной попытке, тест падает, а не проходит молча.
 func TestCacheResubscribeFlushesAfterLostEvent(t *testing.T) {
 	const appName = "tapegw-iam-cache-test"
+	const attempts = 10
 
 	e := setup(t)
 	cache := newCacheOver(t, e.service(t, e.ringV1), cacheTTL, appName)
 
-	mustCreate(t, cache, "frank", "secret-frank", auth.RoleUser, tenantClient)
-	warmUntilCached(t, cache, "frank")
-	if n := cache.Len(); n != 1 {
-		t.Fatalf("прогрев не попал в кэш: записей %d, рвать соединение не с чем", n)
+	opened := 0
+	for i := 0; i < attempts; i++ {
+		access := fmt.Sprintf("frank%d", i)
+		mustCreate(t, cache, access, "secret", auth.RoleUser, tenantClient)
+		warmUntilCached(t, cache, access)
+
+		pid, err := listenerBackendPID(context.Background(), e, appName)
+		if err != nil {
+			t.Fatalf("попытка %d: найти соединение листенера: %v", i, err)
+		}
+		if _, err := e.m.Pool.Exec(context.Background(),
+			`SELECT pg_terminate_backend($1)`, pid); err != nil {
+			t.Fatalf("попытка %d: оборвать соединение: %v", i, err)
+		}
+		if !waitFor(5*time.Second, func() bool {
+			_, err := listenerBackendPID(context.Background(), e, appName)
+			return err != nil
+		}) {
+			t.Fatalf("попытка %d: соединение листенера не оборвалось", i)
+		}
+
+		if err := cache.DeleteUserAccount(access); err != nil {
+			t.Fatalf("попытка %d: отзыв: %v", i, err)
+		}
+
+		// Открылось ли окно: кэш обязан всё ещё отдавать отозванную учётку.
+		if _, err := cache.GetUserAccount(access); err == nil {
+			opened++
+			// Смысл теста: устаревшую запись снимает только сброс при
+			// переподписке — уведомление пришло, когда слушателя не было.
+			if !waitFor(15*time.Second, func() bool {
+				_, err := cache.GetUserAccount(access)
+				return errors.Is(err, auth.ErrNoSuchUser)
+			}) {
+				t.Fatalf("попытка %d: после обрыва и переподписки кэш отдаёт отозванную "+
+					"учётку: переподписка не сбрасывает кэш целиком, и событие, пришедшее "+
+					"в окно между обрывом и LISTEN, потеряно (сбросов: %d)",
+					i, cache.Stats().Flushes)
+			}
+			break
+		}
+		// Окно закрылось до изменения — пробуем снова.
 	}
 
-	pid, err := listenerBackendPID(context.Background(), e, appName)
-	if err != nil {
-		t.Fatalf("найти соединение листенера: %v", err)
-	}
-	if _, err := e.m.Pool.Exec(context.Background(),
-		`SELECT pg_terminate_backend($1)`, pid); err != nil {
-		t.Fatalf("обрыв соединения: %v", err)
-	}
-	// Ждём, пока соединение действительно исчезнет из pg_stat_activity, а не
-	// спим наугад. Пауза sleep(100ms) на быстром раннере проигрывала гонку:
-	// листенер переподписывался раньше удаления, уведомление доходило, кэш
-	// опустел — и тест зелёничал без всякой инвалидации.
-	if !waitFor(5*time.Second, func() bool {
-		_, err := listenerBackendPID(context.Background(), e, appName)
-		return err != nil
-	}) {
-		t.Fatalf("соединение листенера так и не оборвалось — тест не за что проверять")
-	}
-
-	// Окно без слушателя: уведомление об этом изменении некому принять.
-	if err := cache.DeleteUserAccount("frank"); err != nil {
-		t.Fatalf("удаление в окно без слушателя: %v", err)
-	}
-	// Смысл теста в этом: устаревшая запись всё ещё в кэше, и снять её может
-	// только сброс при переподписке. Если бы кэш к этому моменту уже опустел,
-	// тест зелёничал бы без всякой инвалидации.
-	if n := cache.Len(); n == 0 {
-		t.Fatal("кэш опустел сам — тест не проверяет сброс при переподписке")
-	}
-
-	if !waitFor(15*time.Second, func() bool {
-		_, err := cache.GetUserAccount("frank")
-		return errors.Is(err, auth.ErrNoSuchUser)
-	}) {
-		t.Fatalf("после обрыва и переподписки кэш отдаёт отозванную учётку: переподписка "+
-			"не сбрасывает кэш целиком, и событие, пришедшее в окно между обрывом и "+
-			"LISTEN, потеряно (сбросов: %d)", cache.Stats().Flushes)
+	if opened == 0 {
+		t.Fatalf("за %d попыток ни разу не открылось окно без слушателя: тест не может "+
+			"проверить сброс при переподписке и зелёным быть не должен", attempts)
 	}
 }
 
