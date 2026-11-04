@@ -3,11 +3,17 @@ package backend_test
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	stypes "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
 	"github.com/versity/versitygw/auth"
+	vs3err "github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 
 	"github.com/vladsimachkov/tapegw/internal/meta"
@@ -217,9 +223,12 @@ func TestListObjectsV2ContinuationToken(t *testing.T) {
 	}
 }
 
-// Чужой тенант получает ПУСТУЮ выдачу, а не ошибку: по ответу «пусто» нельзя
-// узнать, что бакет существует.
-func TestListObjectsForeignTenantSeesEmpty(t *testing.T) {
+// Чужой бакет для листинга — тот же AccessDenied, что и в точечных операциях
+// (ADR-0017). «Пустая выдача ничего не выдаёт» здесь не аргумент: имена бакетов
+// глобальны и существование чужого бакета так или иначе выдаёт CreateBucket, а
+// для обычной учётки versitygw вызывает GetBucketAcl до листинга и тот отказывает
+// сам. Фильтрация только сделала бы поведение разным для разных путей.
+func TestListObjectsForeignTenantDenied(t *testing.T) {
 	be, m, _ := newBackend(t)
 	owner := ownerCtx("root-owner")
 	const bucket = "secret-list"
@@ -230,22 +239,45 @@ func TestListObjectsForeignTenantSeesEmpty(t *testing.T) {
 	insertVersion(t, m, bucket, "visible", true, false, false, 1)
 
 	foreign := accountCtx(auth.Account{Access: "intruder", Role: auth.RoleUser, ProjectID: testProjectID + 1})
-	res, err := be.ListObjects(foreign, &s3.ListObjectsInput{Bucket: ptr(bucket)})
-	if err != nil {
-		t.Fatalf("чужому тенанту листинг вернул ошибку %v, ожидали пустую выдачу", err)
+	if _, err := be.ListObjects(foreign, &s3.ListObjectsInput{Bucket: ptr(bucket)}); !isS3Code(err, vs3err.ErrAccessDenied) {
+		t.Errorf("чужому тенанту ListObjects вернул %v, хотели AccessDenied", err)
 	}
-	if len(res.Contents) != 0 {
-		t.Errorf("чужой тенант увидел %d объектов — страж не отфильтровал выдачу",
-			len(res.Contents))
+	if _, err := be.ListObjectsV2(foreign, &s3.ListObjectsV2Input{Bucket: ptr(bucket)}); !isS3Code(err, vs3err.ErrAccessDenied) {
+		t.Errorf("чужому тенанту ListObjectsV2 вернул %v, хотели AccessDenied", err)
 	}
+	if _, err := be.ListObjectVersions(foreign, &s3.ListObjectVersionsInput{Bucket: ptr(bucket)}); !isS3Code(err, vs3err.ErrAccessDenied) {
+		t.Errorf("чужому тенанту ListObjectVersions вернул %v, хотели AccessDenied", err)
+	}
+}
 
-	vers, err := be.ListObjectVersions(foreign, &s3.ListObjectVersionsInput{Bucket: ptr(bucket)})
-	if err != nil {
-		t.Fatalf("чужому тенанту листинг версий вернул ошибку %v", err)
+// Листинг несуществующего бакета обязан быть NoSuchBucket. Под администратором:
+// у root/admin versitygw не вызывает GetBucketAcl перед листингом, поэтому
+// проверка лежит целиком на нас, и «пусто вместо ошибки» здесь прошло бы
+// незамеченным для всего остального кода.
+func TestListObjectsMissingBucket(t *testing.T) {
+	be, _, _ := newBackend(t)
+	ctx := adminCtx()
+
+	cases := map[string]func() error{
+		"ListObjects": func() error {
+			_, err := be.ListObjects(ctx, &s3.ListObjectsInput{Bucket: ptr("no-such-bucket")})
+			return err
+		},
+		"ListObjectsV2": func() error {
+			_, err := be.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: ptr("no-such-bucket")})
+			return err
+		},
+		"ListObjectVersions": func() error {
+			_, err := be.ListObjectVersions(ctx,
+				&s3.ListObjectVersionsInput{Bucket: ptr("no-such-bucket")})
+			return err
+		},
 	}
-	if len(vers.Versions) != 0 || len(vers.DeleteMarkers) != 0 {
-		t.Errorf("чужой тенант увидел %d версий и %d маркеров",
-			len(vers.Versions), len(vers.DeleteMarkers))
+	for name, call := range cases {
+		if err := call(); !isS3Code(err, vs3err.ErrNoSuchBucket) {
+			t.Errorf("%s несуществующего бакета: %v, хотели NoSuchBucket — пустой "+
+				"ответ клиент читает как «бакет пуст» и не замечает опечатку в имени", name, err)
+		}
 	}
 }
 
@@ -262,4 +294,124 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// Ключи с «+», «%», пробелом и юникодом через ListObjectVersions с
+// encoding-type=url. Клиент (botocore) при этом поле декодирует ответ, и
+// некодированный «a+b» вернулся бы как «a b»: имени, которое клиент получил, не
+// существует, прочитать или удалить эту версию он уже не сможет.
+func TestListObjectVersionsURLEncoding(t *testing.T) {
+	be, m, _ := newBackend(t)
+	ctx := ownerCtx("root-owner")
+	const bucket = "encoded"
+
+	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr(bucket)}, nil); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	keys := []string{"a+b", "50%", "with space", "ключ/тест", "tilde~x", "star*x"}
+	for _, k := range keys {
+		insertVersion(t, m, bucket, k, true, false, false, 1)
+	}
+
+	res, err := be.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: ptr(bucket), EncodingType: stypes.EncodingTypeUrl,
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if res.EncodingType != stypes.EncodingTypeUrl {
+		t.Fatalf("EncodingType = %q, хотели url", res.EncodingType)
+	}
+	if len(res.Versions) != len(keys) {
+		t.Fatalf("версий %d, хотели %d", len(res.Versions), len(keys))
+	}
+
+	// Декодируем ровно как клиент: обратное преобразование к percent-encoding.
+	got := make([]string, 0, len(res.Versions))
+	for _, v := range res.Versions {
+		dec, err := url.QueryUnescape(*v.Key)
+		if err != nil {
+			t.Fatalf("клиент не смог декодировать %q: %v", *v.Key, err)
+		}
+		got = append(got, dec)
+	}
+	sort.Strings(got)
+	want := append([]string{}, keys...)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("после декодирования %v, хотели %v", got, want)
+	}
+
+	// «+» обязан быть закодирован: иначе он приедет пробелом.
+	for _, v := range res.Versions {
+		if strings.Contains(*v.Key, " ") {
+			t.Errorf("в закодированном ключе пробел: %q", *v.Key)
+		}
+	}
+
+	// Точная форма кодирования, а не только «декодируется обратно». Разбор
+	// «закодировали — декодировали» не различает рецепт versitygw и наивный
+	// QueryEscape: оба обратимы, но первый оставляет «/» и «*» как есть и
+	// экранирует «~», а второй закодирует всё. Кливер сверяет байты, а не
+	// обратимость.
+	res2, err := be.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: ptr(bucket), Prefix: ptr("star*x"), EncodingType: stypes.EncodingTypeUrl,
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions с prefix: %v", err)
+	}
+	if len(res2.Versions) != 1 {
+		t.Fatalf("по prefix star*x версий %d, хотели 1", len(res2.Versions))
+	}
+	if got := *res2.Versions[0].Key; got != "star*x" {
+		t.Errorf("ключ star*x закодирован как %q, хотели star*x — «*» у S3 не кодируется", got)
+	}
+	if got := *res2.Prefix; got != "star*x" {
+		t.Errorf("prefix закодирован как %q, хотели star*x", got)
+	}
+	res3, err := be.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: ptr(bucket), Prefix: ptr("tilde~x"), EncodingType: stypes.EncodingTypeUrl,
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions с prefix: %v", err)
+	}
+	if len(res3.Versions) == 1 {
+		if got := *res3.Versions[0].Key; got != "tilde%7Ex" {
+			t.Errorf("ключ tilde~x закодирован как %q, хотели tilde%%7Ex — «~» у S3 экранируется", got)
+		}
+	}
+}
+
+// Для v1 и v2 ключи кодирует контроллер versitygw, а не бэкенд: если закодирует
+// бэкенд, контроллер закодирует второй раз, и «a b» станет «a%2520b».
+func TestListObjectsV1V2DoNotEncodeInBackend(t *testing.T) {
+	be, m, _ := newBackend(t)
+	ctx := ownerCtx("root-owner")
+	const bucket = "rawkeys"
+
+	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr(bucket)}, nil); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	insertVersion(t, m, bucket, "a+b", true, false, false, 1)
+
+	v1, err := be.ListObjects(ctx, &s3.ListObjectsInput{
+		Bucket: ptr(bucket), EncodingType: stypes.EncodingTypeUrl,
+	})
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(v1.Contents) != 1 || *v1.Contents[0].Key != "a+b" {
+		t.Errorf("ListObjects v1 закодировал ключ сам: %v — контроллер кодирует "+
+			"повторно, и клиент получит двойное кодирование", objectKeys(v1.Contents))
+	}
+
+	v2, err := be.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: ptr(bucket), EncodingType: stypes.EncodingTypeUrl,
+	})
+	if err != nil {
+		t.Fatalf("ListObjectsV2: %v", err)
+	}
+	if len(v2.Contents) != 1 || *v2.Contents[0].Key != "a+b" {
+		t.Errorf("ListObjectsV2 закодировал ключ сам: %v", objectKeys(v2.Contents))
+	}
 }

@@ -34,11 +34,6 @@ type guardClass int
 const (
 	// guarded — метод с бакетом, реализован бэкендом и обязан отказать чужому.
 	guarded guardClass = iota
-	// filtersByTenant — листинг: страж здесь не отказывает, а фильтрует.
-	// Чужой бакет даёт ПУСТУЮ выдачу без ошибки: по ответу «пусто» клиент не
-	// узнает, что бакет существует, тогда как AccessDenied или NoSuchBucket
-	// выдали бы этот факт. Тот же приём, что в ListBuckets.
-	filtersByTenant
 	// noBucket — бакета нет (или метод не про доступ): проверять нечего.
 	noBucket
 	// unimplemented — заглушка BackendUnsupported. Обязана отвечать
@@ -53,8 +48,6 @@ func (c guardClass) String() string {
 	switch c {
 	case guarded:
 		return "под стражом"
-	case filtersByTenant:
-		return "фильтрует по тенанту"
 	case noBucket:
 		return "без бакета"
 	case unimplemented:
@@ -125,9 +118,9 @@ var backendMethodCases = map[string]guardCase{
 	"GetObjectRetention":            {class: unimplemented, reason: "Object Lock вне MVP"},
 	"GetObjectTagging":              {class: unimplemented, reason: "теги объектов появятся с M3"},
 	"ListMultipartUploads":          {class: unimplemented, reason: "multipart вне MVP"},
-	"ListObjectVersions":            {class: filtersByTenant, reason: "листинг версий: пустая выдача чужому тенанту"},
-	"ListObjects":                   {class: filtersByTenant, reason: "листинг v1: пустая выдача чужому тенанту"},
-	"ListObjectsV2":                 {class: filtersByTenant, reason: "листинг v2: пустая выдача чужому тенанту"},
+	"ListObjectVersions":            {class: guarded, reason: "листинг версий: чужой бакет — AccessDenied"},
+	"ListObjects":                   {class: guarded, reason: "листинг v1: чужой бакет — AccessDenied"},
+	"ListObjectsV2":                 {class: guarded, reason: "листинг v2: чужой бакет — AccessDenied"},
 	"ListParts":                     {class: unimplemented, reason: "multipart вне MVP"},
 	"PutBucketCors":                 {class: unimplemented, reason: "CORS вне MVP"},
 	"PutBucketOwnershipControls":    {class: unimplemented, reason: "ownership controls вне MVP"},
@@ -177,7 +170,7 @@ func TestTenantGuardSweepForeignTenant(t *testing.T) {
 	be, _, _ := newBackend(t)
 	createVictim(t, be)
 
-	sweep(t, be, "чужой тенант", false,
+	sweep(t, be, "чужой тенант",
 		accountCtx(auth.Account{Access: "intruder", Role: auth.RoleUser, ProjectID: testProjectID + 1}))
 }
 
@@ -188,7 +181,7 @@ func TestTenantGuardSweepAnonymous(t *testing.T) {
 	be, _, _ := newBackend(t)
 	createVictim(t, be)
 
-	sweep(t, be, "аноним", true, accountCtx(auth.Account{}))
+	sweep(t, be, "аноним", accountCtx(auth.Account{}))
 }
 
 func createVictim(t *testing.T, be *backend.TapeGW) {
@@ -199,7 +192,7 @@ func createVictim(t *testing.T, be *backend.TapeGW) {
 	}
 }
 
-func sweep(t *testing.T, be *backend.TapeGW, pass string, anonymous bool, ctx context.Context) {
+func sweep(t *testing.T, be *backend.TapeGW, pass string, ctx context.Context) {
 	t.Helper()
 
 	value := reflect.ValueOf(be)
@@ -216,27 +209,8 @@ func sweep(t *testing.T, be *backend.TapeGW, pass string, anonymous bool, ctx co
 				t.Skipf("%s: %s", entry.class, entry.reason)
 			}
 
-			out, err := callBackendOut(value, name, ctx)
+			err := callBackend(value, name, ctx)
 			switch entry.class {
-			case filtersByTenant:
-				// Анониму листинг отказывает, а не отдаёт пустоту: у него нет
-				// тенанта, и «пусто» означало бы «у анонима есть тенант без
-				// бакетов». Пустая выдача — только для аутентифицированного
-				// чужого тенанта (ADR-0017).
-				if anonymous {
-					if !isS3Code(err, s3err.ErrAccessDenied) {
-						t.Errorf("анонимный листинг разрешён: %v", err)
-					}
-					return
-				}
-				if err != nil {
-					t.Errorf("чужому тенанту листинг вернул ошибку %v, а должен пустую "+
-						"выдачу: по ошибке клиент узнает о существовании бакета", err)
-				}
-				if n := countListed(out); n != 0 {
-					t.Errorf("чужому тенанту листинг выдал %d записей — страж не "+
-						"отфильтровал выдачу", n)
-				}
 			case guarded:
 				if !isS3Code(err, s3err.ErrAccessDenied) {
 					t.Errorf("чужому тенанту разрешено: %v, ожидали AccessDenied — "+
@@ -255,6 +229,11 @@ func sweep(t *testing.T, be *backend.TapeGW, pass string, anonymous bool, ctx co
 
 // callBackend вызывает метод интерфейса с «жертвой» на месте бакета и
 // возвращает error из результатов (nil, если error в сигнатуре нет).
+func callBackend(value reflect.Value, name string, ctx context.Context) error {
+	_, err := callBackendOut(value, name, ctx)
+	return err
+}
+
 func callBackendOut(value reflect.Value, name string, ctx context.Context) ([]reflect.Value, error) {
 	method, ok := backendInterface.MethodByName(name)
 	if !ok {
@@ -269,33 +248,6 @@ func callBackendOut(value reflect.Value, name string, ctx context.Context) ([]re
 		}
 	}
 	return out, nil
-}
-
-// listedFields — срезы выдачи, в которых живут строки листинга.
-var listedFields = map[string]bool{
-	"Contents": true, "Versions": true, "DeleteMarkers": true, "CommonPrefixes": true,
-}
-
-// countListed считает записи в первом результате метода листинга. Нужен именно
-// подсчёт, а не «nil или нет»: пустой срез и nil для клиента одинаковы, а вот
-// непустая выдача чужому тенанту — уже дыра.
-func countListed(out []reflect.Value) int {
-	n := 0
-	for _, v := range out {
-		if v.Kind() != reflect.Struct {
-			continue
-		}
-		for i := 0; i < v.NumField(); i++ {
-			if !listedFields[v.Type().Field(i).Name] {
-				continue
-			}
-			f := v.Field(i)
-			if f.Kind() == reflect.Slice {
-				n += f.Len()
-			}
-		}
-	}
-	return n
 }
 
 // sweepArgs собирает аргументы метода: контекст, имя бакета-«жертвы» на месте

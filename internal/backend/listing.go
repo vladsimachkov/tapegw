@@ -3,6 +3,8 @@ package backend
 import (
 	"context"
 	"encoding/base64"
+	"net/url"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -23,14 +25,19 @@ func deref(s *string) string {
 
 // Листинг объектов и версий.
 //
-// Страж (ADR-0017) здесь работает иначе, чем в точечных операциях: он не
-// проверяет бакет, а **фильтрует** выдачу. Для чужого тенанта запрос ничего не
-// найдёт, и правильный ответ — пустая выдача, а не AccessDenied: по ответу
-// «пусто» клиент не узнает, что бакет существует. Тот же приём, что в
-// ListBuckets.
+// Страж здесь ведёт себя так же, как в точечных операциях (ADR-0017): бакета
+// нет — NoSuchBucket, бакет чужой — AccessDenied, аноним — AccessDenied.
 //
-// Пустая выдача — не «бакета нет»: если бакет существует у другого тенанта,
-// NoSuchBucket тоже был бы утечкой факта существования.
+// Соблазн «фильтровать выдачу, а не отказывать» (как в ListBuckets) здесь
+// неверен по трём причинам. Листинг несуществующего бакета обязан быть ошибкой:
+// клиенты проверяют им существование бакета, и опечатка в имени выглядела бы
+// как «бакет пуст». Имена бакетов глобальны, и существование чужого бакета так
+// или иначе выдаёт CreateBucket. А для обычной учётки versitygw ещё до листинга
+// вызывает GetBucketAcl, который под стражом уже отказывает — то есть
+// фильтрация ничего не прячет, но делает поведение разным для разных путей.
+//
+// Фильтровать по тенанту остаётся только ListBuckets: он и по смыслу показывает
+// список СВОИХ бакетов.
 
 // defaultMaxKeys — столько же, сколько по умолчанию у S3.
 const defaultMaxKeys = 1000
@@ -89,6 +96,63 @@ func commonPrefixes(res meta.ListResult) []types.CommonPrefix {
 	return out
 }
 
+// Кодирование ключей для encoding-type=url.
+//
+// Для ListObjects и ListObjectsV2 ключи кодирует контроллер versitygw
+// (URLEncodeListObjectsResult и URLEncodeListObjectsV2Result в
+// s3api/controllers/bucket-get.go), поэтому бэкенд обязан отдавать ключи
+// как есть: иначе контроллер закодирует второй раз, и «a b» станет «a%2520b».
+//
+// Для ListObjectVersions контроллер кодирования НЕ делает вовсе — а клиент
+// (botocore у aws cli и boto3) по умолчанию просит encoding-type=url и
+// декодирует ответ, когда видит его. Значит некодированный ключ с «+» придёт
+// обратно пробелом, а «%41» — как «A»: имени, которое клиент получил, не
+// существует, и прочитать или удалить эту версию он уже не сможет.
+//
+// Рецепт повторяет versitygw дословно: url.QueryEscape плюс те же замены, чтобы
+// «/» и «*» остались как есть, а «~» экранировалась.
+
+// s3KeyNameEscaper — та же таблица замен, что у versitygw.
+var s3KeyNameEscaper = strings.NewReplacer("%2F", "/", "%2A", "*", "~", "%7E")
+
+func urlEncodeKeyName(name *string) *string {
+	if name == nil {
+		return nil
+	}
+	encoded := s3KeyNameEscaper.Replace(url.QueryEscape(*name))
+	return &encoded
+}
+
+func urlEncodeCommonPrefixes(prefixes []types.CommonPrefix) []types.CommonPrefix {
+	if prefixes == nil {
+		return nil
+	}
+	out := make([]types.CommonPrefix, len(prefixes))
+	for i, cp := range prefixes {
+		cp.Prefix = urlEncodeKeyName(cp.Prefix)
+		out[i] = cp
+	}
+	return out
+}
+
+// encodeVersionsResult кодирует выдачу ListObjectVersions. Поля из input
+// не мутируются: указатели на них клиент переиспользует, а перекодированное
+// значение по чужому указателю изменило бы запрос клиента.
+func encodeVersionsResult(res *s3response.ListVersionsResult) {
+	res.Delimiter = urlEncodeKeyName(res.Delimiter)
+	res.Prefix = urlEncodeKeyName(res.Prefix)
+	res.KeyMarker = urlEncodeKeyName(res.KeyMarker)
+	res.NextKeyMarker = urlEncodeKeyName(res.NextKeyMarker)
+	res.CommonPrefixes = urlEncodeCommonPrefixes(res.CommonPrefixes)
+
+	for i := range res.Versions {
+		res.Versions[i].Key = urlEncodeKeyName(res.Versions[i].Key)
+	}
+	for i := range res.DeleteMarkers {
+		res.DeleteMarkers[i].Key = urlEncodeKeyName(res.DeleteMarkers[i].Key)
+	}
+}
+
 func strPtr(s string) *string { return &s }
 
 // encodeToken делает из ключа непрерывающий токен для ListObjectsV2. S3
@@ -120,6 +184,13 @@ func (t *TapeGW) ListObjects(ctx context.Context,
 		return s3response.ListObjectsResult{}, err
 	}
 
+	if ok, err := t.meta.BucketExists(ctx, tenant, bucket); err != nil {
+		return s3response.ListObjectsResult{}, mapMetaErr(err, bucket)
+	} else if !ok {
+		// Отдельная проверка, а не «фильтр ничего не нашёл»: несуществующий
+		// бакет обязан быть NoSuchBucket, а не пустой выдачей.
+		return s3response.ListObjectsResult{}, t.bucketErr(ctx, bucket, tenant, meta.ErrNotFound)
+	}
 	marker := deref(input.Marker)
 	res, err := t.meta.ListObjectsCurrent(ctx, tenant, bucket,
 		deref(input.Prefix), deref(input.Delimiter), marker, maxKeysOf(input.MaxKeys))
@@ -158,6 +229,13 @@ func (t *TapeGW) ListObjectsV2(ctx context.Context,
 		return s3response.ListObjectsV2Result{}, err
 	}
 
+	if ok, err := t.meta.BucketExists(ctx, tenant, bucket); err != nil {
+		return s3response.ListObjectsV2Result{}, mapMetaErr(err, bucket)
+	} else if !ok {
+		// Отдельная проверка, а не «фильтр ничего не нашёл»: несуществующий
+		// бакет обязан быть NoSuchBucket, а не пустой выдачей.
+		return s3response.ListObjectsV2Result{}, t.bucketErr(ctx, bucket, tenant, meta.ErrNotFound)
+	}
 	// ContinuationToken имеет приоритет над StartAfter: так ведёт себя S3, и
 	// иначе клиент, передавший оба, получил бы не ту страницу, на которую
 	// смотрит в своём же запросе.
@@ -208,6 +286,13 @@ func (t *TapeGW) ListObjectVersions(ctx context.Context,
 		return s3response.ListVersionsResult{}, err
 	}
 
+	if ok, err := t.meta.BucketExists(ctx, tenant, bucket); err != nil {
+		return s3response.ListVersionsResult{}, mapMetaErr(err, bucket)
+	} else if !ok {
+		// Отдельная проверка, а не «фильтр ничего не нашёл»: несуществующий
+		// бакет обязан быть NoSuchBucket, а не пустой выдачей.
+		return s3response.ListVersionsResult{}, t.bucketErr(ctx, bucket, tenant, meta.ErrNotFound)
+	}
 	res, err := t.meta.ListObjectVersions(ctx, tenant, bucket,
 		deref(input.Prefix), deref(input.Delimiter),
 		deref(input.KeyMarker), deref(input.VersionIdMarker),
@@ -265,6 +350,9 @@ func (t *TapeGW) ListObjectVersions(ctx context.Context,
 		if res.NextVersionID != "" {
 			out.NextVersionIdMarker = strPtr(res.NextVersionID)
 		}
+	}
+	if input.EncodingType == types.EncodingTypeUrl {
+		encodeVersionsResult(&out)
 	}
 	return out, nil
 }
