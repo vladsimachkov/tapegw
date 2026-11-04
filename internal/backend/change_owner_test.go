@@ -29,7 +29,7 @@ func setupClientTenant(t *testing.T, m *meta.Meta, access string) context.Contex
 	// статус и тенант учётки.
 	if _, err := m.Pool.Exec(ctx,
 		`INSERT INTO accounts (access_key, secret_wrapped, role, tenant_id, tenant_system)
-		  VALUES ($1, NULL, 'user', $2, false)
+		  VALUES ($1, 'test-only-not-a-real-secret'::bytea, 'user', $2, false)
 		  ON CONFLICT (access_key) DO UPDATE SET status = 'active', tenant_id = $2`,
 		access, clientTenantID); err != nil {
 		t.Fatalf("account %s: %v", access, err)

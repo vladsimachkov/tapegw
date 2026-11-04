@@ -220,7 +220,7 @@ func TestCacheTTLBoundsExternalChanges(t *testing.T) {
 
 	// Внешняя правка: прямой SQL, никакого pg_notify.
 	if _, err := e.m.Pool.Exec(context.Background(),
-		`UPDATE accounts SET status = 'revoked' WHERE access_key = 'dave'`); err != nil {
+		`UPDATE accounts SET status = 'revoked', secret_wrapped = NULL WHERE access_key = 'dave'`); err != nil {
 		t.Fatalf("отзыв: %v", err)
 	}
 

@@ -169,7 +169,7 @@ func TestGetUserAccountRevoked(t *testing.T) {
 	mustCreate(t, svc, "gone", "s3cr3t", auth.RoleUser, tenantClient)
 
 	if _, err := e.m.Pool.Exec(context.Background(),
-		`UPDATE accounts SET status = 'revoked' WHERE access_key = 'gone'`); err != nil {
+		`UPDATE accounts SET status = 'revoked', secret_wrapped = NULL WHERE access_key = 'gone'`); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 
