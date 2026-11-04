@@ -632,6 +632,15 @@ func TestLoadKeyRingFile(t *testing.T) {
 
 	write := func(content string, mode os.FileMode) {
 		t.Helper()
+		// Перед перезаписью возвращаем файлу право записи: после mode = 0400
+		// os.WriteFile уже не может его усечь и даёт EACCES. Локально под root
+		// этого не видно (root права на запись не спрашивает), а на CI-раннере
+		// тест падал именно здесь.
+		if _, statErr := os.Stat(path); statErr == nil {
+			if err := os.Chmod(path, 0o600); err != nil {
+				t.Fatalf("chmod перед записью: %v", err)
+			}
+		}
 		if err := os.WriteFile(path, []byte(content), mode); err != nil {
 			t.Fatalf("write: %v", err)
 		}
