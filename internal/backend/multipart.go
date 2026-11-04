@@ -153,10 +153,17 @@ func (t *TapeGW) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3
 
 	id := uuid.New()
 	limit := int64(t.cfg.S3.MaxObjectSize)
+	// Соль — на каждую ПОПЫТКУ загрузки части. Переотправка части с тем же
+	// номером штатна (retry после сетевой ошибки), а DEK на загрузку один:
+	// без новой соли вторая попытка дала бы повтор nonce при том же ключе.
+	salt, err := newSalt()
+	if err != nil {
+		return nil, err
+	}
 	info, err := t.spool.WritePartEncrypted(id, up.ObjectID, input.Body, spool.SumSpec{
 		ContentMD5: str(input.ContentMD5),
 		Algorithm:  input.ChecksumAlgorithm,
-	}, limit, dek, declared, uint32(partNumber))
+	}, limit, dek, declared, uint32(partNumber), salt)
 	if err != nil {
 		if errors.Is(err, spool.ErrTooLarge) {
 			return nil, s3err.GetAPIError(s3err.ErrEntityTooLarge)
@@ -176,6 +183,7 @@ func (t *TapeGW) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3
 		Size:   info.Size,
 		ETag:   info.MD5Hex,
 		FileID: id,
+		Salt:   salt,
 	})
 	if err != nil {
 		// Файл части без строки — сирота; убираем сразу.
@@ -268,8 +276,12 @@ func (t *TapeGW) UploadPartCopy(ctx context.Context,
 	defer encrypt.Zero(dek)
 
 	id := uuid.New()
+	salt, err := newSalt()
+	if err != nil {
+		return s3response.CopyPartResult{}, err
+	}
 	info, err := t.spool.WritePartEncrypted(id, up.ObjectID, body, spool.SumSpec{}, length, dek, length,
-		uint32(partNumber))
+		uint32(partNumber), salt)
 	if err != nil {
 		var s3e s3err.S3Error
 		if errors.As(err, &s3e) {
@@ -283,6 +295,7 @@ func (t *TapeGW) UploadPartCopy(ctx context.Context,
 		Size:   info.Size,
 		ETag:   info.MD5Hex,
 		FileID: id,
+		Salt:   salt,
 	})
 	if err != nil {
 		if rmErr := t.spool.Remove(id); rmErr != nil {
@@ -393,7 +406,7 @@ func (t *TapeGW) CompleteMultipartUpload(ctx context.Context,
 	objParts := make([]meta.ObjectPart, 0, len(parts))
 	for _, p := range parts {
 		objParts = append(objParts, meta.ObjectPart{
-			Number: p.Number, PlainSize: p.Size, CipherOffset: cipherAcc,
+			Number: p.Number, PlainSize: p.Size, CipherOffset: cipherAcc, Salt: p.Salt,
 		})
 		cipherAcc += encrypt.CipherSize(p.Size)
 	}

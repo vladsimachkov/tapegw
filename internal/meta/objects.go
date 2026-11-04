@@ -18,6 +18,9 @@ type ObjectPart struct {
 	Number       int
 	PlainSize    int64
 	CipherOffset int64
+	// Salt — соль этой попытки загрузки части. Хранится навсегда: без неё
+	// собранный объект не прочитать, а переотправка части обязана менять nonce.
+	Salt []byte
 }
 
 // Object — строка таблицы objects.
@@ -127,6 +130,10 @@ type PutObjectInput struct {
 	// вставить строку без неё, и путь, который про ключ забыл, упадёт здесь, а
 	// не отдаст позже открытые байты.
 	WrappedDEK []byte
+	// Salt — соль части для nonce сегментов тела. Обычный PUT — это одна часть
+	// (см. Parts), поэтому соль обязана быть у любой версии с данными: без неё
+	// шифрование использует nonce, которые могли уже встречаться.
+	Salt []byte
 	// Parts — части multipart-версии (T2 PR#2). Пусто — объект записан одним
 	// PUT. Заполняется вместе с файлом, который уже склеен из частей: без этих
 	// строк Range по зашифрованному multipart не найдёт, в какой части лежит
@@ -350,14 +357,26 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 		}
 		obj.Versioning = versioning
 
-		// 6. Части multipart — в той же транзакции, что и строка объекта.
-		// Разъехаться они не имеют права: файл без object_parts нечитаем
-		// (Range не вычислит сегмент), а object_parts без файла — мусор.
-		for _, part := range in.Parts {
+		// 6. Части — в той же транзакции, что и строка объекта. Разъехаться они
+		// не имеют права: файл без object_parts нечитаем (Range не вычислит
+		// сегмент и не возьмёт соль), а object_parts без файла — мусор.
+		//
+		// Обычный PUT — это одна часть №1: соль тогда живёт в одном месте для
+		// обеих форм записи, и «salt в objects или, может, в object_parts»
+		// невозможно в принципе. Номера с нуля не бывает (CHECK part_number >= 1
+		// из миграции 0005), поэтому синтетическая часть начинается с 1.
+		parts := in.Parts
+		if len(parts) == 0 {
+			if len(in.Salt) == 0 {
+				return fmt.Errorf("meta: у версии %s нет ни частей, ни соли", in.ID)
+			}
+			parts = []ObjectPart{{Number: 1, PlainSize: in.Size, CipherOffset: 0, Salt: in.Salt}}
+		}
+		for _, part := range parts {
 			if _, err := tx.Exec(ctx,
-				`INSERT INTO object_parts (version_id, part_number, plain_size, cipher_offset)
-				 VALUES ($1, $2, $3, $4)`,
-				in.ID, part.Number, part.PlainSize, part.CipherOffset); err != nil {
+				`INSERT INTO object_parts (version_id, part_number, plain_size, cipher_offset, salt)
+				 VALUES ($1, $2, $3, $4, $5)`,
+				in.ID, part.Number, part.PlainSize, part.CipherOffset, part.Salt); err != nil {
 				return fmt.Errorf("часть %d объекта %s/%s: %w", part.Number, in.Bucket, in.Key, err)
 			}
 		}
@@ -506,7 +525,7 @@ func scanObjectRow(src interface {
 // получил эту версию через GetObject/GetObjectByID под стражем.
 func (m *Meta) ObjectParts(ctx context.Context, versionID uuid.UUID) ([]ObjectPart, error) {
 	rows, err := m.Pool.Query(ctx,
-		`SELECT part_number, plain_size, cipher_offset
+		`SELECT part_number, plain_size, cipher_offset, salt
 		   FROM object_parts WHERE version_id = $1
 		  ORDER BY part_number`, versionID)
 	if err != nil {
@@ -517,7 +536,7 @@ func (m *Meta) ObjectParts(ctx context.Context, versionID uuid.UUID) ([]ObjectPa
 	var out []ObjectPart
 	for rows.Next() {
 		var p ObjectPart
-		if err := rows.Scan(&p.Number, &p.PlainSize, &p.CipherOffset); err != nil {
+		if err := rows.Scan(&p.Number, &p.PlainSize, &p.CipherOffset, &p.Salt); err != nil {
 			return nil, fmt.Errorf("meta: части версии %s: %w", versionID, err)
 		}
 		out = append(out, p)

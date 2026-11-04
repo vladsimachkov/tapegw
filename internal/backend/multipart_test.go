@@ -669,3 +669,126 @@ func TestUploadPartRequiresContentLength(t *testing.T) {
 // e2ptr — ETag из ответа уже в кавычках, а CompletedPart их терпит в любом
 // виде: helper versitygw срезает.
 func e2ptr(v string) *string { return aws.String(v) }
+
+// Повторная загрузка части не повторяет nonce — на боевом пути.
+//
+// Форматный тест проверяет криптографию, этот — что соль действительно
+// заводится на каждую попытку и доезжает до object_parts: если UploadPart
+// переиспользует соль прежней попытки, собранный объект читаться будет (соль
+// та же и там и там) и на этом тесте мутация пройдёт. Поэтому проверяем
+// шифротексты частей и содержимое после Complete.
+func TestMultipartReuploadPartDoesNotReuseNonce(t *testing.T) {
+	be, m, land := newBackend(t)
+	ctx := testCtx()
+	mustBucket(t, be)
+	uploadID := startMPU(t, be, "b", "mp")
+
+	// Две попытки части №1: разный содержимый, ОДИНАКОВАЯ длина — именно так
+	// выглядит атака на повтор nonce (XOR шифротекстов равен XOR открытых
+	// текстов только при совпадении длины).
+	first := filler(vbackend.MinPartSize)
+	second := make([]byte, len(first))
+	for i := range second {
+		second[i] = first[i] ^ byte(i*13+1)
+	}
+
+	uploadPart(t, be, "b", "mp", uploadID, 1, first)
+	up, err := m.GetUpload(ctx, meta.NewTenant(testProjectID), uploadID)
+	if err != nil {
+		t.Fatalf("GetUpload: %v", err)
+	}
+	firstFile := land.Path(up.Parts[0].FileID)
+	firstRaw, err := os.ReadFile(firstFile)
+	if err != nil {
+		t.Fatalf("файл первой попытки: %v", err)
+	}
+	firstSalt := append([]byte(nil), up.Parts[0].Salt...)
+
+	etag2 := uploadPart(t, be, "b", "mp", uploadID, 1, second)
+	up, err = m.GetUpload(ctx, meta.NewTenant(testProjectID), uploadID)
+	if err != nil {
+		t.Fatalf("GetUpload после перезаписи: %v", err)
+	}
+	if len(up.Parts) != 1 {
+		t.Fatalf("после перезаписи частей %d, хотели одну", len(up.Parts))
+	}
+	secondRaw, err := os.ReadFile(land.Path(up.Parts[0].FileID))
+	if err != nil {
+		t.Fatalf("файл второй попытки: %v", err)
+	}
+
+	// Соль обязана смениться: это и есть носитель уникальности nonce.
+	if bytes.Equal(firstSalt, up.Parts[0].Salt) {
+		t.Errorf("соль части не изменилась при перезаписи: nonce повторятся")
+	}
+	// А шифротексты — различаться. При повторе nonce XOR шифротекстов равен XOR
+	// открытых текстов, и это прямое свидетельство утечки.
+	if bytes.Equal(firstRaw, secondRaw) {
+		t.Errorf("шифротексты двух попыток идентичны")
+	}
+	n := len(first)
+	if len(secondRaw) < n || len(firstRaw) < n {
+		t.Fatalf("файлы частей короче открытого текста")
+	}
+	xorCT := make([]byte, n)
+	xorPT := make([]byte, n)
+	for i := 0; i < n; i++ {
+		xorCT[i] = firstRaw[i] ^ secondRaw[i]
+		xorPT[i] = first[i] ^ second[i]
+	}
+	if bytes.Equal(xorCT, xorPT) {
+		t.Errorf("XOR шифротекстов равен XOR открытых текстов: nonce повторились")
+	}
+	// Прежний файл части удалён: он больше нигде не участвует.
+	if _, err := os.Stat(firstFile); !os.IsNotExist(err) {
+		t.Errorf("файл первой попытки %s остался в спуле", firstFile)
+	}
+
+	// И собранный объект содержит данные ВТОРОЙ попытки.
+	if _, _, err := be.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket: ptr("b"), Key: ptr("mp"), UploadId: ptr(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
+			{ETag: ptr(etag2), PartNumber: ptr(int32(1))},
+		}},
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	get, err := be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("mp")})
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	defer get.Body.Close()
+	got, err := readBody(t, get.Body)
+	if err != nil {
+		t.Fatalf("чтение: %v", err)
+	}
+	if !bytes.Equal(got, second) {
+		t.Errorf("объект содержит не данные второй попытки (%d байт)", len(got))
+	}
+}
+
+// У обычного PUT соль тоже своя и тоже доезжает до object_parts.
+func TestPutStoresPartSalt(t *testing.T) {
+	be, m, _ := newBackend(t)
+	ctx := testCtx()
+	mustBucket(t, be)
+	putBytes(t, be, "b", "k", filler(1000))
+
+	obj := currentObject(t, m, "b", "k")
+	parts, err := m.ObjectParts(ctx, obj.ID)
+	if err != nil {
+		t.Fatalf("ObjectParts: %v", err)
+	}
+	if len(parts) != 1 {
+		t.Fatalf("частей %d, хотели одну (обычный PUT — это одна часть)", len(parts))
+	}
+	if parts[0].Number != 1 {
+		t.Errorf("номер части %d, хотели 1 (CHECK part_number >= 1)", parts[0].Number)
+	}
+	if len(parts[0].Salt) != encrypt.SaltSize {
+		t.Errorf("соль %d байт, хотели %d", len(parts[0].Salt), encrypt.SaltSize)
+	}
+	if int(parts[0].PlainSize) != 1000 || parts[0].CipherOffset != 0 {
+		t.Errorf("часть: %+v", parts[0])
+	}
+}

@@ -61,6 +61,9 @@ type UploadPart struct {
 	ETag      string
 	Checksums map[string]string
 	FileID    uuid.UUID
+	// Salt — соль этой попытки загрузки. Перезапись части меняет её, иначе
+	// вторая попытка получила бы те же nonce при другом DEK-контексте.
+	Salt []byte
 }
 
 // CreateUploadInput — данные CreateMultipartUpload.
@@ -139,7 +142,7 @@ func (m *Meta) GetUpload(ctx context.Context, tenant TenantID, uploadID string) 
 // uploadParts — части загрузки. maxParts = 0 означает «все».
 func (m *Meta) uploadParts(ctx context.Context, tenant TenantID, uploadID string, maxParts int) ([]UploadPart, error) {
 	q, args := withTenantCol(
-		`SELECT p.part_number, p.size, p.etag, p.checksums, p.file_id
+		`SELECT p.part_number, p.size, p.etag, p.checksums, p.file_id, p.salt
 		   FROM upload_parts p
 		   JOIN uploads u ON u.upload_id = p.upload_id
 		   JOIN buckets b ON b.id = u.bucket_id
@@ -161,7 +164,7 @@ func (m *Meta) uploadParts(ctx context.Context, tenant TenantID, uploadID string
 			p         UploadPart
 			checksums []byte
 		)
-		if err := rows.Scan(&p.Number, &p.Size, &p.ETag, &checksums, &p.FileID); err != nil {
+		if err := rows.Scan(&p.Number, &p.Size, &p.ETag, &checksums, &p.FileID, &p.Salt); err != nil {
 			return nil, fmt.Errorf("meta: части загрузки %s: %w", uploadID, err)
 		}
 		if len(checksums) > 0 {
@@ -179,7 +182,9 @@ func (m *Meta) uploadParts(ctx context.Context, tenant TenantID, uploadID string
 
 // PutPartInput — результат UploadPart: файл уже на диске, здесь только строка.
 type PutPartInput struct {
-	Number    int
+	Number int
+	// Salt — соль именно этой попытки; генерирует вызывающий.
+	Salt      []byte
 	Size      int64
 	ETag      string
 	Checksums map[string]string
@@ -215,12 +220,13 @@ func (m *Meta) PutPart(ctx context.Context, tenant TenantID, uploadID string, in
 			`SELECT file_id FROM upload_parts WHERE upload_id = $1 AND part_number = $2`,
 			uploadID, in.Number).Scan(&old)
 		_, err := tx.Exec(ctx,
-			`INSERT INTO upload_parts (upload_id, part_number, size, etag, checksums, file_id)
-			 VALUES ($1, $2, $3, $4, $5, $6)
+			`INSERT INTO upload_parts (upload_id, part_number, size, etag, checksums, file_id, salt)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
 			 ON CONFLICT (upload_id, part_number) DO UPDATE
 			    SET size = EXCLUDED.size, etag = EXCLUDED.etag,
-			        checksums = EXCLUDED.checksums, file_id = EXCLUDED.file_id`,
-			uploadID, in.Number, in.Size, in.ETag, checksums, in.FileID)
+			        checksums = EXCLUDED.checksums, file_id = EXCLUDED.file_id,
+			        salt = EXCLUDED.salt`,
+			uploadID, in.Number, in.Size, in.ETag, checksums, in.FileID, in.Salt)
 		if err != nil {
 			return fmt.Errorf("meta: часть %d загрузки %s: %w", in.Number, uploadID, err)
 		}

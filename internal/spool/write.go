@@ -69,7 +69,7 @@ type ObjectInfo struct {
 //
 // limit > 0 ограничивает размер; превышение — ErrTooLarge, файл не остаётся.
 func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (ObjectInfo, error) {
-	return s.write(id, id, r, spec, limit, nil, 0, 0)
+	return s.write(id, id, r, spec, limit, nil, 0, 0, nil)
 }
 
 // WriteEncrypted — то же, что Write, но на диск ложится шифротекст (ADR-0014).
@@ -85,8 +85,10 @@ func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (Obj
 // plainSize — объявленный размер открытого тела. Он обязателен: входит в AAD
 // каждого сегмента (ADR-0014), поэтому шифровать можно только зная длину
 // заранее. Факт несовпадения с фактическими байтами — ErrSizeMismatch.
-func (s *Spool) WriteEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, key []byte, plainSize int64) (ObjectInfo, error) {
-	return s.write(id, id, r, spec, limit, key, plainSize, 0)
+func (s *Spool) WriteEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, key []byte, plainSize int64, salt []byte) (ObjectInfo, error) {
+	// Часть №1: обычный PUT — это одна часть (см. meta.PutObject), номер входит
+	// в nonce и должен совпасть с номером из object_parts.
+	return s.write(id, id, r, spec, limit, key, plainSize, 1, salt)
 }
 
 // WritePartEncrypted — та же запись для одной части multipart: part — номер
@@ -99,11 +101,11 @@ func (s *Spool) WriteEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit in
 // под UUID строки objects. Файл части при этом живёт под собственным именем —
 // два разных UUID, и путать их нельзя.
 func (s *Spool) WritePartEncrypted(id, version uuid.UUID, r io.Reader, spec SumSpec, limit int64,
-	key []byte, plainSize int64, part uint32) (ObjectInfo, error) {
-	return s.write(id, version, r, spec, limit, key, plainSize, part)
+	key []byte, plainSize int64, part uint32, salt []byte) (ObjectInfo, error) {
+	return s.write(id, version, r, spec, limit, key, plainSize, part, salt)
 }
 
-func (s *Spool) write(id, version uuid.UUID, r io.Reader, spec SumSpec, limit int64, encKey []byte, plainSize int64, part uint32) (ObjectInfo, error) {
+func (s *Spool) write(id, version uuid.UUID, r io.Reader, spec SumSpec, limit int64, encKey []byte, plainSize int64, part uint32, salt []byte) (ObjectInfo, error) {
 	var info ObjectInfo
 
 	// Ограничитель ставим ниже сверителей, чтобы HashReader увидел EOF и успел
@@ -170,7 +172,7 @@ func (s *Spool) write(id, version uuid.UUID, r io.Reader, spec SumSpec, limit in
 	var dst io.Writer = tmp
 	var enc *encrypt.Writer
 	if encKey != nil {
-		enc, err = encrypt.NewWriter(tmp, encKey, version, part, plainSize)
+		enc, err = encrypt.NewWriter(tmp, encKey, version, part, salt, plainSize)
 		if err != nil {
 			tmp.Close()
 			return info, err

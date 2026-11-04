@@ -26,6 +26,10 @@ type Part struct {
 	Number       uint32
 	PlainSize    int64
 	CipherOffset int64
+	// Salt — соль этой попытки загрузки части. Входит в nonce каждого её
+	// сегмента: без неё переотправка части с тем же номером дала бы повтор
+	// nonce при том же DEK.
+	Salt []byte
 }
 
 // Reader — чтение открытых данных из файла шифротекста.
@@ -47,8 +51,8 @@ type Reader struct {
 }
 
 // NewReader — читатель тела версии из одной части (обычный PUT).
-func NewReader(at io.ReaderAt, key []byte, version uuid.UUID, part uint32, plain int64) (*Reader, error) {
-	return NewPartsReader(at, key, version, []Part{{Number: part, PlainSize: plain}}, plain)
+func NewReader(at io.ReaderAt, key []byte, version uuid.UUID, part uint32, salt []byte, plain int64) (*Reader, error) {
+	return NewPartsReader(at, key, version, []Part{{Number: part, PlainSize: plain, Salt: salt}}, plain)
 }
 
 // NewPartsReader — читатель multipart-версии.
@@ -84,6 +88,10 @@ func NewPartsReader(at io.ReaderAt, key []byte, version uuid.UUID, parts []Part,
 		p := &own[i]
 		if p.PlainSize < 0 {
 			return nil, fmt.Errorf("encrypt: часть %d с отрицательным размером", p.Number)
+		}
+		if len(p.Salt) != SaltSize {
+			return nil, fmt.Errorf("encrypt: часть %d: соль %d байт, нужно %d",
+				p.Number, len(p.Salt), SaltSize)
 		}
 		if p.PlainSize == 0 && len(own) > 1 {
 			// Пустая часть в multipart ломает поиск части по смещению: две
@@ -222,7 +230,7 @@ func (r *Reader) readSegment(part Part, seg uint64, plainSeg int64) ([]byte, err
 		r.tmpBuf = make([]byte, need)
 	}
 	out := r.tmpBuf[:0]
-	return OpenSegment(out, r.key, r.version, part.Number, seg, part.PlainSize, ct)
+	return OpenSegment(out, r.key, r.version, part.Number, part.Salt, seg, part.PlainSize, ct)
 }
 
 // SeqReader — последовательное чтение с нуля. Нужен там, где Range нет: полный

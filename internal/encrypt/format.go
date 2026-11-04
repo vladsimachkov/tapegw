@@ -40,6 +40,16 @@ const (
 
 	// KeySize — длина DEK/TEK (AES-256).
 	KeySize = 32
+
+	// SaltSize — размер случайной соли одной части.
+	//
+	// Соль заводится на КАЖДУЮ попытку загрузки части и хранится рядом с её
+	// шифротекстом. Нужна затем, что S3 разрешает переотправить часть с тем же
+	// номером (retry после сетевой ошибки делают aws cli, rclone и SDK), а DEK
+	// на всю загрузку один: без соли вторая попытка части N зашифровалась бы
+	// тем же ключом и теми же nonce, что первая. Для GCM это худший извозможных
+	// сбоев — по двум сообщениям с одним nonce восстанавливается ключ GHASH.
+	SaltSize = 16
 )
 
 // ErrCorruptedSegment — сегмент не прошёл проверку тега.
@@ -104,21 +114,39 @@ func SegmentCount(plain int64) int64 {
 	return n
 }
 
-// nonce — 12 байт для AES-GCM из UUID версии, номера части и номера сегмента.
+// nonce — 12 байт для AES-GCM из UUID версии, номера части, соли части и
+// номера сегмента.
 //
-// В 12 байт тройка байт-в-байт не влезаёт (только UUID — 16), поэтому берётся
-// SHA-256 от неё. Повтор nonce при одном DEK разрушает GCM целиком, поэтому
-// здесь важна уникальность тройки, а не обратимость вывода: DEK свой на
-// каждую версию, а внутри версии (часть, сегмент) не повторяются по
-// построению.
-func nonce(version uuid.UUID, part uint32, seg uint64) []byte {
+// В 12 байт набор байт-в-байт не влезаёт (только UUID — 16), поэтому берётся
+// SHA-256 от него. Повтор nonce при одном DEK разрушает GCM целиком, поэтому
+// здесь важна уникальность, а не обратимость вывода.
+//
+// Из чего складывается уникальность:
+//
+//   - UUID версии и DEK — разные на каждую версию объекта;
+//   - номер части — разные внутри версии;
+//   - номер сегмента — разные внутри части;
+//   - соль — разные на каждую ПОПЫТКУ загрузки части.
+//
+// Последнее критично именно для multipart: DEK один на всю загрузку, а
+// переотправка части с тем же номером — штатное поведение S3. Без соли вторая
+// попытка дала бы те же ключ и nonce при других данных: XOR шифротекстов равен
+// XOR открытых текстов, а дальше восстанавливается ключ аутентификации GHASH.
+// Гарантия «nonce уникален для ключа» обязана держаться на формате, а не на
+// том, что старый файл части успели удалить и никто его не прочитал.
+func nonce(version uuid.UUID, part uint32, salt []byte, seg uint64) []byte {
 	// Размер буфера считается от длины домена, а не пишется числом: опечатка в
 	// таком числе — это паника на первом же сегменте.
-	var buf [len(domain) + 16 + 4 + 8]byte
+	var buf [len(domain) + 16 + 4 + SaltSize + 8]byte
 	n := copy(buf[:], domain)
 	copy(buf[n:], version[:])
 	binary.BigEndian.PutUint32(buf[n+16:], part)
-	binary.BigEndian.PutUint64(buf[n+20:], seg)
+	if len(salt) != SaltSize {
+		// Молча дополнить нулями было бы «уникальностью» только на словах.
+		panic(fmt.Sprintf("encrypt: соль %d байт, нужно %d", len(salt), SaltSize))
+	}
+	copy(buf[n+20:], salt)
+	binary.BigEndian.PutUint64(buf[n+20+SaltSize:], seg)
 	sum := sha256.Sum256(buf[:])
 	return sum[:12]
 }
@@ -169,7 +197,7 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 //
 // buf — буфер под результат длиной не меньше CipherSize(len(plain)); передаётся
 // снаружи, чтобы в потоке не аллоцировать на каждый сегмент.
-func SealSegment(dst, key []byte, version uuid.UUID, part uint32, seg uint64, plainSize int64, plain []byte) ([]byte, error) {
+func SealSegment(dst, key []byte, version uuid.UUID, part uint32, salt []byte, seg uint64, plainSize int64, plain []byte) ([]byte, error) {
 	gcm, err := newGCM(key)
 	if err != nil {
 		return nil, err
@@ -177,17 +205,17 @@ func SealSegment(dst, key []byte, version uuid.UUID, part uint32, seg uint64, pl
 	if len(plain) > SegmentSize {
 		return nil, fmt.Errorf("encrypt: сегмент %d байт, максимум %d", len(plain), SegmentSize)
 	}
-	out := gcm.Seal(dst[:0], nonce(version, part, seg), plain, aad(version, part, plainSize))
+	out := gcm.Seal(dst[:0], nonce(version, part, salt, seg), plain, aad(version, part, plainSize))
 	return out, nil
 }
 
 // OpenSegment — открытый текст одного сегмента. Ошибка, если тег не сошёлся.
-func OpenSegment(dst, key []byte, version uuid.UUID, part uint32, seg uint64, plainSize int64, data []byte) ([]byte, error) {
+func OpenSegment(dst, key []byte, version uuid.UUID, part uint32, salt []byte, seg uint64, plainSize int64, data []byte) ([]byte, error) {
 	gcm, err := newGCM(key)
 	if err != nil {
 		return nil, err
 	}
-	out, err := gcm.Open(dst[:0], nonce(version, part, seg), data, aad(version, part, plainSize))
+	out, err := gcm.Open(dst[:0], nonce(version, part, salt, seg), data, aad(version, part, plainSize))
 	if err != nil {
 		return nil, fmt.Errorf("%w: часть %d сегмент %d", ErrCorruptedSegment, part, seg)
 	}

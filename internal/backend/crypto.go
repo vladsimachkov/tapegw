@@ -11,6 +11,7 @@ package backend
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"os"
@@ -103,13 +104,29 @@ func (t *TapeGW) partsReader(ctx context.Context, obj *meta.Object, f *os.File, 
 		return nil, err
 	}
 	if len(parts) == 0 {
-		return encrypt.NewReader(f, dek, obj.ID, 0, obj.Size)
+		// Не «предположим одну часть», а отказ: с миграции 0014 часть есть у
+		// любой версии с данными, и пустая таблица означает рассинхрон БД с
+		// диском. Молча выбрать соль неоткуда — а без неё nonce не собрать.
+		return nil, fmt.Errorf("у версии %s нет частей в object_parts", obj.ID)
 	}
 	enc := make([]encrypt.Part, 0, len(parts))
 	for _, p := range parts {
 		enc = append(enc, encrypt.Part{
-			Number: uint32(p.Number), PlainSize: p.PlainSize, CipherOffset: p.CipherOffset,
+			Number: uint32(p.Number), PlainSize: p.PlainSize,
+			CipherOffset: p.CipherOffset, Salt: p.Salt,
 		})
 	}
 	return encrypt.NewPartsReader(f, dek, obj.ID, enc, obj.Size)
+}
+
+// newSalt — соль новой части: 16 случайных байт.
+//
+// Генерируется на КАЖДУЮ попытку загрузки, а не на часть: переотправка части с
+// тем же номером обязана дать другой набор nonce (ADR-0014).
+func newSalt() ([]byte, error) {
+	salt := make([]byte, encrypt.SaltSize)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, fmt.Errorf("соль части: %w", err)
+	}
+	return salt, nil
 }

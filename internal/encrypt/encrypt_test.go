@@ -10,6 +10,16 @@ import (
 	"github.com/google/uuid"
 )
 
+// testSalt — фиксированная соль для тестов формата. Настоящая генерируется
+// случайно на каждую попытку загрузки; здесь важна длина и неизменность.
+func testSalt() []byte {
+	s := make([]byte, SaltSize)
+	for i := range s {
+		s[i] = byte(0xA0 + i)
+	}
+	return s
+}
+
 func mustKey(t *testing.T) []byte {
 	t.Helper()
 	k := make([]byte, KeySize)
@@ -33,7 +43,7 @@ func writeRead(t *testing.T, data []byte, version uuid.UUID, part uint32) ([]byt
 	t.Helper()
 	key := mustKey(t)
 	var ct bytes.Buffer
-	w, err := NewWriter(&ct, key, version, part, int64(len(data)))
+	w, err := NewWriter(&ct, key, version, part, testSalt(), int64(len(data)))
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -50,7 +60,7 @@ func writeRead(t *testing.T, data []byte, version uuid.UUID, part uint32) ([]byt
 		t.Fatalf("размер шифротекста %d, формула обещала %d", ct.Len(), CipherSize(int64(len(data))))
 	}
 
-	r, err := NewReader(bytes.NewReader(ct.Bytes()), key, version, part, int64(len(data)))
+	r, err := NewReader(bytes.NewReader(ct.Bytes()), key, version, part, testSalt(), int64(len(data)))
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -93,7 +103,7 @@ func TestReaderRanges(t *testing.T) {
 	key := mustKey(t)
 
 	var ct bytes.Buffer
-	w, err := NewWriter(&ct, key, version, 0, int64(len(data)))
+	w, err := NewWriter(&ct, key, version, 0, testSalt(), int64(len(data)))
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -104,7 +114,7 @@ func TestReaderRanges(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	r, err := NewReader(bytes.NewReader(ct.Bytes()), key, version, 0, int64(n))
+	r, err := NewReader(bytes.NewReader(ct.Bytes()), key, version, 0, testSalt(), int64(n))
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -154,7 +164,7 @@ func TestCorruptionDetected(t *testing.T) {
 
 	seal := func() []byte {
 		var ct bytes.Buffer
-		w, err := NewWriter(&ct, key, version, 0, int64(len(data)))
+		w, err := NewWriter(&ct, key, version, 0, testSalt(), int64(len(data)))
 		if err != nil {
 			t.Fatalf("NewWriter: %v", err)
 		}
@@ -182,7 +192,7 @@ func TestCorruptionDetected(t *testing.T) {
 		pos := c.off(len(ct))
 		ct[pos] ^= 0x01
 
-		r, err := NewReader(bytes.NewReader(ct), key, version, 0, int64(n))
+		r, err := NewReader(bytes.NewReader(ct), key, version, 0, testSalt(), int64(n))
 		if err != nil {
 			t.Fatalf("%s: NewReader: %v", c.name, err)
 		}
@@ -206,7 +216,7 @@ func TestShortCiphertext(t *testing.T) {
 	key := mustKey(t)
 
 	var ct bytes.Buffer
-	w, _ := NewWriter(&ct, key, version, 0, int64(len(data)))
+	w, _ := NewWriter(&ct, key, version, 0, testSalt(), int64(len(data)))
 	if _, err := w.Write(data); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -215,7 +225,7 @@ func TestShortCiphertext(t *testing.T) {
 	}
 	truncated := ct.Bytes()[:ct.Len()-CipherSegmentSize+7]
 
-	r, err := NewReader(bytes.NewReader(truncated), key, version, 0, int64(n))
+	r, err := NewReader(bytes.NewReader(truncated), key, version, 0, testSalt(), int64(n))
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -233,7 +243,7 @@ func TestNonceUniquePerVersion(t *testing.T) {
 
 	seal := func(v uuid.UUID, part uint32) []byte {
 		var ct bytes.Buffer
-		w, _ := NewWriter(&ct, key, v, part, int64(len(data)))
+		w, _ := NewWriter(&ct, key, v, part, testSalt(), int64(len(data)))
 		if _, err := w.Write(data); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
@@ -264,7 +274,7 @@ func TestAADBindsSegment(t *testing.T) {
 	vA, vB := uuid.New(), uuid.New()
 
 	var ct bytes.Buffer
-	w, _ := NewWriter(&ct, key, vA, 0, int64(len(data)))
+	w, _ := NewWriter(&ct, key, vA, 0, testSalt(), int64(len(data)))
 	if _, err := w.Write(data); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -272,7 +282,7 @@ func TestAADBindsSegment(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	r, err := NewReader(bytes.NewReader(ct.Bytes()), key, vB, 0, int64(len(data)))
+	r, err := NewReader(bytes.NewReader(ct.Bytes()), key, vB, 0, testSalt(), int64(len(data)))
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -282,13 +292,13 @@ func TestAADBindsSegment(t *testing.T) {
 }
 
 func TestWriterRejectsBadKey(t *testing.T) {
-	if _, err := NewWriter(io.Discard, make([]byte, 16), uuid.New(), 0, 5); err == nil {
+	if _, err := NewWriter(io.Discard, make([]byte, 16), uuid.New(), 0, testSalt(), 5); err == nil {
 		t.Errorf("короткий ключ принят")
 	}
 }
 
 func TestWriterWriteAfterClose(t *testing.T) {
-	w, err := NewWriter(io.Discard, mustKey(t), uuid.New(), 0, 5)
+	w, err := NewWriter(io.Discard, mustKey(t), uuid.New(), 0, testSalt(), 5)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -313,11 +323,11 @@ func TestDeclaredSizeIsBoundToSegments(t *testing.T) {
 
 	var ct bytes.Buffer
 	// Отрицательный объявленный размер — ошибка конструктора, а не паника.
-	if _, err := NewWriter(io.Discard, key, version, 0, -1); err == nil {
+	if _, err := NewWriter(io.Discard, key, version, 0, testSalt(), -1); err == nil {
 		t.Errorf("писатель принял отрицательный размер")
 	}
 
-	w, err := NewWriter(&ct, key, version, 0, int64(n))
+	w, err := NewWriter(&ct, key, version, 0, testSalt(), int64(n))
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -336,7 +346,7 @@ func TestDeclaredSizeIsBoundToSegments(t *testing.T) {
 	// Усечение в середину сегмента ловится и без размера (длина шифротекста не
 	// совпадёт с тегом), и первый вариант теста давал именно этот случай —
 	// мутация «AAD игнорирует размер» сквозь него проходила.
-	short, err := NewReader(bytes.NewReader(ct.Bytes()), key, version, 0, 2*SegmentSize)
+	short, err := NewReader(bytes.NewReader(ct.Bytes()), key, version, 0, testSalt(), 2*SegmentSize)
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -346,7 +356,7 @@ func TestDeclaredSizeIsBoundToSegments(t *testing.T) {
 	}
 
 	// Целый объект читается как ни в чём не бывало.
-	full, err := NewReader(bytes.NewReader(ct.Bytes()), key, version, 0, int64(n))
+	full, err := NewReader(bytes.NewReader(ct.Bytes()), key, version, 0, testSalt(), int64(n))
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -369,7 +379,7 @@ func sealParts(t *testing.T, key []byte, version uuid.UUID, sizes []int) ([]byte
 	for i, n := range sizes {
 		data := plaintext(n)
 		plains = append(plains, data)
-		w, err := NewWriter(&all, key, version, uint32(i+1), int64(n))
+		w, err := NewWriter(&all, key, version, uint32(i+1), testSalt(), int64(n))
 		if err != nil {
 			t.Fatalf("часть %d: NewWriter: %v", i+1, err)
 		}
@@ -400,7 +410,7 @@ func TestPartsReaderRanges(t *testing.T) {
 
 	parts := make([]Part, 0, len(sizes))
 	for i, n := range sizes {
-		parts = append(parts, Part{Number: uint32(i + 1), PlainSize: int64(n)})
+		parts = append(parts, Part{Number: uint32(i + 1), PlainSize: int64(n), Salt: testSalt()})
 	}
 	r, err := NewPartsReader(bytes.NewReader(ct), key, version, parts, int64(total))
 	if err != nil {
@@ -453,7 +463,8 @@ func TestPartsReaderRejectsWrongPartSize(t *testing.T) {
 
 	// Уменьшили вторую часть на 100 байт: суммарный размер тоже меньше, и
 	// каждая оставшаяся часть целая. Ловит только привязка размера в AAD.
-	parts := []Part{{Number: 1, PlainSize: SegmentSize}, {Number: 2, PlainSize: 200}}
+	parts := []Part{{Number: 1, PlainSize: SegmentSize, Salt: testSalt()},
+		{Number: 2, PlainSize: 200, Salt: testSalt()}}
 	r, err := NewPartsReader(bytes.NewReader(ct), key, version, parts, SegmentSize+200)
 	if err != nil {
 		t.Fatalf("NewPartsReader: %v", err)
@@ -472,10 +483,112 @@ func TestPartsReaderRejectsWrongCipherOffset(t *testing.T) {
 	ct, _ := sealParts(t, key, version, []int{SegmentSize, 300})
 
 	parts := []Part{
-		{Number: 1, PlainSize: SegmentSize, CipherOffset: 0},
-		{Number: 2, PlainSize: 300, CipherOffset: 999},
+		{Number: 1, PlainSize: SegmentSize, CipherOffset: 0, Salt: testSalt()},
+		{Number: 2, PlainSize: 300, CipherOffset: 999, Salt: testSalt()},
 	}
 	if _, err := NewPartsReader(bytes.NewReader(ct), key, version, parts, SegmentSize+300); err == nil {
 		t.Errorf("несовпадение cipher_offset принято")
+	}
+}
+
+// Повторная загрузка части не должна повторять nonce.
+//
+// S3 разрешает переотправить часть с тем же номером — retry после сетевой
+// ошибки делают aws cli, rclone и SDK, — а DEK на multipart-загрузку один.
+// Если nonce не зависит от соли, вторая попытка шифруется тем же ключом и теми
+// же nonce, и тогда XOR шифротекстов равен XOR открытых текстов: данные
+// утекают без ключа, а по двум сообщениям с одним nonce восстанавливается ключ
+// аутентификации GHASH.
+//
+// Данные одинаковой длины — обязательное условие атаки, поэтому и тест берёт
+// одинаковую длину: на разных длинах XOR-проверка была бы слабее.
+func TestReencryptedPartDoesNotReuseNonce(t *testing.T) {
+	const n = 3 * SegmentSize
+	key := mustKey(t)
+	version := uuid.New()
+	const part = uint32(2)
+
+	p1 := plaintext(n)
+	p2 := make([]byte, n)
+	for i := range p2 {
+		p2[i] = p1[i] ^ byte(i%251)
+	}
+
+	seal := func(salt, plain []byte) []byte {
+		var buf bytes.Buffer
+		w, err := NewWriter(&buf, key, version, part, salt, int64(len(plain)))
+		if err != nil {
+			t.Fatalf("NewWriter: %v", err)
+		}
+		if _, err := w.Write(plain); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		return buf.Bytes()
+	}
+
+	salt1 := testSalt()
+	salt2 := make([]byte, SaltSize)
+	for i := range salt2 {
+		salt2[i] = salt1[i] ^ 0xFF
+	}
+
+	c1 := seal(salt1, p1)
+	c2 := seal(salt2, p2)
+
+	// Прямой признак reuse: XOR шифротекстов равен XOR открытых текстов.
+	xorCT := make([]byte, n)
+	xorPT := make([]byte, n)
+	for i := 0; i < n; i++ {
+		xorCT[i] = c1[i] ^ c2[i]
+		xorPT[i] = p1[i] ^ p2[i]
+	}
+	if bytes.Equal(xorCT[:SegmentSize], xorPT[:SegmentSize]) {
+		t.Errorf("XOR шифротекстов равен XOR открытых текстов: nonce повторились")
+	}
+	if bytes.Equal(c1, c2) {
+		t.Errorf("одинаковые шифротексты при разных данных")
+	}
+
+	// И каждая попытка читается только своей солью: соль — часть контекста,
+	// а не декорация.
+	r, err := NewReader(bytes.NewReader(c2), key, version, part, salt2, n)
+	if err != nil {
+		t.Fatalf("NewReader(salt2): %v", err)
+	}
+	got, err := io.ReadAll(NewSeqReader(r))
+	r.Close()
+	if err != nil {
+		t.Fatalf("чтение второй попытки: %v", err)
+	}
+	if !bytes.Equal(got, p2) {
+		t.Errorf("вторая попытка прочиталась неверно")
+	}
+
+	r2, err := NewReader(bytes.NewReader(c2), key, version, part, salt1, n)
+	if err != nil {
+		t.Fatalf("NewReader(salt1): %v", err)
+	}
+	defer r2.Close()
+	if _, err := io.ReadAll(NewSeqReader(r2)); err == nil {
+		t.Errorf("чужая соль принята: соль не влияет на nonce")
+	}
+}
+
+// Писатель и читатель обязаны отказывать на соли неверного размера: молча
+// дополнить нулями означало бы «уникальность nonce» только на словах.
+func TestSaltSizeIsEnforced(t *testing.T) {
+	key := mustKey(t)
+	version := uuid.New()
+	if _, err := NewWriter(io.Discard, key, version, 0, nil, 5); err == nil {
+		t.Errorf("писатель принял соль нулевой длины")
+	}
+	if _, err := NewWriter(io.Discard, key, version, 0, make([]byte, SaltSize-1), 5); err == nil {
+		t.Errorf("писатель принял короткую соль")
+	}
+	if _, err := NewReader(bytes.NewReader(nil), key, version, 0, make([]byte, SaltSize+1), 0); err == nil {
+		t.Errorf("читатель принял длинную соль")
 	}
 }
