@@ -118,9 +118,9 @@ var backendMethodCases = map[string]guardCase{
 	"GetObjectRetention":            {class: unimplemented, reason: "Object Lock вне MVP"},
 	"GetObjectTagging":              {class: unimplemented, reason: "теги объектов появятся с M3"},
 	"ListMultipartUploads":          {class: unimplemented, reason: "multipart вне MVP"},
-	"ListObjectVersions":            {class: unimplemented, reason: "листинг появится с M2/V"},
-	"ListObjects":                   {class: unimplemented, reason: "листинг появится с M2/V"},
-	"ListObjectsV2":                 {class: unimplemented, reason: "листинг появится с M2/V"},
+	"ListObjectVersions":            {class: guarded, reason: "листинг версий: чужой бакет — AccessDenied"},
+	"ListObjects":                   {class: guarded, reason: "листинг v1: чужой бакет — AccessDenied"},
+	"ListObjectsV2":                 {class: guarded, reason: "листинг v2: чужой бакет — AccessDenied"},
 	"ListParts":                     {class: unimplemented, reason: "multipart вне MVP"},
 	"PutBucketCors":                 {class: unimplemented, reason: "CORS вне MVP"},
 	"PutBucketOwnershipControls":    {class: unimplemented, reason: "ownership controls вне MVP"},
@@ -230,6 +230,11 @@ func sweep(t *testing.T, be *backend.TapeGW, pass string, ctx context.Context) {
 // callBackend вызывает метод интерфейса с «жертвой» на месте бакета и
 // возвращает error из результатов (nil, если error в сигнатуре нет).
 func callBackend(value reflect.Value, name string, ctx context.Context) error {
+	_, err := callBackendOut(value, name, ctx)
+	return err
+}
+
+func callBackendOut(value reflect.Value, name string, ctx context.Context) ([]reflect.Value, error) {
 	method, ok := backendInterface.MethodByName(name)
 	if !ok {
 		panic("нет метода " + name)
@@ -239,10 +244,10 @@ func callBackend(value reflect.Value, name string, ctx context.Context) error {
 	for i := len(out) - 1; i >= 0; i-- {
 		if out[i].Type() == errType {
 			e, _ := out[i].Interface().(error)
-			return e
+			return out, e
 		}
 	}
-	return nil
+	return out, nil
 }
 
 // sweepArgs собирает аргументы метода: контекст, имя бакета-«жертвы» на месте
