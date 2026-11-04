@@ -14,7 +14,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	"github.com/versity/versitygw/auth"
 
@@ -27,7 +29,8 @@ func main() {
 	cfgPath := flag.String("config", "", "путь к tapegw.yaml (оттуда же DSN и iam.kek_file)")
 	cmd := flag.String("cmd", "create", "create | revoke | list")
 	access := flag.String("access", "", "access key (create, revoke)")
-	secret := flag.String("secret", "", "секрет в открытом виде (create)")
+	secret := flag.String("secret", "", "секрет в открытом виде; если не задан — читается со stdin. "+
+		"Флаг — только для тестов: аргументы видны в ps и истории оболочки")
 	role := flag.String("role", "user", "роль: user | userplus | admin (create)")
 	tenant := flag.Int64("tenant", 0, "тенант учётки (create)")
 	flag.Parse()
@@ -65,11 +68,26 @@ func main() {
 
 	switch *cmd {
 	case "create":
-		if *access == "" || *secret == "" || *tenant == 0 {
-			fatal("для create нужны -access, -secret и -tenant")
+		if *access == "" || *tenant == 0 {
+			fatal("для create нужны -access и -tenant")
+		}
+		// Секрет из stdin, а не из флага: аргументы командной строки видны в
+		// `ps` и в истории оболочки, а в бою этот ключ даёт доступ ко всему
+		// тенанту. Флаг -secret остаётся только для тестов, где «секрет» —
+		// заведомо не настоящий.
+		sec := *secret
+		if sec == "" {
+			b, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				fatal("прочитать секрет из stdin: %v", err)
+			}
+			sec = strings.TrimSpace(string(b))
+			if sec == "" {
+				fatal("секрет пуст: передайте его на stdin или флагом -secret (только для тестов)")
+			}
 		}
 		err = svc.CreateAccount(auth.Account{
-			Access: *access, Secret: *secret, Role: auth.Role(*role), ProjectID: int(*tenant),
+			Access: *access, Secret: sec, Role: auth.Role(*role), ProjectID: int(*tenant),
 		})
 		if err != nil {
 			fatal("создать %q: %v", *access, err)

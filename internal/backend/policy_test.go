@@ -35,7 +35,7 @@ func TestChangeBucketOwnerReassignsRights(t *testing.T) {
 	}
 	if _, err := m.Pool.Exec(context.Background(),
 		`INSERT INTO accounts (access_key, secret_wrapped, role, tenant_id, tenant_system)
-		  VALUES ('userplus', NULL, 'userplus', 2, false)
+		  VALUES ('userplus', 'test-only-not-a-real-secret'::bytea, 'userplus', 2, false)
 		  ON CONFLICT (access_key) DO NOTHING`); err != nil {
 		t.Fatalf("account userplus: %v", err)
 	}
