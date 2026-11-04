@@ -36,6 +36,11 @@ type Object struct {
 	OnlineUntil time.Time
 	CreatedAt   time.Time
 	ArchivedAt  *time.Time
+	// Versioning — состояние версионирования бакета на момент вставки.
+	// Заполняет только PutObject: по нему бэкенд решает, какой x-amz-version-id
+	// поставить в ответ. Для unversioned заголовка нет, для suspended — "null",
+	// для enabled — id версии.
+	Versioning string
 }
 
 // ReadableFromDisk — можно ли отдать содержимое без RestoreObject.
@@ -279,6 +284,7 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 		if err != nil {
 			return err
 		}
+		obj.Versioning = versioning
 		out = obj
 		return nil
 	})
