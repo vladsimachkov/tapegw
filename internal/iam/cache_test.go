@@ -303,11 +303,18 @@ func TestCacheResubscribeFlushesAfterLostEvent(t *testing.T) {
 		`SELECT pg_terminate_backend($1)`, pid); err != nil {
 		t.Fatalf("обрыв соединения: %v", err)
 	}
+	// Ждём, пока соединение действительно исчезнет из pg_stat_activity, а не
+	// спим наугад. Пауза sleep(100ms) на быстром раннере проигрывала гонку:
+	// листенер переподписывался раньше удаления, уведомление доходило, кэш
+	// опустел — и тест зелёничал без всякой инвалидации.
+	if !waitFor(5*time.Second, func() bool {
+		_, err := listenerBackendPID(context.Background(), e, appName)
+		return err != nil
+	}) {
+		t.Fatalf("соединение листенера так и не оборвалось — тест не за что проверять")
+	}
 
 	// Окно без слушателя: уведомление об этом изменении некому принять.
-	// Пауза нужна, чтобы обрыв точно был обработан, а переподписка ещё сидела
-	// в первой задержке бэкоффа (секунда).
-	time.Sleep(100 * time.Millisecond)
 	if err := cache.DeleteUserAccount("frank"); err != nil {
 		t.Fatalf("удаление в окно без слушателя: %v", err)
 	}
