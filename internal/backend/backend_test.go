@@ -7,14 +7,18 @@ import (
 	"reflect"
 	"testing"
 
+	"crypto/sha256"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 
 	"github.com/vladsimachkov/tapegw/internal/backend"
 	"github.com/vladsimachkov/tapegw/internal/config"
+	"github.com/vladsimachkov/tapegw/internal/iam"
+	"github.com/vladsimachkov/tapegw/internal/keys"
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/spool"
 	"github.com/vladsimachkov/tapegw/internal/testdb"
@@ -49,7 +53,27 @@ func newBackendWith(t *testing.T, mutate func(*config.Config)) (*backend.TapeGW,
 	if err != nil {
 		t.Fatalf("spool.Open: %v", err)
 	}
-	return backend.New(m, land, cfg), m, land
+	return backend.New(m, land, cfg, keys.New(m, testKeyRing(t))), m, land
+}
+
+// testKEK — фиксированный KEK всего пакета бэкенд-тестов.
+//
+// Случайный на каждый тест не годится: TEK тенанта 1 переживает тест (Clean
+// оставляет seed-строки и не восстанавливает колонки), и второй тест получил бы
+// обёртку, завернутую уже другим KEK, — «ключ не подошёл» там, где бага нет.
+// Фиксированный KEK делает это состояние безвредным.
+var testKEK = func() []byte {
+	sum := sha256.Sum256([]byte("tapegw backend tests kek v1"))
+	return sum[:]
+}()
+
+func testKeyRing(t *testing.T) *iam.KeyRing {
+	t.Helper()
+	ring, err := iam.NewKeyRing(1, map[int][]byte{1: testKEK})
+	if err != nil {
+		t.Fatalf("кольцо KEK: %v", err)
+	}
+	return ring
 }
 
 // testProjectID — ProjectID учётки тестового тенанта, а заодно и tenants.id:
@@ -292,10 +316,10 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 	// выключал бы вытеснение, поэтому колонка NOT NULL.
 	if _, err := m.Pool.Exec(ctx, `
 		INSERT INTO objects (id, bucket_id, key, size, etag, state, online_until,
-		                     tenant_id, pool_id)
+		                     tenant_id, pool_id, wrapped_dek)
 		SELECT gen_random_uuid(), (SELECT id FROM buckets WHERE name='full'),
 		       'a.txt', 3, 'd41d8cd98f00b204e9800998ecf8427e', 'archived',
-		       now() + interval '1 day', $1, $2`,
+		       now() + interval '1 day', $1, $2, 'x'::bytea`,
 		testTenantID, meta.DefaultPoolID); err != nil {
 		t.Fatalf("подготовка объекта: %v", err)
 	}

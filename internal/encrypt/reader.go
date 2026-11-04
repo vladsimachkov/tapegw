@@ -36,15 +36,29 @@ func NewReader(at io.ReaderAt, key []byte, version uuid.UUID, part uint32, plain
 	if plain < 0 {
 		return nil, fmt.Errorf("encrypt: отрицательный размер %d", plain)
 	}
+	// Ключ копируется. Reader ленивый: он читает ключ в момент ReadAt, а не в
+	// конструкторе, и вызывающий, который обнулит свой массив сразу после
+	// NewReader, оставил бы читатель с нулевым ключом — ошибка аутентичности
+	// вместо данных (проверено: именно так и происходило).
+	own := make([]byte, KeySize)
+	copy(own, key)
 	return &Reader{
 		at:      at,
-		key:     key,
+		key:     own,
 		version: version,
 		part:    part,
 		plain:   plain,
 		segBuf:  make([]byte, 0, CipherSegmentSize),
 		tmpBuf:  make([]byte, 0, SegmentSize),
 	}, nil
+}
+
+// Close — стирает ключ и буферы. Обязателен для того же, для чего закрывают
+// файл: после чтения ключ и расшифрованные байты лежат в памяти читателя.
+func (r *Reader) Close() error {
+	Zero(r.key)
+	Zero(r.tmpBuf)
+	return nil
 }
 
 // Size — размер открытых данных.

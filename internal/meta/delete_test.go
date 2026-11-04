@@ -139,9 +139,10 @@ func TestDeleteVersionUnderLock(t *testing.T) {
 		if err := m.Pool.QueryRow(ctx,
 			`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class,
 			                      state, landing, online_until, tenant_id, pool_id,
-			                      is_current, retention_mode, retain_until, legal_hold)
+			                      is_current, retention_mode, retain_until, legal_hold,
+			                      wrapped_dek)
 			  VALUES (gen_random_uuid(), $1, $2, 1, 'etag', 'GLACIER', 'pending', true,
-			          now() + interval '1 day', 1, 1, true, $3, $4, $5)
+			          now() + interval '1 day', 1, 1, true, $3, $4, $5, 'x'::bytea)
 			  RETURNING id::text`,
 			bucketID, key, mode, retain, tc.hold).Scan(&id); err != nil {
 			t.Fatalf("вставка %s: %v", tc.name, err)
@@ -314,8 +315,10 @@ func TestMarkerStateConstraints(t *testing.T) {
 		_, err := m.Pool.Exec(ctx,
 			`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class,
 			                      state, landing, online_until, tenant_id, pool_id,
-			                      is_current, is_delete_marker, is_null_version, retired_at)
-			  VALUES ($1,$2,$3,0,'','GLACIER',$4,false,now(),1,1,false,$5,false,$6)`,
+			                      is_current, is_delete_marker, is_null_version, retired_at,
+			                      wrapped_dek)
+			  VALUES ($1,$2,$3,0,'','GLACIER',$4,false,now(),1,1,false,$5,false,$6,
+			          CASE WHEN $5 THEN NULL ELSE 'x'::bytea END)`,
 			uuid.New(), bucketID, fmt.Sprintf("k%d", i), tc.state, tc.marker, tc.retired)
 		if tc.wantOK && err != nil {
 			t.Errorf("%s: вставка отклонена (%v), а должна пройти", tc.name, err)

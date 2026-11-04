@@ -21,6 +21,7 @@ import (
 	"github.com/versity/versitygw/s3response"
 
 	"github.com/vladsimachkov/tapegw/internal/config"
+	"github.com/vladsimachkov/tapegw/internal/keys"
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	tapegwerr "github.com/vladsimachkov/tapegw/internal/s3err"
 	"github.com/vladsimachkov/tapegw/internal/spool"
@@ -35,6 +36,10 @@ type TapeGW struct {
 	meta  *meta.Meta
 	cfg   *config.Config
 	spool *spool.Spool
+	// keys — хранилище ключей шифрования (ADR-0014). Шифрование обязательное:
+	// nil на этом месте не означает «пишем открытым текстом», а означает, что
+	//PutObject не сможет записать ни одного байта.
+	keys *keys.Vault
 }
 
 // compile-time check: не даём интерфейсу versitygw тихо уехать вперёд.
@@ -44,12 +49,13 @@ var _ vbackend.Backend = (*TapeGW)(nil)
 // ответить ни на один запрос. spool — дисковый буфер landing; без него PutObject
 // некуда писать, поэтому nil на месте spool означает «объектные операции
 // выключены» и они честно вернут NotImplemented.
-func New(m *meta.Meta, s *spool.Spool, cfg *config.Config) *TapeGW {
+func New(m *meta.Meta, s *spool.Spool, cfg *config.Config, vault *keys.Vault) *TapeGW {
 	return &TapeGW{
 		BackendUnsupported: &vbackend.BackendUnsupported{},
 		meta:               m,
 		cfg:                cfg,
 		spool:              s,
+		keys:               vault,
 	}
 }
 

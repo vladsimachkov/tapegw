@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,8 +18,12 @@ import (
 // (правило 6), и имя файла обязано совпасть со строкой. Путь spool.Path(id)
 // по тому же UUID собирает и mover в другом процессе (ADR-0007).
 type Object struct {
-	ID           uuid.UUID
-	BucketID     int64
+	ID       uuid.UUID
+	BucketID int64
+	// TenantID — владелец строки (денормализация из миграции 0005). Нужен
+	// шифрованию: DEK оборачивают ключом тенанта объекта, и доставать его из
+	// buckets вторым запросом было бы дорого на каждом GET.
+	TenantID     int64
 	Key          string
 	Size         int64
 	ETag         string
@@ -44,6 +49,10 @@ type Object struct {
 	// бакете без версий или на приостановленном). По ней чтение решает, что
 	// положить в x-amz-version-id: id или "null".
 	IsNullVersion bool
+	// WrappedDEK — обёртка ключа шифрования этой версии (ADR-0014). Пустая у
+	// маркера удаления: тела нет. Остальные версии обязаны её иметь — это
+	// закреплено CHECK в миграции 0013, а не договорённостью.
+	WrappedDEK []byte
 	// RetentionMode/RetainUntil/LegalHold — Object Lock версии. nil/false —
 	// настройки нет; HEAD и GET обязаны отдавать их, иначе клиент не узнает,
 	// что объект защищён, и не сможет проверить себя.
@@ -105,6 +114,11 @@ type PutObjectInput struct {
 	RetainUntil   *time.Time
 	// LegalHold — x-amz-object-lock-legal-hold: ON на момент записи.
 	LegalHold bool
+	// WrappedDEK — обёртка ключа шифрования тела (ADR-0014). Обязательна для
+	// версии с данными: CHECK objects_dek_present из миграции 0013 не даст
+	// вставить строку без неё, и путь, который про ключ забыл, упадёт здесь, а
+	// не отдаст позже открытые байты.
+	WrappedDEK []byte
 }
 
 // PutObject вставляет объект и делает его текущим, вытесняя прежнюю версию
@@ -276,22 +290,21 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 		// is_null_version ставится по состоянию бакета: пока версии не включены,
 		// у объекта versionId = "null" в смысле AWS. Именно эта пометка потом
 		// позволяет записи в suspended-бакет заменить предыдущую null-версию.
-		created, err := tx.Query(ctx,
-			`INSERT INTO objects (
-			    id, bucket_id, key, is_current, size, etag, checksums,
-			    content_type, user_meta, acl, tags, storage_class,
-			    state, landing, online_until, tenant_id, pool_id, is_null_version,
-			    retention_mode, retain_until, legal_hold)
-			 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12,$13,$14,$15,
-			         $16::retention_mode,$17,$18)
-			 RETURNING id, bucket_id, key, size, etag, checksums, content_type,
-			           user_meta, acl, tags, storage_class, state, landing,
-			           online_until, created_at, archived_at, is_delete_marker,
-			           is_null_version, retention_mode::text, retain_until, legal_hold`,
+		insertQ := `INSERT INTO objects (
+		    id, bucket_id, key, is_current, size, etag, checksums,
+		    content_type, user_meta, acl, tags, storage_class,
+		    state, landing, online_until, tenant_id, pool_id, is_null_version,
+		    retention_mode, retain_until, legal_hold, wrapped_dek)
+		 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12,$13,$14,$15,
+		         $16::retention_mode,$17,$18,$19)
+		 RETURNING ` + objectCols("")
+
+		created, err := tx.Query(ctx, insertQ,
 			in.ID, bucketID, in.Key, in.Size, in.ETag, checksums,
 			in.ContentType, userMeta, in.ACL, tags, in.StorageClass,
 			in.OnlineUntil, bucketTenant, DefaultPoolID, nullVersion,
-			retentionModeArg(in.RetentionMode), in.RetainUntil, in.LegalHold)
+			retentionModeArg(in.RetentionMode), in.RetainUntil, in.LegalHold,
+			wrappedDEKArg(in.WrappedDEK))
 		if err != nil {
 			return fmt.Errorf("insert object %s/%s: %w", in.Bucket, in.Key, err)
 		}
@@ -322,11 +335,7 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 // GetObject возвращает текущую строку объекта того же тенанта, что и бакет.
 func (m *Meta) GetObject(ctx context.Context, tenant TenantID, bucket, key string) (*Object, error) {
 	q, args := withTenantCol(
-		`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
-		        o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
-		        o.state, o.landing, o.online_until, o.created_at, o.archived_at,
-		        o.is_delete_marker, o.is_null_version,
-		        o.retention_mode::text, o.retain_until, o.legal_hold
+		`SELECT `+objectCols("o")+`
 		   FROM objects o
 		   JOIN buckets b ON b.id = o.bucket_id
 		  WHERE b.name = $1 AND b.deleted_at IS NULL
@@ -341,11 +350,7 @@ func (m *Meta) GetObject(ctx context.Context, tenant TenantID, bucket, key strin
 // ради того, чтобы такие выборки не требовали JOIN с buckets.
 func (m *Meta) GetObjectByID(ctx context.Context, tenant TenantID, id uuid.UUID) (*Object, error) {
 	q, args := withTenantCol(
-		`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
-		        o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
-		        o.state, o.landing, o.online_until, o.created_at, o.archived_at,
-		        o.is_delete_marker, o.is_null_version,
-		        o.retention_mode::text, o.retain_until, o.legal_hold
+		`SELECT `+objectCols("o")+`
 		   FROM objects o WHERE o.id = $1`,
 		"o.tenant_id", tenant, id)
 	row := m.Pool.QueryRow(ctx, q, args...)
@@ -359,6 +364,43 @@ func retentionModeArg(mode string) any {
 		return nil
 	}
 	return mode
+}
+
+// objectColumns — порядок колонок, который читает scanObjectRow.
+//
+// Список один на все запросы намеренно. Четыре места с перечислением колонок
+// разъезжаются молча: ошибка проявляется либо как «неверный тип в Scan», либо —
+// что хуже — как прочитанный NULL там, где данные есть.
+var objectColumns = []string{
+	"id", "bucket_id", "tenant_id", "key", "size", "etag", "checksums",
+	"content_type", "user_meta", "acl", "tags", "storage_class",
+	"state", "landing", "online_until", "created_at", "archived_at",
+	"is_delete_marker", "is_null_version",
+	// ::text — в Go приходит имя значения enum, а не сам enum.
+	"retention_mode::text AS retention_mode", "retain_until", "legal_hold",
+	"wrapped_dek",
+}
+
+// objectCols — тот же список с префиксом alias. Пустой alias — без префикса:
+// так нужно INSERT ... RETURNING.
+func objectCols(alias string) string {
+	if alias == "" {
+		return strings.Join(objectColumns, ", ")
+	}
+	parts := make([]string, len(objectColumns))
+	for i, c := range objectColumns {
+		parts[i] = alias + "." + c
+	}
+	return strings.Join(parts, ", ")
+}
+
+// wrappedDEKArg: пустая обёртка — это NULL (маркер удаления), а не пустой bytea.
+// Разница важна для CHECK из миграции 0013.
+func wrappedDEKArg(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 func scanObject(row pgx.Row) (*Object, error) {
@@ -378,11 +420,11 @@ func scanObjectRow(src interface {
 		onlineUntil                    time.Time
 	)
 	err := src.Scan(
-		&o.ID, &o.BucketID, &key, &o.Size, &etag, &checksums,
+		&o.ID, &o.BucketID, &o.TenantID, &key, &o.Size, &etag, &checksums,
 		&o.ContentType, &userMeta, &o.ACL, &tags, &storageClass,
 		&state, &o.Landing, &onlineUntil, &o.CreatedAt, &o.ArchivedAt,
 		&o.IsDeleteMarker, &o.IsNullVersion,
-		&o.RetentionMode, &o.RetainUntil, &o.LegalHold)
+		&o.RetentionMode, &o.RetainUntil, &o.LegalHold, &o.WrappedDEK)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

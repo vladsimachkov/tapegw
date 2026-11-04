@@ -368,3 +368,25 @@ func escapeLike(s string) string {
 	}
 	return string(out)
 }
+
+// BucketTenantID — id тенанта-владельца бакета, с проверкой стража.
+//
+// Нужен шифрованию: DEK оборачивают ключом тенанта БАКЕТА, а не тенанта учётки
+// запроса. Разница не косметика: root проходит стража как обход (у него вообще
+// нет ProjectID), и если бы ключ брали от учётки, объекты root шифровались бы
+// ключом «-1», которого в tenants нет.
+//
+// Под обходом возвращается владелец бакета, какой бы он ни был; под обычным
+// ключом — только своего тенанта, иначе чужой бакет выдал бы свой id.
+func (m *Meta) BucketTenantID(ctx context.Context, tenant TenantID, name string) (int64, error) {
+	q, args := withTenant(
+		`SELECT tenant_id FROM buckets WHERE name = $1 AND deleted_at IS NULL`, tenant, name)
+	var id int64
+	if err := m.Pool.QueryRow(ctx, q, args...).Scan(&id); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, fmt.Errorf("tenant of bucket %q: %w", name, err)
+	}
+	return id, nil
+}

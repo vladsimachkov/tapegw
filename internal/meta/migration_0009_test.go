@@ -103,9 +103,10 @@ func TestMigration0009VersionSeq(t *testing.T) {
 		cur := i == 2
 		if err := m.Pool.QueryRow(ctx,
 			`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class,
-			                      state, landing, online_until, tenant_id, pool_id, is_current)
+			                      state, landing, online_until, tenant_id, pool_id,
+		                      is_current, wrapped_dek)
 			  VALUES ($1, $2, $3, 1, 'etag', 'GLACIER', 'pending', true,
-			          now() + interval '1 day', 1, 1, $4)
+			          now() + interval '1 day', 1, 1, $4, 'x'::bytea)
 			  RETURNING version_seq`,
 			uuid.New(), bucketID, key, cur).Scan(&seq); err != nil {
 			t.Fatalf("вставка версии %d: %v", i, err)

@@ -29,15 +29,20 @@ type Writer struct {
 // NewWriter — поток для записи тела версии. part = 0 для обычного PUT, номер
 // части для multipart (ADR-0014: номер части входит в nonce).
 //
-// Ключ не копируется и не обнуляется: он принадлежит вызывающему, и тому он
-// ещё нужен после Close — обёрнутый DEK кладётся в строку объекта.
+// Ключ копируется внутрь, поэтому вызывающий волен обнулить свой массив сразу
+// после записи: обёрнутый DEK он уже получил, а писателю ключ больше не нужен.
 func NewWriter(dst io.Writer, key []byte, version uuid.UUID, part uint32) (*Writer, error) {
 	if len(key) != KeySize {
 		return nil, fmt.Errorf("encrypt: ключ %d байт, нужно %d", len(key), KeySize)
 	}
+	// Ключ копируется: Writer переживает вызов NewWriter, и обнуление ключа
+	// вызывающим в середине записи разрушило бы шифрование так же тихо, как и
+	// в Reader.
+	own := make([]byte, KeySize)
+	copy(own, key)
 	return &Writer{
 		dst:     dst,
-		key:     key,
+		key:     own,
 		version: version,
 		part:    part,
 		buf:     make([]byte, 0, SegmentSize),
@@ -99,6 +104,7 @@ func (w *Writer) Close() error {
 	}
 	err := w.flush()
 	w.closed = true
+	Zero(w.key)
 	Zero(w.tmp)
 	return err
 }
