@@ -3,7 +3,10 @@ package meta_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/testdb"
@@ -84,10 +87,10 @@ func TestChangeBucketOwnerAndList(t *testing.T) {
 	mustBucket(t, m, "b1")
 	mustBucket(t, m, "b2")
 
-	if err := m.ChangeBucketOwner(ctx, testTenant, "b2", "userplus", []byte(`{"Owner":"userplus","Grantees":[]}`)); err != nil {
+	if err := m.ChangeBucketOwner(ctx, testTenant, "b2", "userplus", 1, []byte(`{"Owner":"userplus","Grantees":[]}`)); err != nil {
 		t.Fatalf("ChangeBucketOwner: %v", err)
 	}
-	if err := m.ChangeBucketOwner(ctx, testTenant, "ghost", "userplus", nil); !errors.Is(err, meta.ErrNotFound) {
+	if err := m.ChangeBucketOwner(ctx, testTenant, "ghost", "userplus", 1, nil); !errors.Is(err, meta.ErrNotFound) {
 		t.Fatalf("чужой бакет: получили %v, хотели ErrNotFound", err)
 	}
 
@@ -104,5 +107,126 @@ func TestChangeBucketOwnerAndList(t *testing.T) {
 	}
 	if all[1].Name != "b2" || all[1].Owner != "userplus" {
 		t.Errorf("второй = %+v, хотели b2/userplus", all[1])
+	}
+}
+
+// Перенос бакета между тенантами (план PR#2b).
+//
+// Пустой — переносится; в бакете что-то осталось — отказ. «Осталось» считается
+// по всем строкам objects (старые версии, delete markers, deleting) и по
+// незавершённым uploads: иначе в чужой тенант уезжают хвосты, которые не видно
+// списком, но которые потом воскресают.
+func TestChangeBucketOwnerMovesTenant(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+
+	// Тенант-получатель: справочник в тестовой базе содержит только default.
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO tenants (id, name, pool_id) VALUES (77, 't77', 1)
+		  ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("tenant 77: %v", err)
+	}
+	const tenant77 = int64(77)
+
+	mustBucket(t, m, "mv-empty")
+	mustBucket(t, m, "mv-full")
+
+	// 1. Пустой бакет переезжает.
+	if err := m.ChangeBucketOwner(ctx, testTenant, "mv-empty", "bob", tenant77,
+		[]byte(`{"Owner":"bob","Grantees":[]}`)); err != nil {
+		t.Fatalf("перенос пустого: %v", err)
+	}
+	var got int64
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT tenant_id FROM buckets WHERE name = 'mv-empty'`).Scan(&got); err != nil {
+		t.Fatalf("tenant_id: %v", err)
+	}
+	if got != tenant77 {
+		t.Errorf("tenant_id = %d, хотели %d — новый владелец упрётся в стража", got, tenant77)
+	}
+
+	// 2. Бакет с объектом не переезжает.
+	if _, err := m.PutObject(ctx, testTenant, meta.PutObjectInput{
+		Bucket: "mv-full", Key: "k", Size: 3,
+		OnlineUntil: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	if err := m.ChangeBucketOwner(ctx, testTenant, "mv-full", "bob", tenant77, nil); !errors.Is(err, meta.ErrBucketNotEmpty) {
+		t.Errorf("перенос непустого: %v, хотели ErrBucketNotEmpty", err)
+	}
+
+	// 3. Незавершённая multipart-загрузка — тоже «не пусто».
+	mustBucket(t, m, "mv-mpu")
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO uploads (upload_id, bucket_id, key, meta)
+		 SELECT 'u1', id, 'mp', '{}'::jsonb FROM buckets WHERE name = 'mv-mpu'`); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if err := m.ChangeBucketOwner(ctx, testTenant, "mv-mpu", "bob", tenant77, nil); !errors.Is(err, meta.ErrBucketNotEmpty) {
+		t.Errorf("перенос бакета с незавершённой загрузкой: %v, хотели ErrBucketNotEmpty", err)
+	}
+
+	// 4. Перенос «в тот же тенант» пустоты не требует: хвосты остаются там же,
+	// где были, а владелец меняется.
+	if err := m.ChangeBucketOwner(ctx, testTenant, "mv-mpu", "bob", 1, nil); err != nil {
+		t.Fatalf("перенос в свой тенант не должен требовать пустоты: %v", err)
+	}
+}
+
+// Гонка «параллельный PUT против смены владельца» (план PR#2b).
+//
+// ChangeBucketOwner берёт бакет FOR UPDATE, PUT — FOR SHARE (ADR-0005), поэтому
+// третий исход невозможен: либо смена отклонена (объект успел), либо PUT упал
+// по тенанту. Оба успеха одновременно означали бы, что бакет уехал в чужой
+// тенант вместе со свежим объектом текущего.
+func TestChangeOwnerRacesWithPut(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO tenants (id, name, pool_id) VALUES (78, 't78', 1)
+		  ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("tenant 78: %v", err)
+	}
+
+	for round := 0; round < 20; round++ {
+		bucket := fmt.Sprintf("race-%02d", round)
+		mustBucket(t, m, bucket)
+
+		var putErr, chgErr error
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, putErr = m.PutObject(ctx, testTenant, meta.PutObjectInput{
+				Bucket: bucket, Key: "k", Size: 1,
+				OnlineUntil: time.Now().Add(time.Hour),
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			chgErr = m.ChangeBucketOwner(ctx, testTenant, bucket, "bob", 78, nil)
+		}()
+		close(start)
+		wg.Wait()
+
+		if putErr == nil && chgErr == nil {
+			t.Fatalf("%s: оба прошли — бакет уехал в чужой тенант вместе со свежим объектом", bucket)
+		}
+		if putErr != nil && chgErr != nil {
+			// Допустимо: PUT не дождался блокировки и попал уже в чужой
+			// тенант, а смена увидила строку objects из откатившейся попытки?
+			// Нет — откатившаяся транзакция не оставляет строк. Значит отказ
+			// смены обязан быть именно «не пусто».
+			if !errors.Is(chgErr, meta.ErrBucketNotEmpty) {
+				t.Fatalf("%s: смена отказала %v при PUT %v", bucket, chgErr, putErr)
+			}
+		}
 	}
 }

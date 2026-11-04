@@ -1,6 +1,7 @@
 package backend_test
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -23,6 +24,21 @@ func TestChangeBucketOwnerReassignsRights(t *testing.T) {
 	be, m, _ := newBackend(t)
 	// Смена владельца — admin API, под администратором и работаем.
 	ctx := adminCtx()
+
+	// Новый владелец обязан существовать в accounts: с PR#2b его тенант берётся
+	// оттуда, а несуществующему ключу бакет не передаётся. Тенант — клиентский:
+	// не-admin в системном тенанте запрещён CHECK из миграции 0007.
+	if _, err := m.Pool.Exec(context.Background(),
+		`INSERT INTO tenants (id, name, pool_id) VALUES (2, 'client-po', 1)
+		  ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("tenant 2: %v", err)
+	}
+	if _, err := m.Pool.Exec(context.Background(),
+		`INSERT INTO accounts (access_key, secret_wrapped, role, tenant_id, tenant_system)
+		  VALUES ('userplus', NULL, 'userplus', 2, false)
+		  ON CONFLICT (access_key) DO NOTHING`); err != nil {
+		t.Fatalf("account userplus: %v", err)
+	}
 
 	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr("own")}, nil); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
@@ -74,7 +90,7 @@ func TestChangeBucketOwnerReassignsRights(t *testing.T) {
 	}
 
 	// 3. Инвариант: buckets.owner и acl.Owner не расходятся.
-	bucket, err := m.GetBucket(ctx, meta.NewTenant(testProjectID), "own")
+	bucket, err := m.GetBucket(ctx, meta.NewTenant(2), "own")
 	if err != nil {
 		t.Fatalf("GetBucket: %v", err)
 	}
