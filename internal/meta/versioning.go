@@ -50,3 +50,142 @@ func (m *Meta) BucketVersioningState(ctx context.Context, tenant TenantID, bucke
 	}
 	return state, nil
 }
+
+// Ошибки переходов версионирования и лока. Каждая соответствует правилу AWS,
+// которое нельзя выразить схемой: схема не видит разницы между «не меняли» и
+// «попытались выключить».
+var (
+	// ErrSuspendWithLock — в бакете с Object Lock версионирование нельзя
+	// приостановить: версии под retention должны читаться всегда.
+	ErrSuspendWithLock = errors.New("meta: cannot suspend versioning with object lock")
+	// ErrSuspendNeverEnabled — приостанавливать нечего: версий никогда не было.
+	ErrSuspendNeverEnabled = errors.New("meta: versioning was never enabled")
+	// ErrLockNeedsVersioning — Object Lock включается только поверх включённого
+	// версионирования: без версий нет и неизменяемости.
+	ErrLockNeedsVersioning = errors.New("meta: object lock requires versioning enabled")
+	// ErrLockCannotDisable — Object Lock включается один раз и навсегда. Это
+	// обещание неизменяемости, и снять его задним числом нельзя.
+	ErrLockCannotDisable = errors.New("meta: object lock cannot be disabled")
+	// ErrNotConfigured — бакет есть, настройки нет. Отдельно от ErrNotFound:
+	// иначе «бакета нет» начнёт выглядеть как «не сконфигурировано», и проверка
+	// неизменяемости пойдёт по пути «настройки нет».
+	ErrNotConfigured = errors.New("meta: not configured")
+)
+
+// SetBucketVersioning меняет версионирование бакета.
+//
+// Переходы:
+//
+//	unversioned → enabled    — можно
+//	unversioned → suspended  — нельзя: приостанавливать нечего
+//	enabled     → suspended  — можно, если Object Lock не включён
+//	suspended   → enabled    — можно
+//	в любой → unversioned    — нельзя никогда (API такого статуса и не шлёт)
+//
+// Повторный вызов с тем же статусом — успех, а не ошибка: клиент мог отправить
+// конфигурацию дважды, AWS на это отвечает 200.
+//
+// Бакет берётся FOR UPDATE: состояние и проверка «лок включён» должны быть
+// атомарны, иначе параллельное включение лока пропустило бы запрет на
+// приостановку.
+func (m *Meta) SetBucketVersioning(ctx context.Context, tenant TenantID, bucket, status string) error {
+	return m.inTx(ctx, func(tx pgx.Tx) error {
+		var (
+			id     int64
+			cur    string
+			lockOn bool
+		)
+		q, args := withTenant(
+			`SELECT id, versioning, object_lock_enabled FROM buckets
+			  WHERE name = $1 AND deleted_at IS NULL`, tenant, bucket)
+		err := tx.QueryRow(ctx, q+` FOR UPDATE`, args...).Scan(&id, &cur, &lockOn)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock bucket %q: %w", bucket, err)
+		}
+
+		if status == VersioningSuspended {
+			if lockOn {
+				return ErrSuspendWithLock
+			}
+			if cur == VersioningUnversioned {
+				return ErrSuspendNeverEnabled
+			}
+		}
+		if cur == status {
+			return nil
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE buckets SET versioning = $2 WHERE id = $1`, id, status); err != nil {
+			return fmt.Errorf("set versioning of %q: %w", bucket, err)
+		}
+		return nil
+	})
+}
+
+// SetObjectLockConfig включает Object Lock и (опционально) задаёт правило
+// retentions по умолчанию. enabled=false принимается только до включения:
+// выключить лок нельзя ни при каких обстоятельствах.
+//
+// config — байты конфигурации ровно в том виде, в котором их передал
+// versitygw; отдавать наружу мы обязаны ими же.
+func (m *Meta) SetObjectLockConfig(ctx context.Context, tenant TenantID,
+	bucket string, enabled bool, config []byte) error {
+
+	return m.inTx(ctx, func(tx pgx.Tx) error {
+		var (
+			id         int64
+			versioning string
+			lockOn     bool
+		)
+		q, args := withTenant(
+			`SELECT id, versioning, object_lock_enabled FROM buckets
+			  WHERE name = $1 AND deleted_at IS NULL`, tenant, bucket)
+		err := tx.QueryRow(ctx, q+` FOR UPDATE`, args...).Scan(&id, &versioning, &lockOn)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock bucket %q: %w", bucket, err)
+		}
+
+		if !enabled {
+			if lockOn {
+				return ErrLockCannotDisable
+			}
+			return ErrNotConfigured
+		}
+		if versioning != VersioningEnabled {
+			return ErrLockNeedsVersioning
+		}
+
+		if _, err := tx.Exec(ctx,
+			`UPDATE buckets SET object_lock_enabled = true, lock_config = $2 WHERE id = $1`,
+			id, string(config)); err != nil {
+			return fmt.Errorf("set lock config of %q: %w", bucket, err)
+		}
+		return nil
+	})
+}
+
+// GetObjectLockConfig отдаёт конфигурацию байт в байт. ErrNotConfigured —
+// бакет есть, лока нет; это не ErrNotFound, и подменять их нельзя.
+func (m *Meta) GetObjectLockConfig(ctx context.Context, tenant TenantID, bucket string) ([]byte, error) {
+	var cfg *string
+	q, args := withTenant(
+		`SELECT lock_config FROM buckets WHERE name = $1 AND deleted_at IS NULL`,
+		tenant, bucket)
+	err := m.Pool.QueryRow(ctx, q, args...).Scan(&cfg)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock config of %q: %w", bucket, err)
+	}
+	if cfg == nil || *cfg == "" {
+		return nil, ErrNotConfigured
+	}
+	return []byte(*cfg), nil
+}
