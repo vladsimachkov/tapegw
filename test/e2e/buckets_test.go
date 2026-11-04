@@ -67,6 +67,9 @@ func userClient(t *testing.T) *s3.Client {
 	t.Helper()
 	access, secret := os.Getenv("TAPEGW_E2E_USER_ACCESS"), os.Getenv("TAPEGW_E2E_USER_SECRET")
 	if access == "" || secret == "" {
+		if os.Getenv("TAPEGW_REQUIRE_ACCESS_TESTS") == "1" {
+			t.Fatal("TAPEGW_E2E_USER_ACCESS / TAPEGW_E2E_USER_SECRET не заданы, а доступ в CI обязателен")
+		}
 		t.Skip("TAPEGW_E2E_USER_ACCESS / TAPEGW_E2E_USER_SECRET не заданы — пропускаем проверку доступа")
 	}
 	return clientWith(t, access, secret)
@@ -83,6 +86,9 @@ func ownerClient(t *testing.T) *s3.Client {
 	t.Helper()
 	access, secret := os.Getenv("TAPEGW_E2E_OWNER_ACCESS"), os.Getenv("TAPEGW_E2E_OWNER_SECRET")
 	if access == "" || secret == "" {
+		if os.Getenv("TAPEGW_REQUIRE_ACCESS_TESTS") == "1" {
+			t.Fatal("TAPEGW_E2E_OWNER_ACCESS / TAPEGW_E2E_OWNER_SECRET не заданы, а доступ в CI обязателен")
+		}
 		t.Skip("TAPEGW_E2E_OWNER_ACCESS / TAPEGW_E2E_OWNER_SECRET не заданы — пропускаем проверку доступа")
 	}
 	return clientWith(t, access, secret)

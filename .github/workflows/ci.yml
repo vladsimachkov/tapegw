@@ -141,35 +141,28 @@ jobs:
           if [ -z "${TAPEGW_PG_PORT}" ]; then
             echo "раннер не вернул порт postgres"; exit 1
           fi
-          mkdir -p /tmp/spool/landing /tmp/spool/cache /tmp/iam
-          # Файловый IAM: без него versitygw живёт в режиме одной учётки и
-          # знает только root, а проверки доступа на root не проверяются вовсе
-          # (root и admin идут мимо политик и ACL).
+          mkdir -p /tmp/spool/landing /tmp/spool/cache
+          # Учётки — из Postgres (iam.kek_file), а не из s3.iam_dir: по плану T1
+          # файловый IAM из конфига уходит, и держать рядом второй стенд означало
+          # бы, что основной e2e не трогает IAMService вообще.
           #
-          # Обе учётки — в тенанте 2, клиентском (ADR-0018). В системном тенанте
-          # 1 проверять нечего: страж (ADR-0017) отказывает не-admin учётке
-          # системного тенанта, и тест «политика разрешает» проверял бы отказ
-          # стража вместо политики.
-          #
-          # Роли разные намеренно: бакет создаёт userplus — единственная не-admin
-          # роль, которой versitygw разрешает CreateBucket без identity-политик
-          # (access-control.go:597, для бэкендов без PolicyEvaluator). Обычный
-          # user бакет создать не может, и его права берутся только из политики
-          # бакета — это и есть проверяемый сценарий клиента: два ключа одного
-          # тенанта.
-          cat > /tmp/iam/users.json <<'JSON'
-          {"accessAccounts":{
-            "userplus":{"access":"userplus","secret":"usersecret","role":"userplus","userID":1001,"groupID":1001,"projectID":2},
-            "userplain":{"access":"userplain","secret":"userplainsecret","role":"user","userID":1002,"groupID":1002,"projectID":2}
-          }}
-          JSON
+          # Файл KEK: JSON вида {"1": "<base64>", ...}, права строго 0600/0400 —
+          # LoadKeyRing иначе отказывается. Версий две сразу: активна 1, вторая
+          # нужна шагу ротации.
+          umask 077
+          printf '{"1":"%s","2":"%s"}\n' \
+            "$(head -c 32 /dev/urandom | base64 -w0)" \
+            "$(head -c 32 /dev/urandom | base64 -w0)" > /tmp/kek.json
+          chmod 600 /tmp/kek.json
           # Heredoc без кавычек: нужен подстанов port'а. В теле других $
           # нет, и добавлять их сюда не следует — иначе начнут раскрываться.
           cat > /tmp/ci.yaml <<YAML
           s3:
             listen: [":7070"]
-            iam_dir: /tmp/iam
             health_path: /health
+          iam:
+            kek_file: /tmp/kek.json
+            kek_version: 1
           db:
             dsn: postgres://tapegw:tapegw@localhost:${TAPEGW_PG_PORT}/phobos?search_path=tapegw_ci
           spool:
@@ -195,13 +188,28 @@ jobs:
       # образах раннеров меняется от версии к версии, а docker есть всегда —
       # через него и поднимаются services. Контейнер ищется по опубликованному
       # порту, который раннер вернул в job.services.postgres.ports.
-      - name: seed tenant 2
+      # Тенанты и учётки стенда. Строки о клиентских тенантах — это данные, а не
+      # схема: миграция заводит только системный тенант 1, админ-API для
+      # тенантов появится на T4. Шаг идёт ПОСЛЕ старта tapegw, потому что схему
+      # tapegw_ci создаёт применение миграций на старте процесса.
+      #
+      # Учётки заводятся tapegw-iamctl, а не SQL: секрет должен заворачиваться тем
+      # же кольцом KEK и с той же AAD, что читает tapegw. SQL-сид мог бы
+      # вставить нечитаемую обёртку, и стенд молча жил бы без учёток.
+      #
+      # Роли разные намеренно: бакет создаёт userplus — единственная не-admin роль,
+      # которой versitygw разрешает CreateBucket без identity-политик
+      # (access-control.go:597). Обычный user берёт права только из политики
+      # бакета — это и есть сценарий клиента: два ключа одного тенанта.
+      #
+      # usert3 — ключ ВТОРОГО клиентского тенанта: он нужен тесту, где единственный
+      # барьер — страж тенанта (находка 1 к PR#2a).
+      - name: seed tenants and accounts
         env:
+          TAPEGW_ROOT_ACCESS: ci-access
+          TAPEGW_ROOT_SECRET: ci-secret
           TAPEGW_PG_PORT: ${{ job.services.postgres.ports[5432] }}
         run: |
-          if [ -z "${TAPEGW_PG_PORT}" ]; then
-            echo "раннер не вернул порт postgres"; exit 1
-          fi
           cid=$(docker ps -q --filter "publish=${TAPEGW_PG_PORT}" | head -1)
           if [ -z "${cid}" ]; then
             echo "не нашли контейнер postgres на порту ${TAPEGW_PG_PORT}"; exit 1
@@ -209,7 +217,14 @@ jobs:
           docker exec "$cid" psql -v ON_ERROR_STOP=1 -U tapegw -d phobos -c \
             "SET search_path TO tapegw_ci;
              INSERT INTO tenants (id, name, status, pool_id)
-             VALUES (2, 'ci-client', 'active', 1) ON CONFLICT (id) DO NOTHING"
+             VALUES (2, 'ci-client', 'active', 1), (3, 'ci-client-2', 'active', 1)
+             ON CONFLICT (id) DO NOTHING"
+          for spec in "userplus:usersecret:userplus:2" "userplain:userplainsecret:user:2" "usert3:usert3secret:user:3"; do
+            IFS=: read -r acc sec rol ten <<< "$spec"
+            go run ./cmd/tapegw-iamctl -config /tmp/ci.yaml -cmd create \
+              -access "$acc" -secret "$sec" -role "$rol" -tenant "$ten"
+          done
+          go run ./cmd/tapegw-iamctl -config /tmp/ci.yaml -cmd list
 
       - name: e2e
         env:
@@ -225,6 +240,20 @@ jobs:
           # системного тенанта.
           TAPEGW_E2E_OWNER_ACCESS: userplus
           TAPEGW_E2E_OWNER_SECRET: usersecret
+          # Ключ ВТОРОГО клиентского тенанта: нужен тесту, где единственный
+          # барьер — страж (находка 1 к PR#2a).
+          TAPEGW_E2E_FOREIGN_ACCESS: usert3
+          TAPEGW_E2E_FOREIGN_SECRET: usert3secret
+          # Прямое подключение к базе стенда: тесту нужно записать ACL и
+          # политику мимо API.
+          TAPEGW_E2E_DSN: postgres://tapegw:tapegw@localhost:${{ job.services.postgres.ports[5432] }}/phobos?search_path=tapegw_ci
+          # В CI тесты доступа не имеют права скипаться: молчаливый Skip —
+          # это зелёный прогон, который ничего не проверяет (на PR#2a на
+          # этом и поймались).
+          TAPEGW_REQUIRE_ACCESS_TESTS: "1"
+          # Кольцо KEK стенда: нужно тесту отзыва ключа на живом шлюзе.
+          TAPEGW_E2E_KEK_FILE: /tmp/kek.json
+          TAPEGW_E2E_KEK_VERSION: "1"
         run: go test -count=1 ./test/e2e -v
 
   # Сборка с тегом phobos требует EL9 и исходников Phobos — это стенд ci-dir,
