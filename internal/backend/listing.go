@@ -112,6 +112,16 @@ func commonPrefixes(res meta.ListResult) []types.CommonPrefix {
 // Рецепт повторяет versitygw дословно: url.QueryEscape плюс те же замены, чтобы
 // «/» и «*» остались как есть, а «~» экранировалась.
 
+// encodingRequested — запрошено ли кодирование. Сравнение нечувствительно к
+// регистру: versitygw для v1/v2 принимает и «uRl» (есть такой случай в его
+// тестах), а для ListObjectVersions контроллер параметр вообще не разбирает —
+// то есть регистр доходит до нас как есть. Чувствительное сравнение молча
+// вернула бы «URL» эхом без кодирования, и клиент стал бы декодировать то, что
+// мы не кодировали.
+func encodingRequested(et types.EncodingType) bool {
+	return strings.EqualFold(string(et), string(types.EncodingTypeUrl))
+}
+
 // s3KeyNameEscaper — та же таблица замен, что у versitygw.
 var s3KeyNameEscaper = strings.NewReplacer("%2F", "/", "%2A", "*", "~", "%7E")
 
@@ -351,7 +361,10 @@ func (t *TapeGW) ListObjectVersions(ctx context.Context,
 			out.NextVersionIdMarker = strPtr(res.NextVersionID)
 		}
 	}
-	if input.EncodingType == types.EncodingTypeUrl {
+	if encodingRequested(input.EncodingType) {
+		// Возвращаем нормализованное значение: клиент, приславший «URL», обязан
+		// увидеть в ответе то, что понимает botocore, а не собственный регистр.
+		out.EncodingType = types.EncodingTypeUrl
 		encodeVersionsResult(&out)
 	}
 	return out, nil

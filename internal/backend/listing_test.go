@@ -415,3 +415,34 @@ func TestListObjectsV1V2DoNotEncodeInBackend(t *testing.T) {
 		t.Errorf("ListObjectsV2 закодировал ключ сам: %v", objectKeys(v2.Contents))
 	}
 }
+
+// encoding-type сравнивается без учёта регистра: для v1/v2 versitygw принимает
+// и «uRl», а для версий контроллер параметр не разбирает — регистр доходит до
+// нас. Чувствительное сравнение вернула бы «URL» эхом без кодирования, и клиент
+// стал бы декодировать то, что мы не кодировали.
+func TestListObjectVersionsEncodingTypeCase(t *testing.T) {
+	be, m, _ := newBackend(t)
+	ctx := ownerCtx("root-owner")
+	const bucket = "caseenc"
+
+	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr(bucket)}, nil); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	insertVersion(t, m, bucket, "a+b", true, false, false, 1)
+
+	res, err := be.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: ptr(bucket), EncodingType: stypes.EncodingType("URL"),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	if res.EncodingType != stypes.EncodingTypeUrl {
+		t.Errorf("EncodingType = %q, хотели нормализованное url", res.EncodingType)
+	}
+	if len(res.Versions) != 1 {
+		t.Fatalf("версий %d, хотели 1", len(res.Versions))
+	}
+	if got := *res.Versions[0].Key; got != "a%2Bb" {
+		t.Errorf("ключ при encoding-type=URL закодирован как %q, хотели a%%2Bb", got)
+	}
+}
