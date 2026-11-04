@@ -130,15 +130,35 @@ func DropSchema(t *testing.T, schema string) {
 // Схема своя на пакет, поэтому TRUNCATE безопасен.
 func Clean(t *testing.T, m *meta.Meta) {
 	t.Helper()
-	// accounts тоже: тесты вставляют учётки с фиксированными access_key, и
-	// между прогонами в одной схеме они накапливаются — второй прогон падал на
-	// accounts_pkey. Тест, который проходит или падает в зависимости от
-	// предыдущего, подрывает доверие к зелёному CI.
-	_, err := m.Pool.Exec(context.Background(), `
-		TRUNCATE upload_parts, uploads, restores, objects, buckets, accounts CASCADE`)
-	if err != nil {
+	q := "TRUNCATE " + strings.Join(CleanTables, ", ") + " CASCADE"
+	if _, err := m.Pool.Exec(context.Background(), q); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
+}
+
+// CleanTables — таблицы, которые Clean очищает между тестами.
+//
+// Список вынесен в переменную, потому что правило «Clean обязан покрывать все
+// таблицы схемы» на памяти не держится: кто-то добавит миграцию с новой
+// таблицей и список не допишет, а тест начнёт проходить или падать в
+// зависимости от предыдущего прогона — ровно так же, как падал второй прогон на
+// accounts_pkey. TestCleanCoversEveryTable сверяет этот список с pg_tables.
+//
+// Строки сида миграций (тенант 1, пул 1, tenant_usage для тенанта 1) здесь не
+// перечислены: они не мусор, и их проверяет тот же тест отдельно.
+var CleanTables = []string{
+	"upload_parts", "uploads", "object_parts", "restores", "objects", "buckets",
+	"accounts",
+}
+
+// SeedTables — таблицы, которые Clean НЕ чистит: их содержимое создают
+// миграции, и оно нужно тестам (внешние ключи на tenants/pools, квота
+// тенанта 1). Значение — имя колонки, по которой проверяется единственная
+// сид-строка.
+var SeedTables = map[string]string{
+	"tenants":      "id",
+	"pools":        "id",
+	"tenant_usage": "tenant_id",
 }
 
 // PackageSchema даёт схеме имя по имени тестового бинаря: backend.test →
