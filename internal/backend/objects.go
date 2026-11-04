@@ -156,6 +156,15 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		return s3response.PutObjectOutput{}, s3err.GetChecksumBadDigestErr(algo)
 	}
 
+	// Object Lock при записи: явные заголовки либо правило бакета по умолчанию.
+	lockMode, lockUntil, lockHold, err := t.lockAtWrite(ctx, tenant, bucket, &po)
+	if err != nil {
+		if rmErr := t.spool.Remove(id); rmErr != nil {
+			return s3response.PutObjectOutput{}, fmt.Errorf("%w (и спул-файл %s не удалён: %v)", err, id, rmErr)
+		}
+		return s3response.PutObjectOutput{}, err
+	}
+
 	obj, err := t.meta.PutObject(ctx, tenant, meta.PutObjectInput{
 		ID:           id,
 		Bucket:       bucket,
@@ -171,7 +180,10 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		// значение покажет x-amz-restore, и раньше срока вытеснять нельзя (ADR-0003).
 		OnlineUntil: time.Now().Add(t.cfg.Spool.LandingMinRetention),
 		// Авторитетная проверка условий — внутри транзакции, под локом ключа.
-		Precondition: precondition,
+		Precondition:  precondition,
+		RetentionMode: lockMode,
+		RetainUntil:   lockUntil,
+		LegalHold:     lockHold,
 	})
 	if err != nil {
 		// Файл уже на диске, а строки нет. Убираем сразу: janitor разберёт
@@ -255,6 +267,11 @@ func (t *TapeGW) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3
 		// у нас другой класс был бы ложью. См. ADR-0003.
 		StorageClass: types.StorageClassGlacier,
 		VersionId:    strPtr(vid),
+	}
+	if mode, until, hold := lockHeaders(obj); mode != "" || hold != "" {
+		out.ObjectLockMode = mode
+		out.ObjectLockRetainUntilDate = until
+		out.ObjectLockLegalHoldStatus = hold
 	}
 	if slot := headChecksumSlot(out, checksumAlgo(obj.Checksums)); slot != nil {
 		v := obj.Checksums[string(checksumAlgo(obj.Checksums))]
@@ -373,6 +390,11 @@ func (t *TapeGW) buildGetOutput(ctx context.Context, tenant meta.TenantID, obj *
 		Body:          body,
 		StorageClass:  types.StorageClassGlacier,
 		VersionId:     strPtr(vid),
+	}
+	if mode, until, hold := lockHeaders(obj); mode != "" || hold != "" {
+		out.ObjectLockMode = mode
+		out.ObjectLockRetainUntilDate = until
+		out.ObjectLockLegalHoldStatus = hold
 	}
 	if slot := getChecksumSlot(out, checksumAlgo(obj.Checksums)); slot != nil {
 		v := obj.Checksums[string(checksumAlgo(obj.Checksums))]

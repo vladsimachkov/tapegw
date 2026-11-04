@@ -37,10 +37,12 @@ func (t *TapeGW) DeleteObject(ctx context.Context,
 	in := meta.DeleteObjectInput{
 		Bucket: bucket,
 		Key:    key,
-		// BypassGovernanceRetention — явный запрос на обход GOVERNANCE. Право
-		// на него (s3:BypassGovernanceRetention) проверяет versitygw на уровне
-		// авторизации; здесь мы только принимаем сам запрос.
-		BypassGovernance: input.BypassGovernanceRetention != nil && *input.BypassGovernanceRetention,
+		// Запрос на обход GOVERNANCE берётся из заголовка, а не из поля input:
+		// контроллер versitygw поля не заполняет (object-delete.go:221 — в
+		// бэкенд уходят bucket, key, versionId и условия). Право на обход
+		// (s3:BypassGovernanceRetention) проверяет versitygw до вызова, здесь
+		// мы только принимаем сам запрос — допущение записано в ADR-0015.
+		BypassGovernance: bypassGovernanceRequested(ctx),
 	}
 	if input.VersionId != nil {
 		in.VersionID = *input.VersionId
@@ -49,7 +51,10 @@ func (t *TapeGW) DeleteObject(ctx context.Context,
 	res, err := t.meta.DeleteObject(ctx, tenant, in)
 	if err != nil {
 		if errors.Is(err, meta.ErrObjectLocked) {
-			return nil, s3err.GetBucketErr(s3err.ErrAccessDenied, bucket)
+			// Не голый AccessDenied: у versitygw есть ErrObjectLocked с
+			// описанием «объект защищён локом», и клиент по нему понимает,
+			// что делать дальше (обойти GOVERNANCE или смириться).
+			return nil, s3err.GetBucketErr(s3err.ErrObjectLocked, bucket)
 		}
 		return nil, t.objectErr(ctx, bucket, tenant, err)
 	}

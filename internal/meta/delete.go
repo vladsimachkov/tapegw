@@ -322,7 +322,8 @@ func (m *Meta) LookupVersion(ctx context.Context, tenant TenantID,
 	base := fmt.Sprintf(`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
 			                o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
 			                o.state, o.landing, o.online_until, o.created_at,
-			                o.archived_at, o.is_delete_marker, o.is_null_version
+			                o.archived_at, o.is_delete_marker, o.is_null_version,
+			                o.retention_mode::text, o.retain_until, o.legal_hold
 			           FROM objects o
 			           JOIN buckets b ON b.id = o.bucket_id
 			          WHERE b.name = $1 AND b.deleted_at IS NULL
