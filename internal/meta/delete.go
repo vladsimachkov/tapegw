@@ -278,3 +278,47 @@ func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID int64,
 	}
 	return nil
 }
+
+// ErrNoSuchVersion — запрошенной версии нет. Отличается от ErrNotFound: «нет
+// бакета/ключа» и «нет конкретной версии» — разные ответы клиента, и AWS
+// различает их кодами (NoSuchBucket / NoSuchKey против NoSuchVersion).
+var ErrNoSuchVersion = errors.New("meta: no such object version")
+
+// LookupVersion ищет конкретную версию по id либо по "null".
+//
+// Пустой versionId здесь не обрабатывается: «текущая версия» — это GetObject,
+// и смешивать их в одной функции значит однажды отдать текущую вместо
+// запрошенной.
+func (m *Meta) LookupVersion(ctx context.Context, tenant TenantID,
+	bucket, key, versionID string) (*Object, error) {
+
+	var cond string
+	args := []any{bucket, key}
+	if versionID == "null" {
+		cond = `o.is_null_version`
+	} else {
+		id, err := uuid.Parse(versionID)
+		if err != nil {
+			return nil, ErrNoSuchVersion
+		}
+		args = append(args, id)
+		cond = fmt.Sprintf(`o.id = $%d::uuid`, len(args))
+	}
+
+	base := fmt.Sprintf(`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
+			                o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
+			                o.state, o.landing, o.online_until, o.created_at,
+			                o.archived_at, o.is_delete_marker, o.is_null_version
+			           FROM objects o
+			           JOIN buckets b ON b.id = o.bucket_id
+			          WHERE b.name = $1 AND b.deleted_at IS NULL
+			            AND o.key = $2 AND %s
+			            AND (o.is_delete_marker OR o.state NOT IN ('deleting','deleted'))`, cond)
+	q, qargs := withTenantCol(base, "b.tenant_id", tenant, args...)
+
+	obj, err := scanObject(m.Pool.QueryRow(ctx, q, qargs...))
+	if errors.Is(err, ErrNotFound) {
+		return nil, ErrNoSuchVersion
+	}
+	return obj, err
+}
