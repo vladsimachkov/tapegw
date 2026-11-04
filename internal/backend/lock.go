@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/valyala/fasthttp"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -18,6 +21,10 @@ import (
 //
 // Версию адресуют по versionId, и "null" — тоже адрес: null-версия в
 // приостановленном бакете существует и может быть защищена.
+
+// bypassGovernanceHeader — заголовок запроса на обход GOVERNANCE. Имя
+// регистронезависимо, но пишем как в S3.
+const bypassGovernanceHeader = "x-amz-bypass-governance-retention"
 
 // bucketLockConfig — конфигурация лока бакета, либо nil, если лока нет.
 // Ошибку «бакет чужой» не глотает: её обязан увидеть вызывающий.
@@ -193,4 +200,25 @@ func (t *TapeGW) GetObjectLegalHold(ctx context.Context,
 		return nil, t.bucketErr(ctx, bucket, tenant, err)
 	}
 	return &on, nil
+}
+
+// bypassGovernanceRequested — запросил ли клиент обход GOVERNANCE.
+//
+// Источник — заголовок запроса, а не поле s3.DeleteObjectInput: контроллер
+// versitygw это поле не заполняет (object-delete.go:221, bucket-post.go:153),
+// поэтому по полю бэкенд всегда видел бы «обход не запрошен» и отклонял бы
+// любой GOVERNANCE — то есть GOVERNANCE вел бы себя как COMPLIANCE.
+//
+// Правило то же, что в контроллере: EqualFold со "true"
+// (object-delete.go:144). Право на обход здесь не проверяется: это сделал
+// versitygw до вызова бэкенда (ADR-0015). COMPLIANCE и legal hold заголовком
+// не обходятся никогда.
+func bypassGovernanceRequested(ctx context.Context) bool {
+	rc, ok := ctx.(*fasthttp.RequestCtx)
+	if !ok {
+		// Не HTTP-контекст: прямого вызова бэкенда из воркера или админ-API
+		// с обходом не бывает, поэтому отсутствие запроса — безопасный ответ.
+		return false
+	}
+	return strings.EqualFold(string(rc.Request.Header.Peek(bypassGovernanceHeader)), "true")
 }

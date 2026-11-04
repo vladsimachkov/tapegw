@@ -23,12 +23,15 @@ import (
 // 2. Root удаляет версию под COMPLIANCE → отказ. Root идёт мимо IAM вообще,
 //    поэтому здесь бэкенд — единственный барьер.
 //
-// Положительного контроля «обход работает, когда право есть» здесь нет, и это не
-// забывчивость: в этой сборке GOVERNANCE не обходит никто. Даже root с
-// заголовком получает отказ от самого versitygw (ErrObjectLocked, ещё до
-// бэкенда), а выдача `s3:BypassGovernanceRetention` в политике бакета обычному
-// ключу права не добавила. Наш бэкенд заголовок уважает — это проверяет
-// TestGovernanceBypassAtBackend на уровне backend/meta.
+// Обход бэкенд берёт из заголовка запроса: контроллер versitygw поля
+// BypassGovernanceRetention не передаёт (object-delete.go:221). Положительный
+// контроль — TestGovernanceBypassWorksForAdmin.
+//
+// Не проверяется: выдача `s3:BypassGovernanceRetention` в политике бакета
+// обычному ключу. Право из политики бакета до бэкенда не доходит — versitygw
+// отказывает сам, и отказ приходит до вызова бэкенда. Это отдельный вопрос про
+// интеграцию с versitygw, а не про наш бэкенд: путь через роль (root/admin)
+// работает.
 
 // lockBucket — бакет клиента с включёнными версиями и Object Lock.
 func lockBucket(t *testing.T, owner *s3.Client, prefix string) string {
@@ -125,6 +128,35 @@ func TestGovernanceBypassNeedsRight(t *testing.T) {
 
 	// И без заголовка, и с ним — отказ: права на обход у ключа нет ни в
 	// политике бакета, ни в роли.
+}
+
+// Обход GOVERNANCE работает, когда право есть. Root получает его по роли, и
+// это положительный контроль к TestGovernanceBypassNeedsRight: без него отказ
+// в том тесте нельзя отличить от «версия вообще неудаляема».
+//
+// Бэкенд узнаёт о запросе обхода из заголовка: контроллер versitygw поля
+// BypassGovernanceRetention не передаёт (object-delete.go:221).
+func TestGovernanceBypassWorksForAdmin(t *testing.T) {
+	root := client(t)
+	ctx := context.Background()
+	bucket := lockBucket(t, root, "govok")
+
+	put, err := root.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"), Body: strings.NewReader("данные"),
+	})
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	vid := aws.ToString(put.VersionId)
+	putRetention(t, root, bucket, "k", vid, types.ObjectLockRetentionModeGovernance,
+		time.Now().Add(24*time.Hour))
+
+	if _, err := root.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"), VersionId: aws.String(vid),
+		BypassGovernanceRetention: aws.Bool(true),
+	}); err != nil {
+		t.Errorf("обход GOVERNANCE с правом не прошёл: %v", err)
+	}
 }
 
 // Root идёт мимо IAM: против COMPLIANCE он бессилен, потому что бэкенд —

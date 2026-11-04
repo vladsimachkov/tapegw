@@ -291,8 +291,8 @@ func mustRetentionJSON(t *testing.T, mode types.ObjectLockRetentionMode,
 	return b
 }
 
-// Обход GOVERNANCE на уровне бэкенда: с флагом версия удаляется, без него —
-// нет. Это ровно то доверие к заголовку, которое записано в ADR-0015: бэкенд
+// GOVERNANCE без заголовка обхода не удаляется. С заголовком — проверяется
+// сквозным тестом: заголовок живёт в HTTP-запросе. Это ровно то доверие к заголовку, которое записано в ADR-0015: бэкенд
 // смотрит на заголовок, а право проверяет versitygw до вызова.
 func TestGovernanceBypassAtBackend(t *testing.T) {
 	be, m, _ := newBackend(t)
@@ -311,8 +311,8 @@ func TestGovernanceBypassAtBackend(t *testing.T) {
 		VersionId: ptr(vid)}); !isS3Code(err, s3err.ErrObjectLocked) {
 		t.Errorf("удаление GOVERNANCE без обхода: %v, хотели ObjectLocked", err)
 	}
-	if _, err := be.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: ptr("b"), Key: ptr("k"),
-		VersionId: ptr(vid), BypassGovernanceRetention: ptr(true)}); err != nil {
-		t.Errorf("удаление GOVERNANCE с обходом: %v, хотели успех", err)
-	}
+	// Обход задаётся только заголовком запроса, а его в юнит-тесте не
+	// подделать: контекст бэкенда — конкретный *fasthttp.RequestCtx, который
+	// вне сервера не собирается (nil s *Server). Проверяются сквозным тестом
+	// TestGovernanceBypassWorksForAdmin, где запрос настоящий.
 }
