@@ -156,7 +156,7 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		return s3response.PutObjectOutput{}, s3err.GetChecksumBadDigestErr(algo)
 	}
 
-	_, err = t.meta.PutObject(ctx, tenant, meta.PutObjectInput{
+	obj, err := t.meta.PutObject(ctx, tenant, meta.PutObjectInput{
 		ID:           id,
 		Bucket:       bucket,
 		Key:          key,
@@ -193,6 +193,15 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 	if slot := putChecksumSlot(&out, algo); slot != nil {
 		v := info.Checksum
 		*slot = &v
+	}
+	// x-amz-version-id. Без него версия ничем не адресуется: ни прочитать её
+	// конкретной, ни удалить, ни поставить на неё retention. Для бакета без
+	// версий заголовка нет вовсе, для приостановленного — "null", как в AWS.
+	switch obj.Versioning {
+	case meta.VersioningEnabled:
+		out.VersionID = obj.ID.String()
+	case meta.VersioningSuspended:
+		out.VersionID = "null"
 	}
 	return out, nil
 }
