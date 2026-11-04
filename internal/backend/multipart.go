@@ -70,6 +70,9 @@ func (t *TapeGW) CreateMultipartUpload(ctx context.Context,
 	}
 
 	uploadID := uuid.NewString()
+	// UUID версии заводится здесь, а не при Complete: он входит в nonce и AAD
+	// каждого сегмента каждой части, а части грузятся до появления объекта.
+	objectID := uuid.New()
 	dek, wrapped, err := t.keys.NewUploadDEK(ctx, ownerTenant, uploadID)
 	if err != nil {
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("ключ загрузки: %w", err)
@@ -80,6 +83,7 @@ func (t *TapeGW) CreateMultipartUpload(ctx context.Context,
 		Bucket:     bucket,
 		Key:        key,
 		ID:         uploadID,
+		ObjectID:   objectID,
 		WrappedDEK: wrapped,
 		Meta:       uploadMetaFromCreate(input),
 	}); err != nil {
@@ -149,7 +153,7 @@ func (t *TapeGW) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3
 
 	id := uuid.New()
 	limit := int64(t.cfg.S3.MaxObjectSize)
-	info, err := t.spool.WritePartEncrypted(id, input.Body, spool.SumSpec{
+	info, err := t.spool.WritePartEncrypted(id, up.ObjectID, input.Body, spool.SumSpec{
 		ContentMD5: str(input.ContentMD5),
 		Algorithm:  input.ChecksumAlgorithm,
 	}, limit, dek, declared, uint32(partNumber))
@@ -264,7 +268,7 @@ func (t *TapeGW) UploadPartCopy(ctx context.Context,
 	defer encrypt.Zero(dek)
 
 	id := uuid.New()
-	info, err := t.spool.WritePartEncrypted(id, body, spool.SumSpec{}, length, dek, length,
+	info, err := t.spool.WritePartEncrypted(id, up.ObjectID, body, spool.SumSpec{}, length, dek, length,
 		uint32(partNumber))
 	if err != nil {
 		var s3e s3err.S3Error
@@ -365,7 +369,7 @@ func (t *TapeGW) CompleteMultipartUpload(ctx context.Context,
 		return s3response.CompleteMultipartUploadResult{}, "", tapegwerr.FromMeta(err, up.Bucket)
 	}
 
-	id := uuid.New()
+	id := up.ObjectID
 	// Обёртка DEK переоборачивается под UUID версии: данные не меняются, а
 	// привязка к версии появляется. Переставить такую обёртку в другой объект
 	// нельзя — AAD не совпадёт.

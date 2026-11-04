@@ -29,6 +29,14 @@ END $$;
 
 ALTER TABLE uploads ADD COLUMN wrapped_dek bytea NOT NULL;
 
+-- (a2) UUID будущей версии.
+--
+-- nonce и AAD каждого сегмента строятся от UUID версии, а части загружаются до
+-- того, как версия появится. Значит UUID обязан быть известен на
+-- CreateMultipartUpload и пережить её до Complete, где он станет objects.id.
+-- Иначе части были бы зашифрованы одним идентификатором, а читались под другим.
+ALTER TABLE uploads ADD COLUMN object_id uuid NOT NULL;
+
 -- (b) Файл части в спуле. Части лежат отдельными файлами до Complete, где
 -- склеиваются в файл объекта.
 ALTER TABLE upload_parts ADD COLUMN file_id uuid NOT NULL;
@@ -58,4 +66,5 @@ CREATE INDEX uploads_bucket_key ON uploads (bucket_id, key);
 DROP INDEX IF EXISTS uploads_bucket_key;
 ALTER TABLE object_parts ALTER COLUMN cipher_offset DROP NOT NULL;
 ALTER TABLE upload_parts DROP COLUMN IF EXISTS file_id;
+ALTER TABLE uploads DROP COLUMN IF EXISTS object_id;
 ALTER TABLE uploads DROP COLUMN IF EXISTS wrapped_dek;

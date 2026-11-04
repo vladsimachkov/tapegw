@@ -340,6 +340,11 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 		}
 
 		obj, err := scanObjectRow(created)
+		// Курсор RETURNING закрываем сразу: он держит соединение, и любой
+		// следующий запрос на том же соединении — вставка частей или InTx —
+		// упал бы с «conn busy». defer ниже при повторном Close не мешает:
+		// Close идемпотентен.
+		created.Close()
 		if err != nil {
 			return err
 		}
@@ -358,6 +363,7 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 		}
 
 		out = obj
+
 		if in.InTx != nil {
 			if err := in.InTx(ctx, tx); err != nil {
 				return err

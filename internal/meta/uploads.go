@@ -25,7 +25,11 @@ import (
 
 // Upload — строка uploads вместе с частями.
 type Upload struct {
-	ID        string
+	ID string
+	// ObjectID — UUID будущей версии objects.id. nonce и AAD сегментов частей
+	// строятся от него, а не от upload_id: читать собранный файл будут под
+	// UUID строки объекта, и эти два значения обязаны быть одним и тем же.
+	ObjectID  uuid.UUID
 	Bucket    string
 	Key       string
 	Initiated time.Time
@@ -64,7 +68,9 @@ type CreateUploadInput struct {
 	Bucket string
 	Key    string
 	ID     string
-	Meta   UploadMeta
+	// ObjectID — UUID, который станет objects.id при Complete.
+	ObjectID uuid.UUID
+	Meta     UploadMeta
 	// WrappedDEK — обёртка DEK загрузки. Обязательна: без неё части нечем
 	// шифровать, а «запишем открытым текстом» здесь не допускается.
 	WrappedDEK []byte
@@ -90,9 +96,9 @@ func (m *Meta) CreateUpload(ctx context.Context, tenant TenantID, in CreateUploa
 			return fmt.Errorf("meta: бакет %q: %w", in.Bucket, err)
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO uploads (upload_id, bucket_id, key, meta, wrapped_dek)
-			 VALUES ($1, $2, $3, $4, $5)`,
-			in.ID, bucketID, in.Key, metaJSON, in.WrappedDEK); err != nil {
+			`INSERT INTO uploads (upload_id, bucket_id, key, meta, wrapped_dek, object_id)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			in.ID, bucketID, in.Key, metaJSON, in.WrappedDEK, in.ObjectID); err != nil {
 			return fmt.Errorf("meta: загрузка %s: %w", in.ID, err)
 		}
 		return nil
@@ -104,11 +110,11 @@ func (m *Meta) GetUpload(ctx context.Context, tenant TenantID, uploadID string) 
 	var u Upload
 	var metaJSON []byte
 	q, args := withTenantCol(
-		`SELECT u.upload_id, b.name, u.key, u.initiated, u.meta, u.wrapped_dek
+		`SELECT u.upload_id, u.object_id, b.name, u.key, u.initiated, u.meta, u.wrapped_dek
 		   FROM uploads u JOIN buckets b ON b.id = u.bucket_id
 		  WHERE u.upload_id = $1 AND b.deleted_at IS NULL`,
 		"b.tenant_id", tenant, uploadID)
-	err := m.Pool.QueryRow(ctx, q, args...).Scan(&u.ID, &u.Bucket, &u.Key, &u.Initiated,
+	err := m.Pool.QueryRow(ctx, q, args...).Scan(&u.ID, &u.ObjectID, &u.Bucket, &u.Key, &u.Initiated,
 		&metaJSON, &u.WrappedDEK)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -295,7 +301,7 @@ func (m *Meta) UploadsByBucket(ctx context.Context, tenant TenantID, bucket, pre
 	}
 
 	q, qargs := withTenantCol(
-		`SELECT u.upload_id, b.name, u.key, u.initiated, u.meta, u.wrapped_dek
+		`SELECT u.upload_id, u.object_id, b.name, u.key, u.initiated, u.meta, u.wrapped_dek
 		   FROM uploads u JOIN buckets b ON b.id = u.bucket_id
 		 `+where,
 		"b.tenant_id", tenant, args...)
@@ -313,7 +319,7 @@ func (m *Meta) UploadsByBucket(ctx context.Context, tenant TenantID, bucket, pre
 			u        Upload
 			metaJSON []byte
 		)
-		if err := rows.Scan(&u.ID, &u.Bucket, &u.Key, &u.Initiated, &metaJSON, &u.WrappedDEK); err != nil {
+		if err := rows.Scan(&u.ID, &u.ObjectID, &u.Bucket, &u.Key, &u.Initiated, &metaJSON, &u.WrappedDEK); err != nil {
 			return nil, fmt.Errorf("meta: загрузки бакета %q: %w", bucket, err)
 		}
 		if len(metaJSON) > 0 {

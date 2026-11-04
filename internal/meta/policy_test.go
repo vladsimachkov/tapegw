@@ -163,8 +163,8 @@ func TestChangeBucketOwnerMovesTenant(t *testing.T) {
 		// wrapped_dek обязателен с миграции 0014: без него части нечем
 		// шифровать, и заглушить эту колонку в тесте значило бы проверить
 		// перенос бакета с загрузкой, которой в реальности не существует.
-		`INSERT INTO uploads (upload_id, bucket_id, key, meta, wrapped_dek)
-		 SELECT 'u1', id, 'mp', '{}'::jsonb, decode('00','hex')
+		`INSERT INTO uploads (upload_id, bucket_id, key, meta, wrapped_dek, object_id)
+		 SELECT 'u1', id, 'mp', '{}'::jsonb, decode('00','hex'), gen_random_uuid()
 		   FROM buckets WHERE name = 'mv-mpu'`); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
