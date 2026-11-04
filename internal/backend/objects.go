@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"time"
@@ -453,16 +452,6 @@ func (t *TapeGW) restoreHeader(ctx context.Context, tenant meta.TenantID, obj *m
 	}
 	return r.HeaderValue(), nil
 }
-
-// rangeReader закрывает файл вместе с ограниченным читателем: иначе дескриптор
-// утечёт на каждом Range-запросе.
-type rangeReader struct {
-	r io.Reader
-	c io.Closer
-}
-
-func (r *rangeReader) Read(p []byte) (int, error) { return r.r.Read(p) }
-func (r *rangeReader) Close() error               { return r.c.Close() }
 
 // str — распаковать *string из структур versitygw: там каждое поле указатель.
 func str(p *string) string {

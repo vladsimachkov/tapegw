@@ -21,10 +21,9 @@ import (
 	"github.com/vladsimachkov/tapegw/internal/meta"
 )
 
-// sseAES256 — значение x-amz-server-side-encryption. Как у SSE-S3: ключ наш,
-// клиенту сообщаем факт шифрования, но выбирать алгоритм ему нечем (SSE-C и
-// SSE-KMS у нас NotImplemented).
-const sseAES256 = "AES256"
+// Значение x-amz-server-side-encryption берётся из types.ServerSideEncryptionAes256
+// (как у SSE-S3): ключ наш, клиенту сообщаем факт шифрования, но выбирать
+// алгоритм ему нечем — SSE-C и SSE-KMS у нас NotImplemented.
 
 // versionKey — DEK для записываемой версии и его обёртка.
 //
@@ -70,7 +69,10 @@ func (t *TapeGW) plainReader(ctx context.Context, obj *meta.Object, f *os.File, 
 	}, nil
 }
 
-// closingReader — читатель, закрывающий источник при Close.
+// closingReader — читатель, закрывающий источник при Close. Раньше для Range
+// был отдельный rangeReader поверх io.LimitReader: дескриптор нужно было
+// закрывать вместе с ограничением. С шифрованием читатель и так обёртка,
+// поэтому один тип на оба случая.
 type closingReader struct {
 	r  io.Reader
 	c  io.Closer
