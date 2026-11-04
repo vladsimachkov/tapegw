@@ -12,11 +12,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"unicode"
 
 	"github.com/versity/versitygw/auth"
 
@@ -81,10 +83,14 @@ func main() {
 			if err != nil {
 				fatal("прочитать секрет из stdin: %v", err)
 			}
-			sec = strings.TrimSpace(string(b))
-			if sec == "" {
-				fatal("секрет пуст: передайте его на stdin или флагом -secret (только для тестов)")
+			sec, err = normalizeSecret(string(b))
+			if err != nil {
+				fatal("%v", err)
 			}
+		} else if _, err := normalizeSecret(sec); err != nil {
+			// Флаг проверяется тем же правилом: иначе один и тот же секрет,
+			// переданный флагом и со stdin, сохранялся бы по-разному.
+			fatal("%v", err)
 		}
 		err = svc.CreateAccount(auth.Account{
 			Access: *access, Secret: sec, Role: auth.Role(*role), ProjectID: int(*tenant),
@@ -117,4 +123,29 @@ func main() {
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
+}
+
+// normalizeSecret приводит секрет, прочитанный со stdin, к тому виду, который
+// передал бы флаг -secret.
+//
+// Снимается ровно один завершающий перевод строки (\n или \r\n): его добавляют
+// echo и любой редактор. TrimSpace здесь не годится — он молча съедает пробелы по
+// краям, и тогда секрет, переданный флагом, и тот же секрет со stdin сохраняются
+// по-разному. Клиент с случайным пробелом в секрете получил бы ключ, который не
+// совпадает с записанным у него, и выяснял бы это при первом же входе.
+//
+// Секрет с пробельными символами где угодно — внутри или по краям — отклоняется:
+// AWS access key/secret не содержат пробелов в принципе, так что это не «странная
+// учётка», а испорченный ввод.
+func normalizeSecret(raw string) (string, error) {
+	s := strings.TrimSuffix(raw, "\n")
+	s = strings.TrimSuffix(s, "\r")
+	if s == "" {
+		return "", errors.New("секрет пуст: передайте его на stdin или флагом -secret (только для тестов)")
+	}
+	if strings.IndexFunc(s, unicode.IsSpace) >= 0 {
+		return "", errors.New("секрет содержит пробельный символ — проверьте ввод " +
+			"(перевод строки в конце можно, пробелы и табы внутри секрета быть не может)")
+	}
+	return s, nil
 }
