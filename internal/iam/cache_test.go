@@ -294,13 +294,19 @@ func TestCacheKekRotationAcrossRestart(t *testing.T) {
 // одной попытке, тест падает, а не проходит молча.
 func TestCacheResubscribeFlushesAfterLostEvent(t *testing.T) {
 	const appName = "tapegw-iam-cache-test"
-	const attempts = 10
+	// Границы нужны, чтобы тест не превращался в бесконечное ожидание на
+	// медленном раннере: попыток — фиксированное число, и суммарно они уложены
+	// в бюджет. За пределами бюджета тест падает с внятным сообщением, а не
+	// висит до таймаута CI.
+	const attempts = 5
+	const budget = 40 * time.Second
+	deadline := time.Now().Add(budget)
 
 	e := setup(t)
 	cache := newCacheOver(t, e.service(t, e.ringV1), cacheTTL, appName)
 
 	opened := 0
-	for i := 0; i < attempts; i++ {
+	for i := 0; i < attempts && time.Now().Before(deadline); i++ {
 		access := fmt.Sprintf("frank%d", i)
 		mustCreate(t, cache, access, "secret", auth.RoleUser, tenantClient)
 		warmUntilCached(t, cache, access)
@@ -344,8 +350,9 @@ func TestCacheResubscribeFlushesAfterLostEvent(t *testing.T) {
 	}
 
 	if opened == 0 {
-		t.Fatalf("за %d попыток ни разу не открылось окно без слушателя: тест не может "+
-			"проверить сброс при переподписке и зелёным быть не должен", attempts)
+		t.Fatalf("за %d попыток (бюджет %v) ни разу не открылось окно без слушателя: "+
+			"тест не может проверить сброс при переподписке и зелёным быть не должен",
+			attempts, budget)
 	}
 }
 
