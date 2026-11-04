@@ -1,5 +1,13 @@
 package meta
 
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+)
+
 // Состояния версионирования бакета — значения enum `bucket_versioning` из
 // миграции 0005. Константы объявлены здесь, а не берутся из
 // versitygw `types.BucketVersioningStatus`, по той же причине, по которой
@@ -23,4 +31,22 @@ const (
 // version" expressible at all, since our versionId is always a row UUID.
 func IsNullVersionBucket(versioning string) bool {
 	return versioning != VersioningEnabled
+}
+
+// BucketVersioningState — состояние версионирования бакета. Нужен чтению: по
+// нему бэкенд решает, какой x-amz-version-id поставить (для unversioned
+// заголовка нет, для suspended — "null").
+func (m *Meta) BucketVersioningState(ctx context.Context, tenant TenantID, bucket string) (string, error) {
+	base := `SELECT b.versioning FROM buckets b
+	          WHERE b.name = $1 AND b.deleted_at IS NULL`
+	q, args := withTenantCol(base, "b.tenant_id", tenant, bucket)
+
+	var state string
+	if err := m.Pool.QueryRow(ctx, q, args...).Scan(&state); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("versioning of %s: %w", bucket, err)
+	}
+	return state, nil
 }

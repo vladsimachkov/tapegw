@@ -36,6 +36,14 @@ type Object struct {
 	OnlineUntil time.Time
 	CreatedAt   time.Time
 	ArchivedAt  *time.Time
+	// IsDeleteMarker — версия-маркер удаления: строка без данных из-за которой
+	// ключ выглядит удалённым. Чтение обязано различать её: GET по такому ключу
+	// отдаёт NoSuchKey, а GET по id самого маркера — MethodNotAllowed.
+	IsDeleteMarker bool
+	// IsNullVersion — версия с versionId = "null" в смысле AWS (записана в
+	// бакете без версий или на приостановленном). По ней чтение решает, что
+	// положить в x-amz-version-id: id или "null".
+	IsNullVersion bool
 	// Versioning — состояние версионирования бакета на момент вставки.
 	// Заполняет только PutObject: по нему бэкенд решает, какой x-amz-version-id
 	// поставить в ответ. Для unversioned заголовка нет, для suspended — "null",
@@ -263,7 +271,8 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 			 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12,$13,$14,$15)
 			 RETURNING id, bucket_id, key, size, etag, checksums, content_type,
 			           user_meta, acl, tags, storage_class, state, landing,
-			           online_until, created_at, archived_at`,
+			           online_until, created_at, archived_at, is_delete_marker,
+			           is_null_version`,
 			in.ID, bucketID, in.Key, in.Size, in.ETag, checksums,
 			in.ContentType, userMeta, in.ACL, tags, in.StorageClass,
 			in.OnlineUntil, bucketTenant, DefaultPoolID, nullVersion)
@@ -299,7 +308,8 @@ func (m *Meta) GetObject(ctx context.Context, tenant TenantID, bucket, key strin
 	q, args := withTenantCol(
 		`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
 		        o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
-		        o.state, o.landing, o.online_until, o.created_at, o.archived_at
+		        o.state, o.landing, o.online_until, o.created_at, o.archived_at,
+		        o.is_delete_marker, o.is_null_version
 		   FROM objects o
 		   JOIN buckets b ON b.id = o.bucket_id
 		  WHERE b.name = $1 AND b.deleted_at IS NULL
@@ -316,7 +326,8 @@ func (m *Meta) GetObjectByID(ctx context.Context, tenant TenantID, id uuid.UUID)
 	q, args := withTenantCol(
 		`SELECT o.id, o.bucket_id, o.key, o.size, o.etag, o.checksums,
 		        o.content_type, o.user_meta, o.acl, o.tags, o.storage_class,
-		        o.state, o.landing, o.online_until, o.created_at, o.archived_at
+		        o.state, o.landing, o.online_until, o.created_at, o.archived_at,
+		        o.is_delete_marker, o.is_null_version
 		   FROM objects o WHERE o.id = $1`,
 		"o.tenant_id", tenant, id)
 	row := m.Pool.QueryRow(ctx, q, args...)
@@ -342,7 +353,8 @@ func scanObjectRow(src interface {
 	err := src.Scan(
 		&o.ID, &o.BucketID, &key, &o.Size, &etag, &checksums,
 		&o.ContentType, &userMeta, &o.ACL, &tags, &storageClass,
-		&state, &o.Landing, &onlineUntil, &o.CreatedAt, &o.ArchivedAt)
+		&state, &o.Landing, &onlineUntil, &o.CreatedAt, &o.ArchivedAt,
+		&o.IsDeleteMarker, &o.IsNullVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

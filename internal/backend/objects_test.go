@@ -2,6 +2,7 @@ package backend_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/vladsimachkov/tapegw/internal/backend"
 	"github.com/vladsimachkov/tapegw/internal/config"
+	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/spool"
 )
 
@@ -719,31 +721,227 @@ func TestGetObjectPreconditions(t *testing.T) {
 
 // Версионирования нет. versionId, отличный от null, обязан быть ошибкой:
 // иначе клиент, который просит конкретную версию, молча получил бы текущую.
-func TestVersionIDRejected(t *testing.T) {
+func TestVersionIDUnknownRejected(t *testing.T) {
 	be, _, _ := newBackend(t)
 	ctx := testCtx()
 	mustBucket(t, be)
 	putBody(t, be, "b", "k", "данные")
 
-	for _, vid := range []string{"v1", "0002", "junk"} {
+	// Несуществующая версия — NoSuchVersion. Отдать текущую означало бы
+	// «клиент ищет одну версию, получил другую и молчит».
+	for _, vid := range []string{"v1", "0002", "junk", uuid.NewString()} {
 		if _, err := be.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: ptr("b"), Key: ptr("k"), VersionId: ptr(vid),
-		}); !isS3Code(err, s3err.ErrVersioningNotConfigured) {
-			t.Errorf("GET с versionId=%q: ожидали VersioningNotConfigured, получили %v", vid, err)
+		}); !isS3Code(err, s3err.ErrNoSuchVersion) {
+			t.Errorf("GET с versionId=%q: ожидали NoSuchVersion, получили %v", vid, err)
 		}
 		if _, err := be.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: ptr("b"), Key: ptr("k"), VersionId: ptr(vid),
-		}); !isS3Code(err, s3err.ErrVersioningNotConfigured) {
-			t.Errorf("HEAD с versionId=%q: ожидали VersioningNotConfigured, получили %v", vid, err)
+		}); !isS3Code(err, s3err.ErrNoSuchVersion) {
+			t.Errorf("HEAD с versionId=%q: ожидали NoSuchVersion, получили %v", vid, err)
 		}
 	}
 
-	// "null" — единственная версия в бакете без versioning, обязана работать.
+	// "null" — единственная версия в бакете без versioning, обязана читаться.
 	if _, err := be.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: ptr("b"), Key: ptr("k"), VersionId: ptr("null"),
 	}); err != nil {
 		t.Errorf("versionId=null должен читаться: %v", err)
 	}
+}
+
+// setVersioning — состояние версионирования бакета.
+func setVersioningDB(t *testing.T, m *meta.Meta, bucket, state string) {
+	t.Helper()
+	if _, err := m.Pool.Exec(context.Background(),
+		"UPDATE buckets SET versioning = $2 WHERE name = $1", bucket, state); err != nil {
+		t.Fatalf("versioning %s: %v", state, err)
+	}
+}
+
+// Адресация версий при чтении: конкретная версия читается по своему id,
+// "null" — это null-версия, а не «текущая», и x-amz-version-id в ответе
+// соответствует состоянию бакета.
+func TestReadByVersionID(t *testing.T) {
+	be, m, _ := newBackend(t)
+	ctx := testCtx()
+	mustBucket(t, be)
+	setVersioningDB(t, m, "b", meta.VersioningEnabled)
+
+	// null-версия рядом с обычной: она записана ДО включения версий.
+	setVersioningDB(t, m, "b", meta.VersioningUnversioned)
+	putBody(t, be, "b", "null-версия", "старые данные")
+	setVersioningDB(t, m, "b", meta.VersioningEnabled)
+	putBody(t, be, "b", "null-версия", "новые данные")
+
+	// Обычная версия с двумя поколениями: старая остаётся нетекущей.
+	putBody(t, be, "b", "k", "первая")
+	oldID := mustCurrentID(t, m, "b", "k")
+	putBody(t, be, "b", "k", "вторая версия")
+
+	// Нетекущая версия читается по id и отдаёт именно свои байты.
+	g, err := be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k"),
+		VersionId: ptr(oldID)})
+	if err != nil {
+		t.Fatalf("GET по id нетекущей версии: %v", err)
+	}
+	if got := readAll(t, g); got != "первая" {
+		t.Errorf("нетекущая версия отдала %q, хотели «первая»", got)
+	}
+	if aws.ToString(g.VersionId) != oldID {
+		t.Errorf("x-amz-version-id = %q, хотели id запрошенной версии", aws.ToString(g.VersionId))
+	}
+
+	// Текущая версия — другие данные, и заголовок показывает её id.
+	cur := mustCurrentID(t, m, "b", "k")
+	g, err = be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k")})
+	if err != nil {
+		t.Fatalf("GET текущей версии: %v", err)
+	}
+	if got := readAll(t, g); got != "вторая версия" {
+		t.Errorf("текущая версия отдала %q", got)
+	}
+	if aws.ToString(g.VersionId) != cur {
+		t.Errorf("x-amz-version-id = %q, хотели id текущей версии %s",
+			aws.ToString(g.VersionId), cur)
+	}
+
+	// versionId=null — именно null-версия, а не текущая. Это главный смысл
+	// теста: раньше null игнорировался, и клиент получал «новые данные» молча.
+	g, err = be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("null-версия"),
+		VersionId: ptr("null")})
+	if err != nil {
+		t.Fatalf("GET versionId=null: %v", err)
+	}
+	if got := readAll(t, g); got != "старые данные" {
+		t.Errorf("versionId=null отдала %q, хотели «старые данные» — null проигнорирован", got)
+	}
+	if aws.ToString(g.VersionId) != "null" {
+		t.Errorf("x-amz-version-id = %q, хотели литеральный null", aws.ToString(g.VersionId))
+	}
+
+	// HEAD по той же схеме.
+	h, err := be.HeadObject(ctx, &s3.HeadObjectInput{Bucket: ptr("b"), Key: ptr("k"),
+		VersionId: ptr(oldID)})
+	if err != nil {
+		t.Fatalf("HEAD по id версии: %v", err)
+	}
+	if aws.ToInt64(h.ContentLength) != int64(len("первая")) {
+		t.Errorf("HEAD нетекущей версии вернул размер %d", aws.ToInt64(h.ContentLength))
+	}
+	if aws.ToString(h.VersionId) != oldID {
+		t.Errorf("HEAD x-amz-version-id = %q, хотели %s", aws.ToString(h.VersionId), oldID)
+	}
+}
+
+// Три состояния бакета определяют, какой x-amz-version-id в ответе: для
+// unversioned заголовка нет, для suspended — "null", для enabled — id.
+func TestReadVersionIDHeaderByBucketState(t *testing.T) {
+	for _, tc := range []struct{ state, want string }{
+		{meta.VersioningUnversioned, ""},
+		{meta.VersioningSuspended, "null"},
+		{meta.VersioningEnabled, "id"},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			be, m, _ := newBackend(t)
+			ctx := testCtx()
+			mustBucket(t, be)
+			setVersioningDB(t, m, "b", tc.state)
+			putBody(t, be, "b", "k", "данные")
+
+			h, err := be.HeadObject(ctx, &s3.HeadObjectInput{Bucket: ptr("b"), Key: ptr("k")})
+			if err != nil {
+				t.Fatalf("HEAD: %v", err)
+			}
+			got := aws.ToString(h.VersionId)
+			if tc.want == "" && got != "" {
+				t.Errorf("unversioned: заголовка быть не должно, получили %q", got)
+			}
+			if tc.want == "null" && got != "null" {
+				t.Errorf("suspended: x-amz-version-id = %q, хотели null", got)
+			}
+			if tc.want == "id" && len(got) != 36 {
+				t.Errorf("enabled: x-amz-version-id = %q, хотели UUID", got)
+			}
+		})
+	}
+}
+
+// Маркер удаления на чтении. Без versionId ключ выглядит удалённым — 404 с
+// заголовками маркера; по id самого маркера — 405, потому что тела у него нет.
+func TestReadDeleteMarker(t *testing.T) {
+	be, m, _ := newBackend(t)
+	ctx := testCtx()
+	mustBucket(t, be)
+	setVersioningDB(t, m, "b", meta.VersioningEnabled)
+	putBody(t, be, "b", "k", "данные")
+	dataID := mustCurrentID(t, m, "b", "k")
+
+	if _, err := be.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: ptr("b"), Key: ptr("k")}); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	markerID := mustCurrentID(t, m, "b", "k")
+	if markerID == dataID {
+		t.Fatalf("маркер должен быть отдельной версией")
+	}
+
+	// Без versionId: 404 и заголовки маркера.
+	_, err := be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k")})
+	if !isS3Code(err, s3err.ErrNoSuchKey) {
+		t.Errorf("GET по ключу под маркером: ожидали NoSuchKey, получили %v", err)
+	}
+	_, err = be.HeadObject(ctx, &s3.HeadObjectInput{Bucket: ptr("b"), Key: ptr("k")})
+	if !isS3Code(err, s3err.ErrNoSuchKey) {
+		t.Errorf("HEAD по ключу под маркером: ожидали NoSuchKey, получили %v", err)
+	}
+
+	// По id маркера: 405.
+	if _, err := be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k"),
+		VersionId: ptr(markerID)}); !isS3Code(err, s3err.ErrMethodNotAllowed) {
+		t.Errorf("GET по id маркера: ожидали MethodNotAllowed, получили %v", err)
+	}
+	if _, err := be.HeadObject(ctx, &s3.HeadObjectInput{Bucket: ptr("b"), Key: ptr("k"),
+		VersionId: ptr(markerID)}); !isS3Code(err, s3err.ErrMethodNotAllowed) {
+		t.Errorf("HEAD по id маркера: ожидали MethodNotAllowed, получили %v", err)
+	}
+
+	// Данные под маркером живы и читаются по своему id — удаление без
+	// versionId к данным не прикоснулось.
+	g, err := be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k"),
+		VersionId: ptr(dataID)})
+	if err != nil {
+		t.Fatalf("GET версии под маркером: %v", err)
+	}
+	if got := readAll(t, g); got != "данные" {
+		t.Errorf("версия под маркером отдала %q", got)
+	}
+}
+
+// mustCurrentID — id текущей версии ключа.
+func mustCurrentID(t *testing.T, m *meta.Meta, bucket, key string) string {
+	t.Helper()
+	var id string
+	err := m.Pool.QueryRow(context.Background(),
+		`SELECT o.id::text FROM objects o JOIN buckets b ON b.id = o.bucket_id
+		  WHERE b.name = $1 AND o.key = $2 AND o.is_current`, bucket, key).Scan(&id)
+	if err != nil {
+		t.Fatalf("текущая версия %s/%s: %v", bucket, key, err)
+	}
+	return id
+}
+
+// readAll прочитывает тело ответа целиком.
+func readAll(t *testing.T, out *s3.GetObjectOutput) string {
+	t.Helper()
+	if out.Body == nil {
+		t.Fatalf("пустое тело ответа")
+	}
+	defer out.Body.Close()
+	b, err := io.ReadAll(out.Body)
+	if err != nil {
+		t.Fatalf("чтение тела: %v", err)
+	}
+	return string(b)
 }
 
 // --- Trailing checksums (Major ревью PR #6) ---

@@ -220,11 +220,21 @@ func (t *TapeGW) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3
 	if err != nil {
 		return nil, err
 	}
-	if err := checkVersionID(input.VersionId); err != nil {
-		return nil, err
-	}
-	obj, err := t.meta.GetObject(ctx, tenant, str(input.Bucket), str(input.Key))
+	obj, vid, err := t.readVersion(ctx, tenant, str(input.Bucket), str(input.Key),
+		input.VersionId)
 	if err != nil {
+		if errors.Is(err, errDeleteMarker) {
+			vid, marker, merr := markerRead(vid, input.VersionId != nil && *input.VersionId != "",
+				str(input.Bucket))
+			out := &s3.HeadObjectOutput{DeleteMarker: &marker}
+			if vid != "" {
+				out.VersionId = &vid
+			}
+			return out, merr
+		}
+		if errors.Is(err, meta.ErrNoSuchVersion) {
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
+		}
 		return nil, t.objectErr(ctx, str(input.Bucket), tenant, err)
 	}
 
@@ -244,6 +254,7 @@ func (t *TapeGW) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3
 		// Всегда GLACIER, независимо от того, что клиент прислал при записи:
 		// у нас другой класс был бы ложью. См. ADR-0003.
 		StorageClass: types.StorageClassGlacier,
+		VersionId:    strPtr(vid),
 	}
 	if slot := headChecksumSlot(out, checksumAlgo(obj.Checksums)); slot != nil {
 		v := obj.Checksums[string(checksumAlgo(obj.Checksums))]
@@ -264,13 +275,20 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 	if err != nil {
 		return nil, err
 	}
-	if err := checkVersionID(input.VersionId); err != nil {
-		return nil, err
-	}
+	byID := input.VersionId != nil && *input.VersionId != ""
+	var vid string
 
 	for attempt := 0; ; attempt++ {
-		obj, err := t.meta.GetObject(ctx, tenant, bucket, key)
+		obj, v, err := t.readVersion(ctx, tenant, bucket, key, input.VersionId)
+		vid = v
 		if err != nil {
+			if errors.Is(err, errDeleteMarker) {
+				_, _, merr := markerRead(vid, byID, bucket)
+				return &s3.GetObjectOutput{DeleteMarker: ptr(true), VersionId: strPtr(vid)}, merr
+			}
+			if errors.Is(err, meta.ErrNoSuchVersion) {
+				return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
+			}
 			return nil, t.objectErr(ctx, bucket, tenant, err)
 		}
 		if !obj.ReadableFromDisk(time.Now()) {
@@ -308,7 +326,7 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 			return nil, fmt.Errorf("open object %s/%s: %w", bucket, key, err)
 		}
 
-		out, err := t.buildGetOutput(ctx, tenant, obj, f, str(input.Range))
+		out, err := t.buildGetOutput(ctx, tenant, obj, f, str(input.Range), vid)
 		if err != nil {
 			f.Close()
 			return nil, err
@@ -319,7 +337,7 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 
 // buildGetOutput собирает ответ, включая Range. Файл остаётся открытым:
 // versitygw закрывает Body сам.
-func (t *TapeGW) buildGetOutput(ctx context.Context, tenant meta.TenantID, obj *meta.Object, f *os.File, rng string) (*s3.GetObjectOutput, error) {
+func (t *TapeGW) buildGetOutput(ctx context.Context, tenant meta.TenantID, obj *meta.Object, f *os.File, rng, vid string) (*s3.GetObjectOutput, error) {
 	start, length, hasRange, err := vbackend.ParseObjectRange(obj.Size, rng)
 	if err != nil {
 		return nil, err
@@ -354,6 +372,7 @@ func (t *TapeGW) buildGetOutput(ctx context.Context, tenant meta.TenantID, obj *
 		ContentRange:  contentRange,
 		Body:          body,
 		StorageClass:  types.StorageClassGlacier,
+		VersionId:     strPtr(vid),
 	}
 	if slot := getChecksumSlot(out, checksumAlgo(obj.Checksums)); slot != nil {
 		v := obj.Checksums[string(checksumAlgo(obj.Checksums))]
@@ -392,18 +411,6 @@ func str(p *string) string {
 		return ""
 	}
 	return *p
-}
-
-// checkVersionID — версионирования в tapegw нет (вне MVP). Пустой versionId и
-// литеральный "null" — это и есть единственная версия, как в AWS для бакета без
-// versioning. Любой другой значение молча проигнорировать значит отдать текущую
-// версию вместо запрошенной: клиент, который ищет конкретную версию, получил бы
-// другие данные и не узнал бы об этом.
-func checkVersionID(v *string) error {
-	if v == nil || *v == "" || *v == "null" {
-		return nil
-	}
-	return s3err.GetAPIError(s3err.ErrVersioningNotConfigured)
 }
 
 // quoteEtag оборачивает hex-ETag в кавычки — формат, который отдаёт AWS и
