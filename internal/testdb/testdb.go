@@ -141,6 +141,13 @@ func Clean(t *testing.T, m *meta.Meta) {
 		if _, err := m.Pool.Exec(ctx, d); err != nil {
 			t.Fatalf("зачистка %s до строк сида: %v", seed.Table, err)
 		}
+		if seed.Reset != "" {
+			r := fmt.Sprintf("UPDATE %s SET %s WHERE %s = %d",
+				seed.Table, seed.Reset, seed.Column, SeedID)
+			if _, err := m.Pool.Exec(ctx, r); err != nil {
+				t.Fatalf("сброс колонок сида в %s: %v", seed.Table, err)
+			}
+		}
 	}
 }
 
@@ -163,10 +170,20 @@ var CleanTables = []string{
 // тенант 1, пул 1, tenant_usage для тенанта 1.
 const SeedID = 1
 
-// SeedTable — таблица сида и колонка, по которой опознаётся сид-строка.
+// SeedTable — таблица сида, колонка-опознаватель сид-строки и сброс колонок.
 type SeedTable struct {
 	Table  string
 	Column string
+	// Reset — SQL-выражение, приводящее сид-строку к исходному состоянию.
+	//
+	// Нужен потому, что «удалить не-сид-строки» на самом деле не возвращает
+	// сид к тому виду, в котором его положила миграция: тест меняет колонки
+	// существующей строки, и эти изменения переживают тест. На практике это
+	// уже укусило дважды: tenants.wrapped_key (второй тест получал TEK,
+	// завернутый чужим KEK) и tenants.key_destroyed_at (после теста на
+	// крипто-уничтожение все остальные тесты пакета падали на «ключ уничтожен»).
+	// Оба раза ошибка выглядела как баг в шифровании, а не как порядок тестов.
+	Reset string
 }
 
 // SeedTables — таблицы, которые Clean неtruncate-ит целиком: их наполняют
@@ -194,9 +211,9 @@ func IsSeedTable(name string) bool {
 }
 
 var SeedTables = []SeedTable{
-	{"tenant_usage", "tenant_id"},
-	{"tenants", "id"},
-	{"pools", "id"},
+	{"tenant_usage", "tenant_id", ""},
+	{"tenants", "id", "wrapped_key = NULL, kek_version = 1, key_destroyed_at = NULL"},
+	{"pools", "id", ""},
 }
 
 // PackageSchema даёт схеме имя по имени тестового бинаря: backend.test →
