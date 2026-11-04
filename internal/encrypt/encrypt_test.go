@@ -33,7 +33,7 @@ func writeRead(t *testing.T, data []byte, version uuid.UUID, part uint32) ([]byt
 	t.Helper()
 	key := mustKey(t)
 	var ct bytes.Buffer
-	w, err := NewWriter(&ct, key, version, part)
+	w, err := NewWriter(&ct, key, version, part, int64(len(data)))
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestReaderRanges(t *testing.T) {
 	key := mustKey(t)
 
 	var ct bytes.Buffer
-	w, err := NewWriter(&ct, key, version, 0)
+	w, err := NewWriter(&ct, key, version, 0, int64(len(data)))
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestCorruptionDetected(t *testing.T) {
 
 	seal := func() []byte {
 		var ct bytes.Buffer
-		w, err := NewWriter(&ct, key, version, 0)
+		w, err := NewWriter(&ct, key, version, 0, int64(len(data)))
 		if err != nil {
 			t.Fatalf("NewWriter: %v", err)
 		}
@@ -206,7 +206,7 @@ func TestShortCiphertext(t *testing.T) {
 	key := mustKey(t)
 
 	var ct bytes.Buffer
-	w, _ := NewWriter(&ct, key, version, 0)
+	w, _ := NewWriter(&ct, key, version, 0, int64(len(data)))
 	if _, err := w.Write(data); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestNonceUniquePerVersion(t *testing.T) {
 
 	seal := func(v uuid.UUID, part uint32) []byte {
 		var ct bytes.Buffer
-		w, _ := NewWriter(&ct, key, v, part)
+		w, _ := NewWriter(&ct, key, v, part, int64(len(data)))
 		if _, err := w.Write(data); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
@@ -264,7 +264,7 @@ func TestAADBindsSegment(t *testing.T) {
 	vA, vB := uuid.New(), uuid.New()
 
 	var ct bytes.Buffer
-	w, _ := NewWriter(&ct, key, vA, 0)
+	w, _ := NewWriter(&ct, key, vA, 0, int64(len(data)))
 	if _, err := w.Write(data); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -282,13 +282,13 @@ func TestAADBindsSegment(t *testing.T) {
 }
 
 func TestWriterRejectsBadKey(t *testing.T) {
-	if _, err := NewWriter(io.Discard, make([]byte, 16), uuid.New(), 0); err == nil {
+	if _, err := NewWriter(io.Discard, make([]byte, 16), uuid.New(), 0, 5); err == nil {
 		t.Errorf("короткий ключ принят")
 	}
 }
 
 func TestWriterWriteAfterClose(t *testing.T) {
-	w, err := NewWriter(io.Discard, mustKey(t), uuid.New(), 0)
+	w, err := NewWriter(io.Discard, mustKey(t), uuid.New(), 0, 5)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -297,5 +297,65 @@ func TestWriterWriteAfterClose(t *testing.T) {
 	}
 	if _, err := w.Write([]byte("x")); err == nil {
 		t.Errorf("запись после Close принята")
+	}
+}
+
+// Размер открытого текста входит в AAD, поэтому метаданные не могут
+// «договориться» с данными: объект, у которого уменьшили размер, перестаёт
+// проходить проверку аутентичности вместо того, чтобы молча отдаться усечённым.
+// Для rebuild-meta (ADR-0014) это единственная защита: там размер берётся с того
+// же носителя, что и данные.
+func TestDeclaredSizeIsBoundToSegments(t *testing.T) {
+	const n = 2*SegmentSize + 500
+	data := plaintext(n)
+	version := uuid.New()
+	key := mustKey(t)
+
+	var ct bytes.Buffer
+	// Отрицательный объявленный размер — ошибка конструктора, а не паника.
+	if _, err := NewWriter(io.Discard, key, version, 0, -1); err == nil {
+		t.Errorf("писатель принял отрицательный размер")
+	}
+
+	w, err := NewWriter(&ct, key, version, 0, int64(n))
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Уменьшили РОВНО на целый сегмент вместе с хвостом: 2 сегмента вместо
+	// трёх. Это и есть «обрезка по границе сегмента» — каждый оставшийся
+	// сегмент целой длины и сам по себе подлинный, поэтому длина файла о
+	// подмене не скажет ничего. Поймать это может только размер в AAD.
+	//
+	// Усечение в середину сегмента ловится и без размера (длина шифротекста не
+	// совпадёт с тегом), и первый вариант теста давал именно этот случай —
+	// мутация «AAD игнорирует размер» сквозь него проходила.
+	short, err := NewReader(bytes.NewReader(ct.Bytes()), key, version, 0, 2*SegmentSize)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer short.Close()
+	if _, err := io.ReadAll(NewSeqReader(short)); !errors.Is(err, ErrCorruptedSegment) {
+		t.Errorf("уменьшенный размер: %v, хотели ErrCorruptedSegment", err)
+	}
+
+	// Целый объект читается как ни в чём не бывало.
+	full, err := NewReader(bytes.NewReader(ct.Bytes()), key, version, 0, int64(n))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer full.Close()
+	got, err := io.ReadAll(NewSeqReader(full))
+	if err != nil {
+		t.Errorf("полный размер: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Errorf("полный размер: байты не совпали")
 	}
 }

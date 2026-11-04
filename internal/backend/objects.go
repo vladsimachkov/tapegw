@@ -145,6 +145,22 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		algo = types.ChecksumAlgorithm(strings.ToUpper(chRdr.Algorithm()))
 	}
 
+	// Объявленный размер тела обязан быть. Он входит в AAD каждого сегмента
+	// (ADR-0014), поэтому шифровать можно только зная длину заранее — а без
+	// привязки к длине отрезанный по границе сегмента хвост прошёл бы проверку
+	// аутентичности.
+	//
+	// Для aws-chunked versitygw кладёт в ContentLength декодированную длину
+	// (object-put.go:941, x-amz-decoded-content-length), а не длину кадра,
+	// поэтому поле годится и для чанкованных загрузок.
+	declared := int64(0)
+	if po.ContentLength != nil {
+		declared = *po.ContentLength
+	}
+	if declared <= 0 {
+		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrMissingContentLength)
+	}
+
 	// UUID генерируем здесь, а не в базе: имя файла в спуле обязано совпасть со
 	// строкой, и mover потом соберёт тот же путь по UUID из строки (ADR-0007).
 	info, err := t.spool.WriteEncrypted(id, po.Body, spool.SumSpec{
@@ -152,10 +168,15 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		Algorithm:               algo,
 		Expected:                checksumExpected(&po, algo),
 		SkipAlgorithmValidation: trailing,
-	}, limit, dek)
+	}, limit, dek, declared)
 	if err != nil {
 		if errors.Is(err, spool.ErrTooLarge) {
 			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrEntityTooLarge)
+		}
+		if errors.Is(err, spool.ErrSizeMismatch) {
+			// Объявили одно, пришло другое. AWS за это же отвечает
+			// IncompleteBody: недосланный под видом целого объект хуже отказа.
+			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrIncompleteBody)
 		}
 		// Ошибку сверки контрольной суммы HashReader уже вернул типизированной
 		// ошибкой versitygw (BadDigest и родственные) — оборачивать её в

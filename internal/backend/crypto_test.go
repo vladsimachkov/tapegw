@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 
 	"github.com/vladsimachkov/tapegw/internal/backend"
@@ -269,4 +270,57 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b)
+}
+
+// Уменьшение размера в метаданных должно делать объект нечитаемым, а не
+// отдавать его усечённым. Это тот самый rebuild-meta (ADR-0014): там размер
+// приходит с того же носителя, что и данные, поэтому полагаться на него нельзя.
+func TestShrunkSizeInMetadataIsRejected(t *testing.T) {
+	// Хвост в 700 байт нужен затем, чтобы уменьшение попало ровно на границу
+	// сегментов: усечение в середину сегмента ловится и без размера в AAD.
+	be, m, _ := newBackend(t)
+	mustBucket(t, be)
+	const n = 2*encrypt.SegmentSize + 700
+	putBytes(t, be, "b", "k", filler(n))
+
+	obj := currentObject(t, m, "b", "k")
+	if _, err := m.Pool.Exec(context.Background(),
+		`UPDATE objects SET size = $2 WHERE id = $1`, obj.ID, 2*encrypt.SegmentSize); err != nil {
+		t.Fatalf("уменьшение размера: %v", err)
+	}
+
+	out, err := be.GetObject(testCtx(), &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k")})
+	if err != nil {
+		return // отказ до чтения тоже подходит
+	}
+	got, rerr := readBody(t, out.Body)
+	if rerr == nil {
+		t.Errorf("усечённый объект прочитался: %d байт вместо %d", len(got), 2*encrypt.SegmentSize)
+	}
+}
+
+// Размер обязан быть объявлен до тела: он входит в AAD сегментов.
+func TestPutRequiresContentLength(t *testing.T) {
+	be, _, _ := newBackend(t)
+	mustBucket(t, be)
+	_, err := be.PutObject(testCtx(), s3response.PutObjectInput{
+		Bucket: ptr("b"), Key: ptr("k"), Body: bytes.NewReader([]byte("данные")),
+	})
+	if !isS3Code(err, s3err.ErrMissingContentLength) {
+		t.Errorf("PUT без ContentLength: %v, хотели MissingContentLength", err)
+	}
+}
+
+// Объявили одно, пришло другое — отказ, а не «объект непонятной длины».
+func TestPutBodyShorterThanDeclared(t *testing.T) {
+	be, _, _ := newBackend(t)
+	mustBucket(t, be)
+	body := []byte("столько байт, сколько объявлено не будет")
+	_, err := be.PutObject(testCtx(), s3response.PutObjectInput{
+		Bucket: ptr("b"), Key: ptr("k"),
+		Body: bytes.NewReader(body), ContentLength: ptr(int64(len(body) + 10)),
+	})
+	if !isS3Code(err, s3err.ErrIncompleteBody) {
+		t.Errorf("тело короче объявления: %v, хотели IncompleteBody", err)
+	}
 }

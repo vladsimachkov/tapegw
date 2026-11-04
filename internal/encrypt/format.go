@@ -123,16 +123,30 @@ func nonce(version uuid.UUID, part uint32, seg uint64) []byte {
 	return sum[:12]
 }
 
-// aad — открытые данные, привязанные к сегменту: UUID версии и номер части.
+// aad — открытые данные, привязанные к сегменту: UUID версии, номер части и
+// ПОЛНЫЙ размер открытого текста этой части.
 //
-// Без AAD сегмент одной версии можно было бы подставить в другую (тот же DEK у
-// них быть не может, но DEK мог утечь между версиями при копировании строки),
-// и — важнее — сегменты переставлялись бы внутри объекта.
-func aad(version uuid.UUID, part uint32) []byte {
-	out := make([]byte, 0, 20)
+// Первые два поля не дают переставить сегмент между версиями и частями. Третье
+// нужно от отдельного класса атак — усечения: без размера ни один сегмент не
+// знает, сколько их всего, поэтому отрезанный по границе сегмента хвост GCM не
+// заметит (каждый оставшийся сегмент по отдельности подлинный). Сейчас от этого
+// защищает только Reader: он берёт размер из БД и при нехватке байт возвращает
+// ErrShortRead.
+//
+// Это плохо именно для rebuild-meta (ADR-0014): там размер берётся из
+// атрибутов Phobos, то есть с того же носителя, что и данные. Порча или подмена
+// атрибута размера дала бы «успешное» расшифрование объекта без последних
+// сегментов. С размером в AAD такой объект не пройдёт проверку аутентичности:
+// целостность держится на криптографии, а не на целости метаданных.
+//
+// plainSize — размер открытого текста части: для обычного PUT размер объекта,
+// для multipart — размер своей части (он лежит в object_parts навсегда).
+func aad(version uuid.UUID, part uint32, plainSize int64) []byte {
+	out := make([]byte, 0, 28)
 	out = append(out, version[:]...)
-	var p [4]byte
-	binary.BigEndian.PutUint32(p[:], part)
+	var p [12]byte
+	binary.BigEndian.PutUint32(p[:4], part)
+	binary.BigEndian.PutUint64(p[4:], uint64(plainSize))
 	return append(out, p[:]...)
 }
 
@@ -155,7 +169,7 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 //
 // buf — буфер под результат длиной не меньше CipherSize(len(plain)); передаётся
 // снаружи, чтобы в потоке не аллоцировать на каждый сегмент.
-func SealSegment(dst, key []byte, version uuid.UUID, part uint32, seg uint64, plain []byte) ([]byte, error) {
+func SealSegment(dst, key []byte, version uuid.UUID, part uint32, seg uint64, plainSize int64, plain []byte) ([]byte, error) {
 	gcm, err := newGCM(key)
 	if err != nil {
 		return nil, err
@@ -163,17 +177,17 @@ func SealSegment(dst, key []byte, version uuid.UUID, part uint32, seg uint64, pl
 	if len(plain) > SegmentSize {
 		return nil, fmt.Errorf("encrypt: сегмент %d байт, максимум %d", len(plain), SegmentSize)
 	}
-	out := gcm.Seal(dst[:0], nonce(version, part, seg), plain, aad(version, part))
+	out := gcm.Seal(dst[:0], nonce(version, part, seg), plain, aad(version, part, plainSize))
 	return out, nil
 }
 
 // OpenSegment — открытый текст одного сегмента. Ошибка, если тег не сошёлся.
-func OpenSegment(dst, key []byte, version uuid.UUID, part uint32, seg uint64, data []byte) ([]byte, error) {
+func OpenSegment(dst, key []byte, version uuid.UUID, part uint32, seg uint64, plainSize int64, data []byte) ([]byte, error) {
 	gcm, err := newGCM(key)
 	if err != nil {
 		return nil, err
 	}
-	out, err := gcm.Open(dst[:0], nonce(version, part, seg), data, aad(version, part))
+	out, err := gcm.Open(dst[:0], nonce(version, part, seg), data, aad(version, part, plainSize))
 	if err != nil {
 		return nil, fmt.Errorf("%w: часть %d сегмент %d", ErrCorruptedSegment, part, seg)
 	}

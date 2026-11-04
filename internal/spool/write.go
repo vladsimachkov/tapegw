@@ -69,7 +69,7 @@ type ObjectInfo struct {
 //
 // limit > 0 ограничивает размер; превышение — ErrTooLarge, файл не остаётся.
 func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (ObjectInfo, error) {
-	return s.write(id, r, spec, limit, nil)
+	return s.write(id, r, spec, limit, nil, 0)
 }
 
 // WriteEncrypted — то же, что Write, но на диск ложится шифротекст (ADR-0014).
@@ -82,11 +82,14 @@ func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (Obj
 //
 // version — UUID версии объекта (он же id файла спула), part = 0: у обычного PUT
 // частей нет.
-func (s *Spool) WriteEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, key []byte) (ObjectInfo, error) {
-	return s.write(id, r, spec, limit, key)
+// plainSize — объявленный размер открытого тела. Он обязателен: входит в AAD
+// каждого сегмента (ADR-0014), поэтому шифровать можно только зная длину
+// заранее. Факт несовпадения с фактическими байтами — ErrSizeMismatch.
+func (s *Spool) WriteEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, key []byte, plainSize int64) (ObjectInfo, error) {
+	return s.write(id, r, spec, limit, key, plainSize)
 }
 
-func (s *Spool) write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, encKey []byte) (ObjectInfo, error) {
+func (s *Spool) write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, encKey []byte, plainSize int64) (ObjectInfo, error) {
 	var info ObjectInfo
 
 	// Ограничитель ставим ниже сверителей, чтобы HashReader увидел EOF и успел
@@ -153,7 +156,7 @@ func (s *Spool) write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, encK
 	var dst io.Writer = tmp
 	var enc *encrypt.Writer
 	if encKey != nil {
-		enc, err = encrypt.NewWriter(tmp, encKey, id, 0)
+		enc, err = encrypt.NewWriter(tmp, encKey, id, 0, plainSize)
 		if err != nil {
 			tmp.Close()
 			return info, err
@@ -178,9 +181,19 @@ func (s *Spool) write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, encK
 		// и загрузил.
 		n = enc.Wrote()
 	}
+	// Порядок проверок: сначала лимит. Если тело больше допустимого, ответ
+	// EntityTooLarge полезнее, чем «длина не совпала с объявленной»: клиенту
+	// важно, что объект слишком большой, а не то, что он ещё и наврал про длину.
 	if limit > 0 && n > limit {
 		tmp.Close()
 		return info, ErrTooLarge
+	}
+	if enc != nil && n != plainSize {
+		// Тело не совпало с объявленной длиной. Молча записать то, что пришло,
+		// нельзя: AAD сегментов завернут под plainSize, и такой файл потом всё
+		// равно не расшифруется, а ошибка через месяц чтения хуже отказа сейчас.
+		tmp.Close()
+		return info, fmt.Errorf("%w: объявлено %d, записано %d", ErrSizeMismatch, plainSize, n)
 	}
 
 	sum := md5h.Sum(nil)

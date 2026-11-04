@@ -132,7 +132,7 @@ func (r *Reader) readSegment(seg uint64, plainSeg int64) ([]byte, error) {
 		r.tmpBuf = make([]byte, need)
 	}
 	out := r.tmpBuf[:0]
-	return OpenSegment(out, r.key, r.version, r.part, seg, ct)
+	return OpenSegment(out, r.key, r.version, r.part, seg, r.plain, ct)
 }
 
 // Read — последовательное чтение с нуля. Нужен там, где Range нет: полный GET,

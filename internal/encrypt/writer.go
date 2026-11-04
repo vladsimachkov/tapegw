@@ -18,6 +18,10 @@ type Writer struct {
 	key     []byte
 	version uuid.UUID
 	part    uint32
+	// plainSize — полный размер открытого текста части. Он входит в AAD каждого
+	// сегмента, поэтому писатель обязан знать его заранее: отсюда требование к
+	// PutObject объявлять длину до тела.
+	plainSize int64
 
 	buf    []byte // недобитый хвост текущего сегмента
 	seg    uint64 // номер следующего сегмента
@@ -31,9 +35,12 @@ type Writer struct {
 //
 // Ключ копируется внутрь, поэтому вызывающий волен обнулить свой массив сразу
 // после записи: обёрнутый DEK он уже получил, а писателю ключ больше не нужен.
-func NewWriter(dst io.Writer, key []byte, version uuid.UUID, part uint32) (*Writer, error) {
+func NewWriter(dst io.Writer, key []byte, version uuid.UUID, part uint32, plainSize int64) (*Writer, error) {
 	if len(key) != KeySize {
 		return nil, fmt.Errorf("encrypt: ключ %d байт, нужно %d", len(key), KeySize)
+	}
+	if plainSize < 0 {
+		return nil, fmt.Errorf("encrypt: отрицательный размер %d", plainSize)
 	}
 	// Ключ копируется: Writer переживает вызов NewWriter, и обнуление ключа
 	// вызывающим в середине записи разрушило бы шифрование так же тихо, как и
@@ -41,12 +48,13 @@ func NewWriter(dst io.Writer, key []byte, version uuid.UUID, part uint32) (*Writ
 	own := make([]byte, KeySize)
 	copy(own, key)
 	return &Writer{
-		dst:     dst,
-		key:     own,
-		version: version,
-		part:    part,
-		buf:     make([]byte, 0, SegmentSize),
-		tmp:     make([]byte, 0, CipherSegmentSize),
+		dst:       dst,
+		key:       own,
+		version:   version,
+		part:      part,
+		plainSize: plainSize,
+		buf:       make([]byte, 0, SegmentSize),
+		tmp:       make([]byte, 0, CipherSegmentSize),
 	}, nil
 }
 
@@ -81,7 +89,7 @@ func (w *Writer) flush() error {
 	if len(w.buf) == 0 {
 		return nil
 	}
-	ct, err := SealSegment(w.tmp, w.key, w.version, w.part, w.seg, w.buf)
+	ct, err := SealSegment(w.tmp, w.key, w.version, w.part, w.seg, w.plainSize, w.buf)
 	if err != nil {
 		return err
 	}
