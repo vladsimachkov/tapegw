@@ -154,8 +154,15 @@ func (m *Meta) deleteCurrent(ctx context.Context, tx pgx.Tx, bucketID int64,
 	}
 }
 
-// insertDeleteMarker — версия без тела. state = 'deleted': данных нет, в
-// deleting ей делать нечего — deleter искал бы то, чего не существует.
+// insertDeleteMarker — версия без тела: state = 'marker', retired_at = NULL.
+//
+// Не 'deleted' по двум причинам. Во-первых, фильтры вида
+// `state NOT IN ('deleting','deleted')` должны видеть маркер как живую версию:
+// иначе удаление текущей версии воскрешает объект, спрятанный маркером.
+// Во-вторых, janitor (M6) физически удаляет строки в 'deleted' старше
+// meta.terminal_retention, и маркеры исчезли бы вместе с защитой от
+// «воскрешения». В 'deleting' маркеру делать нечего — deleter искал бы то,
+// чего не существует.
 func insertDeleteMarker(ctx context.Context, tx pgx.Tx, bucketID int64,
 	in DeleteObjectInput, nullVersion bool) (string, error) {
 
@@ -167,10 +174,10 @@ func insertDeleteMarker(ctx context.Context, tx pgx.Tx, bucketID int64,
 	_, err := tx.Exec(ctx,
 		`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class,
 		                      state, landing, online_until, tenant_id, pool_id,
-		                      is_current, is_delete_marker, is_null_version, retired_at)
-		  VALUES ($1,$2,$3,0,'','GLACIER','deleted',false,now(),
+		                      is_current, is_delete_marker, is_null_version)
+		  VALUES ($1,$2,$3,0,'','GLACIER','marker',false,now(),
 		          (SELECT tenant_id FROM buckets WHERE id = $2), $5,
-		          true, true, $4, now())`,
+		          true, true, $4)`,
 		id, bucketID, in.Key, nullVersion, DefaultPoolID)
 	if err != nil {
 		return "", fmt.Errorf("insert delete marker %s/%s: %w", in.Bucket, in.Key, err)
@@ -236,18 +243,25 @@ func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID int64,
 		}
 	}
 
-	// Маркер удаления — версия без данных: она просто исчезает, deleter для неё
-	// не нужен. Обычная версия уходит в deleting, и копия снимается с диска и
-	// с ленты.
-	newState := "deleting"
-	retired := "NULL"
+	// Маркер удаления по versionId — стандартный способ вернуть удалённый
+	// объект в S3: удаляешь маркер, и предыдущая версия снова становится
+	// текущей. Строка маркера исчезает физически.
+	//
+	// Перевод в 'deleted' не годится дважды. Во-первых, он нарушает
+	// CHECK (is_delete_marker = (state = 'marker')) — то есть клиент получил бы
+	// 500 на штатную операцию. Во-вторых, «удалённая версия нулевого размера»
+	// — сущность, которой никогда не существовало: данных у маркера нет ни на
+	// диске, ни на ленте, deleter ему не нужен. Для аудита хватит журнала (T4).
+	//
+	// Если на T3 появится квота на число объектов, здесь же нужно уменьшать
+	// счётчик: по ADR-0015 маркеры в квоту входят.
 	if isMarker {
-		newState = "deleted"
-		retired = "now()"
-	}
-	if _, err := tx.Exec(ctx,
-		fmt.Sprintf(`UPDATE objects SET is_current = false, state = '%s', retired_at = %s
-		              WHERE id = $1`, newState, retired), verID); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM objects WHERE id = $1`, verID); err != nil {
+			return fmt.Errorf("delete marker %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
+		}
+	} else if _, err := tx.Exec(ctx,
+		`UPDATE objects SET is_current = false, state = 'deleting', retired_at = NULL
+		  WHERE id = $1`, verID); err != nil {
 		return fmt.Errorf("delete version %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
 	}
 
@@ -313,7 +327,7 @@ func (m *Meta) LookupVersion(ctx context.Context, tenant TenantID,
 			           JOIN buckets b ON b.id = o.bucket_id
 			          WHERE b.name = $1 AND b.deleted_at IS NULL
 			            AND o.key = $2 AND %s
-			            AND (o.is_delete_marker OR o.state NOT IN ('deleting','deleted'))`, cond)
+			            AND o.state NOT IN ('deleting','deleted')`, cond)
 	q, qargs := withTenantCol(base, "b.tenant_id", tenant, args...)
 
 	obj, err := scanObject(m.Pool.QueryRow(ctx, q, qargs...))

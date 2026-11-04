@@ -3,6 +3,9 @@ package meta_test
 import (
 	"context"
 	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
 	"testing"
 	"time"
 
@@ -221,5 +224,159 @@ func TestDeleteLastVersionRemovesKey(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("текущих версий %d, хотели 0", n)
+	}
+}
+
+// Воскрешение удалённого объекта. Сценарий целиком:
+//
+//	PUT k → v1; DELETE k → маркер m2 (ключ «удалён»); PUT k → v3;
+//	DELETE k?versionId=v3.
+//
+// Текущей должен стать маркер m2, и ключ остаётся удалённым. Пока маркер лежал
+// в state='deleted', выбор следующей текущей версии (`NOT IN
+// ('deleting','deleted')`) его не видел и текущей становилась v1 — объект,
+// который клиент удалил, появлялся снова в GET и в листинге.
+func TestDeleteCurrentVersionPromotesMarker(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "res")
+	setBucketVersioning(t, m, "res", meta.VersioningEnabled)
+
+	insertVersion(t, m, "res", "k", versionOpts{size: 5, current: true})
+
+	del, err := m.DeleteObject(ctx, testTenant, meta.DeleteObjectInput{Bucket: "res", Key: "k"})
+	if err != nil {
+		t.Fatalf("удаление без versionId: %v", err)
+	}
+	markerID := del.VersionID
+
+	// PUT поверх маркера: PutObject сам снимает флаг с предыдущей текущей
+	// версии, здесь это одна команда.
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE objects SET is_current = false
+		  WHERE bucket_id = (SELECT id FROM buckets WHERE name = 'res') AND key = 'k'`); err != nil {
+		t.Fatalf("снять флаг текущести: %v", err)
+	}
+	v3 := insertVersion(t, m, "res", "k", versionOpts{size: 7, current: true})
+
+	if _, err := m.DeleteObject(ctx, testTenant, meta.DeleteObjectInput{
+		Bucket: "res", Key: "k", VersionID: v3,
+	}); err != nil {
+		t.Fatalf("удаление v3: %v", err)
+	}
+
+	if got := currentVersionID(t, m, "res", "k"); got != markerID {
+		t.Errorf("текущей стал %s, хотели маркер %s: объект воскрес", got, markerID)
+	}
+
+	// И листинг не должен показывать ключ: под маркером есть живая v1.
+	live, err := m.ListObjectsCurrent(ctx, testTenant, "res", "", "", "", 10)
+	if err != nil {
+		t.Fatalf("листинг: %v", err)
+	}
+	if len(live.Entries) != 0 {
+		keys := keysOf(live)
+		t.Errorf("под маркером листинг дал %v, хотели пусто", keys)
+	}
+}
+
+// Маркер — живущая версия, а не «мусор на удаление». CHECK запрещает и
+// retired_at у маркера, и расхождение флага с состоянием: любой из двух вариантов
+// означает, что janitor (M6) однажды удалит маркер и похороненная под ним
+// версия воскреснет.
+func TestMarkerStateConstraints(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "chk")
+	setBucketVersioning(t, m, "chk", meta.VersioningEnabled)
+
+	var bucketID int64
+	if err := m.Pool.QueryRow(ctx, `SELECT id FROM buckets WHERE name = 'chk'`).Scan(&bucketID); err != nil {
+		t.Fatalf("id бакета: %v", err)
+	}
+
+	now := time.Now()
+	cases := []struct {
+		name, state string
+		marker      bool
+		retired     *time.Time // nil — retired_at нет
+		wantOK      bool
+	}{
+		{"маркер в marker без retired_at", "marker", true, nil, true},
+		{"маркер с retired_at", "marker", true, &now, false},
+		{"маркер в deleted", "deleted", true, nil, false},
+		{"обычная версия в marker", "marker", false, nil, false},
+		{"обычная версия в pending", "pending", false, nil, true},
+	}
+	for i, tc := range cases {
+		_, err := m.Pool.Exec(ctx,
+			`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class,
+			                      state, landing, online_until, tenant_id, pool_id,
+			                      is_current, is_delete_marker, is_null_version, retired_at)
+			  VALUES ($1,$2,$3,0,'','GLACIER',$4,false,now(),1,1,false,$5,false,$6)`,
+			uuid.New(), bucketID, fmt.Sprintf("k%d", i), tc.state, tc.marker, tc.retired)
+		if tc.wantOK && err != nil {
+			t.Errorf("%s: вставка отклонена (%v), а должна пройти", tc.name, err)
+		}
+		if !tc.wantOK && err == nil {
+			t.Errorf("%s: вставка прошла, а схема обязана отклонить", tc.name)
+		}
+	}
+}
+
+// Удаление маркера по versionId — штатный способ S3 вернуть удалённый объект.
+// Пока маркер переводился в 'deleted', эта операция падала на CHECK
+// (is_delete_marker = (state='marker')), и клиент получал 500.
+func TestDeleteMarkerRestoresObject(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "rest")
+	setBucketVersioning(t, m, "rest", meta.VersioningEnabled)
+
+	v1 := insertVersion(t, m, "rest", "k", versionOpts{size: 5, current: true})
+	del, err := m.DeleteObject(ctx, testTenant, meta.DeleteObjectInput{Bucket: "rest", Key: "k"})
+	if err != nil {
+		t.Fatalf("создание маркера: %v", err)
+	}
+	markerID := del.VersionID
+
+	if _, err := m.DeleteObject(ctx, testTenant, meta.DeleteObjectInput{
+		Bucket: "rest", Key: "k", VersionID: markerID,
+	}); err != nil {
+		t.Fatalf("удаление маркера по versionId: %v", err)
+	}
+
+	if got := currentVersionID(t, m, "rest", "k"); got != v1 {
+		t.Errorf("после удаления маркера текущая = %s, хотели v1 = %s", got, v1)
+	}
+
+	// Строки маркера не должно оставаться: у него нет данных, и «удалённая
+	// версия нулевого размера» — сущность, которой никогда не существовало.
+	var left int
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM objects WHERE id = $1::uuid`, markerID).Scan(&left); err != nil {
+		t.Fatalf("спрос про строку маркера: %v", err)
+	}
+	if left != 0 {
+		t.Errorf("строка маркера осталась в базе (%d шт.) — маркер удаляется физически", left)
+	}
+
+	// GET и листинг видят восстановленный объект.
+	obj, err := m.GetObject(ctx, testTenant, "rest", "k")
+	if err != nil {
+		t.Fatalf("GET после удаления маркера: %v", err)
+	}
+	if obj.ID.String() != v1 {
+		t.Errorf("GET отдал версию %s, хотели v1 = %s", obj.ID, v1)
+	}
+	live, err := m.ListObjectsCurrent(ctx, testTenant, "rest", "", "", "", 10)
+	if err != nil {
+		t.Fatalf("листинг: %v", err)
+	}
+	if keys := keysOf(live); len(keys) != 1 || keys[0] != "k" {
+		t.Errorf("листинг дал %v, хотели [k]", keys)
 	}
 }
