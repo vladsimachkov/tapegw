@@ -1,11 +1,31 @@
-# Единная цель пока — безопасная мутация. См. hack/mutate.sh: правки до коммита
-# не лежат в git, и откат через `git checkout <файл>` стирает всю работу в
-# файле. Правило в AGENTS.md не сработало дважды, поэтому механизм.
+# Две цели: check — полный прогон перед пушем, mutate — безопасная мутация.
 #
-#   make mutate FILE=internal/meta/lock.go \
-#        'EXPR=s/return ErrRetentionShorten/_ = 0/' \
+# check существует потому, что CI проверяет больше, чем «go build && go test»:
+# gofmt, vet, staticcheck и то, что `go mod tidy` не оставляет изменений.
+# Последнее уже поймало меня на пуше: новый прямой импорт (fasthttp) надо
+# относить в прямые зависимости go.mod, и обнаружилось это только в CI.
+
+GO       ?= go
+# staticcheck лежит в GOBIN, а не обязательно в PATH.
+GOBIN    ?= $(shell $(GO) env GOPATH)/bin
+PKG      ?= ./...
+DSN      ?= postgres://tapegw:tapegw@localhost:55432/phobos?search_path=tapegw_test
+
+check:
+	@echo "### gofmt"; out=$$(gofmt -l .); if [ -n "$$out" ]; then echo "$$out"; exit 1; fi
+	@echo "### go vet";        $(GO) vet $(PKG)
+	@echo "### staticcheck";   $(GOBIN)/staticcheck $(PKG)
+	@echo "### go mod tidy";   $(GO) mod tidy; \
+		if ! git diff --quiet go.mod go.sum; then \
+			echo "go mod tidy оставил изменения в go.mod/go.sum — закоммить их"; \
+			git diff go.mod go.sum | head -20; exit 1; \
+		fi
+	@echo "### тесты";         TAPEGW_TEST_DSN="$(DSN)" $(GO) test -race -count=1 $(PKG)
+	@echo "### чисто"
+
+# make mutate FILE=internal/meta/lock.go 'EXPR=s/return ErrRetentionShorten/_ = 0/' \
 #        PKG=./internal/backend/ ARGS="-run TestCompliance"
 mutate:
 	./hack/mutate.sh "$(FILE)" "$(EXPR)" "$(PKG)" $(ARGS)
 
-.PHONY: mutate
+.PHONY: check mutate
