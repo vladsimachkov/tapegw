@@ -446,3 +446,53 @@ func TestListObjectVersionsEncodingTypeCase(t *testing.T) {
 		t.Errorf("ключ при encoding-type=URL закодирован как %q, хотели a%%2Bb", got)
 	}
 }
+
+// DeleteObject: заголовки ответа и отказ Object Lock на уровне бэкенда.
+func TestDeleteObjectBackend(t *testing.T) {
+	be, m, _ := newBackend(t)
+	ctx := ownerCtx("root-owner")
+	const bucket = "delobj"
+
+	if err := be.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: ptr(bucket)}, nil); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	if _, err := m.Pool.Exec(context.Background(),
+		`UPDATE buckets SET versioning = 'enabled' WHERE name = $1`, bucket); err != nil {
+		t.Fatalf("versioning: %v", err)
+	}
+
+	// 1. Удаление без versionId — маркер, данные целы.
+	dataID := insertVersion(t, m, bucket, "k", true, false, false, 9)
+	res, err := be.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: ptr(bucket), Key: ptr("k")})
+	if err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	if res.DeleteMarker == nil || !*res.DeleteMarker {
+		t.Errorf("x-amz-delete-marker не выставлен")
+	}
+	if res.VersionId == nil || *res.VersionId == dataID {
+		t.Errorf("x-amz-version-id = %v, хотели id маркера", res.VersionId)
+	}
+
+	// 2. Удаление версии под retention — AccessDenied.
+	lockedID := insertVersion(t, m, bucket, "k2", true, false, false, 3)
+	if _, err := m.Pool.Exec(context.Background(),
+		`UPDATE objects SET retention_mode = 'GOVERNANCE',
+		        retain_until = now() + interval '1 hour'
+		  WHERE id = $1`, lockedID); err != nil {
+		t.Fatalf("retention: %v", err)
+	}
+	if _, err := be.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: ptr(bucket), Key: ptr("k2"), VersionId: ptr(lockedID),
+	}); !isS3Code(err, vs3err.ErrAccessDenied) {
+		t.Errorf("удаление заблокированной версии: %v, хотели AccessDenied", err)
+	}
+
+	// 3. Тот же запрос с обходом GOVERNANCE проходит.
+	if _, err := be.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: ptr(bucket), Key: ptr("k2"), VersionId: ptr(lockedID),
+		BypassGovernanceRetention: ptr(true),
+	}); err != nil {
+		t.Errorf("удаление с обходом GOVERNANCE: %v, хотели успех", err)
+	}
+}

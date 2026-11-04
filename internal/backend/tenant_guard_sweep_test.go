@@ -106,7 +106,7 @@ var backendMethodCases = map[string]guardCase{
 	"DeleteBucketCors":              {class: unimplemented, reason: "CORS вне MVP"},
 	"DeleteBucketOwnershipControls": {class: unimplemented, reason: "ownership controls вне MVP"},
 	"DeleteBucketWebsite":           {class: unimplemented, reason: "static website вне MVP"},
-	"DeleteObject":                  {class: unimplemented, reason: "удаление объектов появится с M3"},
+	"DeleteObject":                  {class: guarded, reason: "удаление под стражом и под проверкой Object Lock"},
 	"DeleteObjectTagging":           {class: unimplemented, reason: "теги объектов появятся с M3"},
 	"DeleteObjects":                 {class: unimplemented, reason: "пакетное удаление появится с M3"},
 	"GetBucketCors":                 {class: unimplemented, reason: "CORS вне MVP"},
