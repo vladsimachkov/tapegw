@@ -22,6 +22,17 @@ CREATE SEQUENCE objects_version_seq;
 ALTER TABLE objects
   ADD COLUMN version_seq bigint;
 
+-- Последовательность привязана к колонке: она удаляется вместе с ней и
+-- правильно переносится pg_dump/restore (иначе на восстановленной базе
+-- nextval() смотрит в последовательность, которая никому не принадлежит).
+ALTER SEQUENCE objects_version_seq OWNED BY objects.version_seq;
+
+-- Старый индекс 0005 на (bucket_id, key COLLATE "C") по всем строкам. Новый
+-- objects_key_versions начинается с тех же колонок и покрывает все запросы
+-- старого, а четвёртый индекс на те же колонки — это четвёртая запись на каждый
+-- PUT. В Down он возвращается дословно так, как был создан в 0005.
+DROP INDEX objects_versions;
+
 -- Порядок существующих строк задаём по (created_at, id): лучше, чем ничего, и
 -- единственный доступный. На живой базе это компромисс, а не истина — но к
 -- моменту включения версионирования строк здесь быть не должно, а тест ниже
@@ -58,3 +69,6 @@ CREATE INDEX objects_key_versions
 DROP INDEX IF EXISTS objects_key_versions;
 ALTER TABLE objects DROP COLUMN IF EXISTS version_seq;
 DROP SEQUENCE IF EXISTS objects_version_seq;
+
+-- Возврат индекса из 0005 — тем же определением, каким он был создан.
+CREATE INDEX objects_versions ON objects (bucket_id, key COLLATE "C");

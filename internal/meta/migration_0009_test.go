@@ -55,6 +55,36 @@ func TestMigration0009VersionSeq(t *testing.T) {
 		t.Errorf("индекс objects_key_versions отсутствует")
 	}
 
+	// Старый индекс 0005 удалён: новый начинается с тех же колонок, и оставить
+	// оба — значит писать на каждый PUT в два индекса с одним префиксом.
+	if n := indexCount(t, ctx, m, "objects_versions"); n != 0 {
+		t.Errorf("индекс objects_versions остался (строк %d): новый его покрывает, а "+
+			"четвёртый индекс на (bucket_id, key) замедляет каждый PUT", n)
+	}
+
+	// Последовательность привязана к колонке: иначе на восстановленной из
+	// pg_dump базе nextval() смотрит в объект, который никому не принадлежит.
+	//
+	// Фильтр по схеме обязателен: в кластере живут соседние тестовые схемы
+	// (tapegw_test_backend, tapegw_test_iam, scratch-схема теста 0007), и без
+	// него count() считает чужие последовательности — тест падает там, где
+	// миграция исправна.
+	var owned int
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_class s
+		   JOIN pg_depend d ON d.objid = s.oid AND d.deptype = 'a'
+		   JOIN pg_class t ON d.refobjid = t.oid
+		   JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+		  WHERE s.relname = 'objects_version_seq'
+		    AND s.relnamespace = current_schema()::regnamespace
+		    AND t.relname = 'objects' AND a.attname = 'version_seq'`).
+		Scan(&owned); err != nil {
+		t.Fatalf(" OWNED BY: %v", err)
+	}
+	if owned != 1 {
+		t.Errorf("objects_version_seq не привязана к objects.version_seq через OWNED BY")
+	}
+
 	// Номера назначаются при вставке и растут в порядке вставки — даже когда
 	// created_at одинаковый. Это и есть смысл колонки: now() в Postgres — время
 	// начала транзакции, и на created_at порядок держать нельзя.
@@ -121,12 +151,26 @@ func TestMigration0009VersionSeq(t *testing.T) {
 	if n := seqCount(t, ctx, m, "objects_version_seq"); n != 0 {
 		t.Errorf("после Down последовательность objects_version_seq осталась")
 	}
+	if n := indexCount(t, ctx, m, "objects_versions"); n != 1 {
+		t.Errorf("после Down индекс objects_versions не возвращён (строк %d)", n)
+	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0009, "Up")); err != nil {
 		t.Fatalf("повторный Up 0009: %v", err)
 	}
 	if n := columnCount(t, ctx, m, "version_seq"); n != 1 {
 		t.Errorf("после повторного Up колонка version_seq не вернулась")
 	}
+}
+
+func indexCount(t *testing.T, ctx context.Context, m *meta.Meta, idx string) int {
+	t.Helper()
+	var n int
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_indexes
+		  WHERE schemaname = current_schema() AND indexname = $1`, idx).Scan(&n); err != nil {
+		t.Fatalf("счётчик индексов: %v", err)
+	}
+	return n
 }
 
 func columnCount(t *testing.T, ctx context.Context, m *meta.Meta, col string) int {
