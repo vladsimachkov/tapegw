@@ -359,3 +359,123 @@ func TestDeclaredSizeIsBoundToSegments(t *testing.T) {
 		t.Errorf("полный размер: байты не совпали")
 	}
 }
+
+// sealParts — шифрует несколько частей в один буфер так же, как это делает
+// multipart: части пишутся последовательно, каждая своим номером.
+func sealParts(t *testing.T, key []byte, version uuid.UUID, sizes []int) ([]byte, [][]byte) {
+	t.Helper()
+	var all bytes.Buffer
+	var plains [][]byte
+	for i, n := range sizes {
+		data := plaintext(n)
+		plains = append(plains, data)
+		w, err := NewWriter(&all, key, version, uint32(i+1), int64(n))
+		if err != nil {
+			t.Fatalf("часть %d: NewWriter: %v", i+1, err)
+		}
+		if _, err := w.Write(data); err != nil {
+			t.Fatalf("часть %d: Write: %v", i+1, err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("часть %d: Close: %v", i+1, err)
+		}
+	}
+	return all.Bytes(), plains
+}
+
+// Чтение multipart: части неровного размера, диапазоны через границы частей и
+// через границы сегментов внутри части.
+func TestPartsReaderRanges(t *testing.T) {
+	sizes := []int{SegmentSize, 1000, 2*SegmentSize + 5, 7}
+	key := mustKey(t)
+	version := uuid.New()
+	ct, plains := sealParts(t, key, version, sizes)
+
+	var total int
+	for _, n := range sizes {
+		total += n
+	}
+	joined := append(append(append([]byte{}, plains[0]...), plains[1]...), plains[2]...)
+	joined = append(joined, plains[3]...)
+
+	parts := make([]Part, 0, len(sizes))
+	for i, n := range sizes {
+		parts = append(parts, Part{Number: uint32(i + 1), PlainSize: int64(n)})
+	}
+	r, err := NewPartsReader(bytes.NewReader(ct), key, version, parts, int64(total))
+	if err != nil {
+		t.Fatalf("NewPartsReader: %v", err)
+	}
+	defer r.Close()
+
+	// Границы частей: 65536, 66536, 132041, 132048.
+	boundaries := []int{0, 1, SegmentSize - 1, SegmentSize, SegmentSize + 1,
+		66536 - 1, 66536, 66536 + 1,
+		132041 - 1, 132041, 132041 + 1,
+		132048 - 1, 132047, total - 1}
+	for _, off := range boundaries {
+		for _, ln := range []int{1, 5, 70000} {
+			if off+ln > total {
+				ln = total - off
+			}
+			if ln <= 0 {
+				continue
+			}
+			p := make([]byte, ln)
+			got, err := r.ReadAt(p, int64(off))
+			if err != nil && !errors.Is(err, io.EOF) {
+				t.Errorf("off=%d len=%d: %v", off, ln, err)
+				continue
+			}
+			if !bytes.Equal(p[:got], joined[off:off+got]) {
+				t.Errorf("off=%d len=%d: байты не совпали", off, ln)
+			}
+		}
+	}
+
+	// Весь объект целиком.
+	all, err := io.ReadAll(NewSeqReader(r))
+	if err != nil {
+		t.Fatalf("чтение целиком: %v", err)
+	}
+	if !bytes.Equal(all, joined) {
+		t.Errorf("объект целиком не совпал: %d байт вместо %d", len(all), len(joined))
+	}
+}
+
+// Размер части входит в AAD, поэтому уменьшение размера части в метаданных
+// делает объект нечитаемым — а не отдаёт усечённые данные.
+func TestPartsReaderRejectsWrongPartSize(t *testing.T) {
+	sizes := []int{SegmentSize, 300}
+	key := mustKey(t)
+	version := uuid.New()
+	ct, _ := sealParts(t, key, version, sizes)
+
+	// Уменьшили вторую часть на 100 байт: суммарный размер тоже меньше, и
+	// каждая оставшаяся часть целая. Ловит только привязка размера в AAD.
+	parts := []Part{{Number: 1, PlainSize: SegmentSize}, {Number: 2, PlainSize: 200}}
+	r, err := NewPartsReader(bytes.NewReader(ct), key, version, parts, SegmentSize+200)
+	if err != nil {
+		t.Fatalf("NewPartsReader: %v", err)
+	}
+	defer r.Close()
+	if _, err := io.ReadAll(NewSeqReader(r)); !errors.Is(err, ErrCorruptedSegment) {
+		t.Errorf("уменьшенная часть: %v, хотели ErrCorruptedSegment", err)
+	}
+}
+
+// Смещения шифротекста, пришедшие из базы, обязаны совпадать с формулой:
+// рассинхрон object_parts и файла — это ошибка конструктора, а не мусор в ответе.
+func TestPartsReaderRejectsWrongCipherOffset(t *testing.T) {
+	key := mustKey(t)
+	version := uuid.New()
+	ct, _ := sealParts(t, key, version, []int{SegmentSize, 300})
+
+	parts := []Part{
+		{Number: 1, PlainSize: SegmentSize, CipherOffset: 0},
+		{Number: 2, PlainSize: 300, CipherOffset: 999},
+	}
+	if _, err := NewPartsReader(bytes.NewReader(ct), key, version, parts, SegmentSize+300); err == nil {
+		t.Errorf("несовпадение cipher_offset принято")
+	}
+}
