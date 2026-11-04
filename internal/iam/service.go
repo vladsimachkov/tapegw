@@ -232,12 +232,12 @@ func (s *Service) UpdateUserAccount(access string, props auth.MutableProps) erro
 	}
 
 	tenant := row.TenantID
+	// Тенант учётки неизменяем (план PR#2a п. 0б). Молча проигнорировать
+	// props.ProjectID было бы хуже: вызывающий получил бы «успех» и остался бы
+	// с прежним тенантом. Нужен другой тенант — выпускается новый ключ.
 	if props.ProjectID != nil {
-		if *props.ProjectID <= 0 {
-			return errNoTenant(access)
-		}
-		tenant = int64(*props.ProjectID)
-		patch.TenantID = &tenant
+		return fmt.Errorf("iam: тенант учётки %q неизменяем (был %d, просят %d): "+
+			"для другого тенанта выпускается новый ключ", access, row.TenantID, *props.ProjectID)
 	}
 
 	// Правило «роль ↔ тенант» проверяется по **итоговой** паре: смена роли или
@@ -257,17 +257,22 @@ func (s *Service) UpdateUserAccount(access string, props auth.MutableProps) erro
 	return nil
 }
 
-// DeleteUserAccount удаляет учётку. Для root — ErrNoSuchUser: root не живёт в
-// accounts и удалить его отсюда нельзя в принципе.
+// DeleteUserAccount — отзыв ключа. Метод называется «удалить» только потому,
+// что так он называется в интерфейсе versitygw; фактически строка остаётся
+// навсегда как надгробие, а секрет стирается (план PR#2a п. 0а). Иначе тот же
+// access_key можно было бы выпустить заново, и все гранты этого принципала в ACL
+// и политиках перешли бы к новому владельцу.
+//
+// Для root — ErrNoSuchUser: root не живёт в accounts и отозвать его отсюда нельзя.
 func (s *Service) DeleteUserAccount(access string) error {
 	ctx := context.Background()
 	if access == s.rootAccess {
 		return auth.ErrNoSuchUser
 	}
-	if err := s.meta.DeleteAccount(ctx, access); errors.Is(err, meta.ErrNotFound) {
+	if err := s.meta.RevokeAccount(ctx, access); errors.Is(err, meta.ErrNotFound) {
 		return auth.ErrNoSuchUser
 	} else if err != nil {
-		return fmt.Errorf("iam: удалить учётку %q: %w", access, err)
+		return fmt.Errorf("iam: отозвать учётку %q: %w", access, err)
 	}
 	return nil
 }

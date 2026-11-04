@@ -37,6 +37,9 @@ const (
 
 	tenantSystem = 1 // `default` из миграции 0005, system = true
 	tenantClient = 2 // клиентский тенант тестовой базы
+	// Второй легальный клиентский тенант: чтобы проверять надгробие на выпуске
+	// того же ключа в другом тенанте, а не на правиле «роль ↔ тенант».
+	tenantClient2 = 3
 )
 
 // Кольца ключей. Разные байты у v1 и v2 обязательны: если Open ошибётся и
@@ -67,6 +70,14 @@ func setup(t *testing.T) *env {
 		`INSERT INTO tenants (id, name, pool_id) VALUES ($1, 'client', 1)
 		  ON CONFLICT (id) DO NOTHING`, tenantClient); err != nil {
 		t.Fatalf("tenant %d: %v", tenantClient, err)
+	}
+	// Второй клиентский тенант: нужен, чтобы проверять надгробие на переносе
+	// между ДВУМЯ легальными для роли тенантами. Иначе отказ приходит по правилу
+	// «роль ↔ тенант» и тест доказывал бы не то.
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO tenants (id, name, pool_id) VALUES ($1, 'client2', 1)
+		  ON CONFLICT (id) DO NOTHING`, tenantClient2); err != nil {
+		t.Fatalf("tenant %d: %v", tenantClient2, err)
 	}
 
 	ring, err := iam.NewKeyRing(1, map[int][]byte{1: keyV1})
@@ -468,9 +479,15 @@ func TestSystemTenantRules(t *testing.T) {
 	// 4. Обычная учётка в клиентском тенанте — можно.
 	mustCreate(t, svc, "client", "s", auth.RoleUser, tenantClient)
 
-	// 5. Перенос клиентской учётки в системный тенант — тот же отказ.
-	err = svc.UpdateUserAccount("client", auth.MutableProps{ProjectID: ptr(tenantSystem)})
-	expectAccessDenied(t, "перенос в системный тенант", err)
+	// 5. Перенос учётки в другой тенант запрещён вовсе (план PR#2a п. 0б):
+	// тенант неизменяем, и отказ здесь — не про права, а про то, что такой
+	// операции не существует.
+	if err := svc.UpdateUserAccount("client", auth.MutableProps{ProjectID: ptr(tenantSystem)}); err == nil {
+		t.Errorf("перенос в системный тенант прошёл, а должен быть отказ")
+	}
+	if row := e.get(t, "client"); row.TenantID != tenantClient {
+		t.Errorf("после отказа тенант изменился: %d, хотели %d", row.TenantID, tenantClient)
+	}
 
 	// 6. Смена роли на admin у учётки клиентского тенанта — тоже.
 	err = svc.UpdateUserAccount("client", auth.MutableProps{Role: auth.RoleAdmin})
@@ -532,14 +549,15 @@ func TestUpdateAndDelete(t *testing.T) {
 		t.Fatalf("секрет не обновился: %+v err=%v", got, err)
 	}
 
-	// Перенос в другой тенант обязан тянуть за собой tenant_system — иначе
-	// вставка падает на составном FK (миграция 0007).
-	if err := svc.UpdateUserAccount("mut", auth.MutableProps{ProjectID: ptr(tenantSystem), Role: auth.RoleAdmin}); err != nil {
-		t.Fatalf("перенос в системный тенант под admin: %v", err)
+	// Переноса между тенантами не существует (план PR#2a п. 0б): тенант
+	// учётки неизменяем, нужен другой тенант — новый ключ. Проверяем, что
+	// попытка отклонена и ничего не записано.
+	if err := svc.UpdateUserAccount("mut", auth.MutableProps{ProjectID: ptr(tenantSystem), Role: auth.RoleAdmin}); err == nil {
+		t.Fatalf("перенос в системный тенант прошёл, а должен быть отказ")
 	}
 	row := e.get(t, "mut")
-	if row.TenantID != tenantSystem || !row.TenantSystem || row.Role != "admin" {
-		t.Errorf("перенос записан неверно: %+v", row)
+	if row.TenantID != tenantClient || row.Role == "admin" {
+		t.Errorf("после отказа запись изменилась: %+v", row)
 	}
 
 	if err := svc.DeleteUserAccount("mut"); err != nil {
@@ -663,3 +681,73 @@ func TestLoadKeyRingFile(t *testing.T) {
 func encodeKey(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
 func ptr[T any](v T) *T { return &v }
+
+// Отзыв — надгробие, а не удаление (план PR#2a п. 0а).
+//
+// Ключ доступа — принципал в ACL и в политиках бакетов. Если строку удалить,
+// тот же access_key можно выпустить заново, и все старые гранты молча перейдут
+// новому владельцу, возможно из другого тенанта. Поэтому проверяются четыре
+// вещи: строка остаётся и теряет секрет; повторный выпуск того же ключа
+// отвергается (в том числе в другом тенанте); отозванную нельзя обновить; в
+// перечислении её не видно.
+func TestRevokedAccountIsTombstone(t *testing.T) {
+	e := setup(t)
+	svc := e.serviceV1(t)
+	ctx := context.Background()
+
+	mustCreate(t, svc, "dead", "topsecret", auth.RoleUser, tenantClient)
+
+	if err := svc.DeleteUserAccount("dead"); err != nil {
+		t.Fatalf("отзыв: %v", err)
+	}
+
+	// 1. Строка жива, секрета нет.
+	row := e.get(t, "dead")
+	if row.Status != meta.AccountRevoked {
+		t.Errorf("status = %q, хотели %q", row.Status, meta.AccountRevoked)
+	}
+	if row.SecretWrapped != nil {
+		t.Errorf("secret_wrapped остался после отзыва: %d байт", len(row.SecretWrapped))
+	}
+	// Прямой запрос в БД: вдруг scanAccount что-то подставляет.
+	var raw []byte
+	if err := e.m.Pool.QueryRow(ctx,
+		`SELECT secret_wrapped FROM accounts WHERE access_key = 'dead'`).Scan(&raw); err != nil {
+		t.Fatalf("прочитать secret_wrapped: %v", err)
+	}
+	if raw != nil {
+		t.Errorf("в БД остался зашифрованный секрет: %d байт", len(raw))
+	}
+
+	// 2. Тот же ключ нельзя выпустить заново — в том числе в ДРУГОМ легальном
+	//    тенанте. Это и есть смысл надгробия: гранты принципала не должны
+	//    переехать новому владельцу.
+	err := svc.CreateAccount(auth.Account{
+		Access: "dead", Secret: "newlife", Role: auth.RoleUser, ProjectID: tenantClient2,
+	})
+	if err == nil {
+		t.Fatalf("повторный выпуск отозванного ключа прошёл: гранты принципала перешли бы новому владельцу")
+	}
+	// Разбор — типом, как его делает versitygw (см. expectAccessDenied):
+	// завёрнутый в %w APIError для ProcessController уже не S3Error.
+	if !errors.Is(err, auth.ErrUserExists) {
+		t.Errorf("повторный выпуск: %v, хотели auth.ErrUserExists", err)
+	}
+
+	// 3. Отозванную нельзя оживить сменой секрета.
+	secret := "revive"
+	if err := svc.UpdateUserAccount("dead", auth.MutableProps{Secret: &secret}); !errors.Is(err, auth.ErrNoSuchUser) {
+		t.Errorf("обновление отозванной: %v, хотели ErrNoSuchUser", err)
+	}
+
+	// 4. В перечислении её нет.
+	list, err := svc.ListUserAccounts()
+	if err != nil {
+		t.Fatalf("ListUserAccounts: %v", err)
+	}
+	for _, a := range list {
+		if a.Access == "dead" {
+			t.Errorf("отозванная учётка видна в ListUserAccounts")
+		}
+	}
+}

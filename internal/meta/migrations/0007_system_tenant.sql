@@ -63,10 +63,22 @@ ALTER TABLE accounts
   ADD CONSTRAINT accounts_not_system_unless_admin
     CHECK (role = 'admin' OR NOT tenant_system);
 
+-- Отзыв ключа (ADR-0018, план PR#2a п. 0а) оставляет строку-надгробие, но
+-- секрет при отзыве стирается: отозванному ключу он не нужен, а хранить
+-- материал для офлайн-подбора незачем. Поэтому колонка перестаёт быть NOT NULL.
+-- NULL теперь означает ровно одно: строка отозвана, секрета больше нет.
+ALTER TABLE accounts ALTER COLUMN secret_wrapped DROP NOT NULL;
+
 -- +goose Down
 -- Откат — строгий обратный порядок: сначала ограничения accounts, затем
 -- колонка accounts, затем чеки и колонка tenants. Иначе DROP COLUMN оставил бы
 -- висящиеся ограничения, а DROP tenants.system сломал бы FK из (d).
+-- Откат секрета в NOT NULL возможен только если ни одной отозванной строки нет:
+-- после отзыва секрета физически не существует, и восстанавливать NOT NULL было
+-- бы не из чего. Это осознанно: откат миграции не должен уметь «воскресить»
+-- отозванный ключ.
+ALTER TABLE accounts ALTER COLUMN secret_wrapped SET NOT NULL;
+
 ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_not_system_unless_admin;
 ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_tenant_fkey;
 ALTER TABLE accounts DROP COLUMN IF EXISTS tenant_system;

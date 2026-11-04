@@ -46,8 +46,10 @@ type AccountPatch struct {
 	SecretWrapped []byte
 	KekVersion    int
 	Role          string
-	// TenantID — перенос учётки в другой тенант. nil = не менять.
-	TenantID *int64
+	// TenantID здесь нет намеренно: тенант учётки неизменяем (план PR#2a п. 0б).
+	// Перенос ключа между тенантами обходил бы всю изоляцию ADR-0010/0018 —
+	// вместе с грантами, которые этот ключ уже имеет в ACL и политиках чужого
+	// тенанта. Нужен другой тенант — выпускается новый ключ.
 }
 
 // ErrAccountExists — учётка с таким access_key уже есть. Отдельно от
@@ -157,20 +159,21 @@ func (m *Meta) CreateAccount(ctx context.Context, a Account) error {
 	})
 }
 
-// UpdateAccount меняет только перечисленное в patch. Перенос в другой тенант
-// заодно перечитывает tenants.system: колонка денормализована и обязана
-// оставаться в согласии с тенантом (миграция 0007).
+// UpdateAccount меняет только перечисленное в patch. Тенант не меняется вовсе:
+// см. комментарий у AccountPatch.
+//
+// Отозванная учётка отвечает ErrNotFound: иначе отозванному ключу можно было бы
+// выставить новый секрет и вернуть его к жизни, а надгробие потеряло бы смысл.
 //
 // Строка блокируется FOR UPDATE: без блокировки два параллельных обновления
-// прочитали бы один и тот же флаг и один из них записал бы пару
-// (tenant_id, tenant_system) вразнобой с реальным tenants.system.
+// записали бы нечитаемую пару значений.
 func (m *Meta) UpdateAccount(ctx context.Context, access string, p AccountPatch) error {
 	return m.inTx(ctx, func(tx pgx.Tx) error {
 		var role string
-		var tenantID int64
 		err := tx.QueryRow(ctx,
-			`SELECT role, tenant_id FROM accounts WHERE access_key = $1 FOR UPDATE`, access).
-			Scan(&role, &tenantID)
+			`SELECT role FROM accounts
+			  WHERE access_key = $1 AND status <> 'revoked' FOR UPDATE`, access).
+			Scan(&role)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -181,28 +184,8 @@ func (m *Meta) UpdateAccount(ctx context.Context, access string, p AccountPatch)
 		if p.Role != "" {
 			role = p.Role
 		}
-		if p.TenantID != nil {
-			tenantID = *p.TenantID
-		}
 
-		// tenant_system пересчитываем всегда, когда менялся тенант, — и только
-		// по факту из tenants.
-		var tenantSystem *bool
-		if p.TenantID != nil {
-			var sys bool
-			err := tx.QueryRow(ctx,
-				`SELECT system FROM tenants WHERE id = $1 AND deleted_at IS NULL`, tenantID).
-				Scan(&sys)
-			if errors.Is(err, pgx.ErrNoRows) {
-				return ErrNotFound
-			}
-			if err != nil {
-				return fmt.Errorf("tenant %d: %w", tenantID, err)
-			}
-			tenantSystem = &sys
-		}
-
-		// Явные приведения типов в COALESCE обязательны: при $2/$6 = NULL
+		// Явные приведения типов в COALESCE обязательны: при $2 = NULL
 		// планировщик не всегда выводит тип параметра из второй ветки, а ошибка
 		// «could not determine data type of parameter» в проде выглядит как
 		// поломка БД.
@@ -210,11 +193,9 @@ func (m *Meta) UpdateAccount(ctx context.Context, access string, p AccountPatch)
 			`UPDATE accounts SET
 			    secret_wrapped = COALESCE($2::bytea, secret_wrapped),
 			    kek_version    = CASE WHEN $2 IS NULL THEN kek_version ELSE $3 END,
-			    role           = $4,
-			    tenant_id      = $5,
-			    tenant_system  = COALESCE($6::boolean, tenant_system)
-			  WHERE access_key = $1`,
-			access, p.SecretWrapped, p.KekVersion, role, tenantID, tenantSystem)
+			    role           = $4
+			  WHERE access_key = $1 AND status <> 'revoked'`,
+			access, p.SecretWrapped, p.KekVersion, role)
 		if err != nil {
 			return fmt.Errorf("update account: %w", err)
 		}
@@ -225,18 +206,24 @@ func (m *Meta) UpdateAccount(ctx context.Context, access string, p AccountPatch)
 	})
 }
 
-// DeleteAccount удаляет строку. ErrNotFound, если учётки нет.
+// RevokeAccount — отзыв ключа: строка остаётся навсегда, секрет стирается.
 //
-// Именно удаление, а не status = 'revoked': единственный путь отзыва в
-// интерфейсе versitygw — DeleteUserAccount, а отозванная строка должна
-// перестать отдавать секрет ровно так же, как удалённая (см. GetAccount и
-// MissingAccounts). Разница между ними появится вместе с админ-API (T4), где
-// status и нужен для аудита.
-func (m *Meta) DeleteAccount(ctx context.Context, access string) error {
+// Почему не DELETE (план PR#2a п. 0а). Ключ доступа — это принципал в ACL и в
+// политиках бакетов. Удалили строку — тот же access_key можно выпустить заново,
+// и все старые гранты молча перейдут новому владельцу, возможно из другого
+// тенанта. Надгробие делает отзыв необратимым по самому ключу: CreateAccount с
+// ранее существовавшим ключом обязан отвечать ErrAccountExists.
+//
+// secret_wrapped обнуляется: отозванному ключу секрет не нужен, а хранить
+// материал для офлайн-подбора незачем.
+func (m *Meta) RevokeAccount(ctx context.Context, access string) error {
 	return m.inTx(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `DELETE FROM accounts WHERE access_key = $1`, access)
+		tag, err := tx.Exec(ctx,
+			`UPDATE accounts
+			    SET status = 'revoked', secret_wrapped = NULL
+			  WHERE access_key = $1 AND status <> 'revoked'`, access)
 		if err != nil {
-			return fmt.Errorf("delete account: %w", err)
+			return fmt.Errorf("revoke account: %w", err)
 		}
 		if tag.RowsAffected() == 0 {
 			return ErrNotFound
@@ -245,12 +232,12 @@ func (m *Meta) DeleteAccount(ctx context.Context, access string) error {
 	})
 }
 
-// ListAccounts — все учётки, включая отозванные: админский вывод обязан
-// показывать и их, иначе «ключ отозван» и «ключа никогда не было» снаружи
-// неразличимы. Секреты не возвращаются никогда — см. GetAccount.
+// ListAccounts — учётки, кроме отозванных (план PR#2a п. 0а, п. 4). Секреты не
+// возвращаются никогда — см. GetAccount.
 func (m *Meta) ListAccounts(ctx context.Context) ([]Account, error) {
 	rows, err := m.Pool.Query(ctx,
-		`SELECT `+accountColumns+` FROM accounts ORDER BY access_key`)
+		`SELECT `+accountColumns+` FROM accounts
+		  WHERE status <> 'revoked' ORDER BY access_key`)
 	if err != nil {
 		return nil, fmt.Errorf("list accounts: %w", err)
 	}

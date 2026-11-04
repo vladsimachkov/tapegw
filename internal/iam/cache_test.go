@@ -406,12 +406,16 @@ func TestCacheConcurrentReadsAndWrites(t *testing.T) {
 			}
 			access := accountName(i % accounts)
 			secret := "rotated"
-			if err := cache.DeleteUserAccount(access); err == nil {
-				_ = cache.CreateAccount(auth.Account{
-					Access: access, Secret: secret, Role: auth.RoleUser, ProjectID: tenantClient,
-				})
+			// Раньше здесь был цикл «удалить и создать заново». С отзывом-
+			// надгробием (план PR#2a п. 0а) такой пары больше не существует:
+			// отозванный ключ нельзя выпустить повторно, и CreateAccount
+			// закономерно отвечает ErrUserExists. Гонку кэша это не ослабляет —
+			// отказ по UPDATE остаётся самым частым видом инвалидации, а
+			// немедленность отзыва проверяет отдельный тест.
+			if err := cache.UpdateUserAccount(access, auth.MutableProps{Secret: &secret}); err != nil {
+				t.Errorf("%s: ротация секрета: %v", access, err)
+				return
 			}
-			_ = cache.UpdateUserAccount(access, auth.MutableProps{Secret: &secret})
 		}
 	}()
 
