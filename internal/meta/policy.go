@@ -80,22 +80,83 @@ func (m *Meta) GetBucketPolicy(ctx context.Context, tenant TenantID, bucket stri
 //
 // acl передаётся собранным извне: формат задают структуры versitygw, а пакет
 // meta про S3-обвязку знать не должен.
-func (m *Meta) ChangeBucketOwner(ctx context.Context, tenant TenantID, bucket, owner string, acl []byte) error {
-	q, args := withTenant(
-		`UPDATE buckets
-		    SET owner = $2,
-		        acl = $3,
-		        policy = NULL
-		  WHERE name = $1 AND deleted_at IS NULL`,
-		tenant, bucket, owner, acl)
-	tag, err := m.Pool.Exec(ctx, q, args...)
-	if err != nil {
-		return fmt.Errorf("change owner of %q: %w", bucket, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+// ChangeBucketOwner меняет владельца, а вместе с ним — тенанта бакета.
+//
+// Перенос обязателен: если сменить владельца, оставив tenant_id прежним, новый
+// владелец получит бакет, в котором страж (ADR-0017) будет отказывать ему по
+// каждому запросу. Именно так ломается основной сценарий роли user: admin
+// создал бакет (тенант системный), передал его клиенту — и клиент не может ни
+// записать, ни прочитать.
+//
+// «Бакет пуст» — это НЕ только текущие объекты. Считаются ВСЕ строки objects:
+// старые версии, delete markers, строки в deleting, — плюс незавершённые
+// multipart-загрузки в uploads. Иначе в чужой тенант уезжают хвосты прошлого
+// владельца: версии, которые не видно списком, но которые потом воскресают.
+//
+// Бакет блокируется FOR UPDATE, а PUT берёт FOR SHARE (ADR-0005): проверка
+// пустоты и перенос тенанта атомарны против параллельной записи. Третьего
+// исхода у гонки нет — либо смена отклонена (объект успел), либо PUT упал по
+// тенанту.
+//
+// Перенос в тот же тенант пустоты не требует: хвосты остаются там же, где были.
+func (m *Meta) ChangeBucketOwner(ctx context.Context, tenant TenantID, bucket, owner string, newTenant int64, acl []byte) error {
+	return m.inTx(ctx, func(tx pgx.Tx) error {
+		var bucketID, curTenant int64
+		q, args := withTenant(
+			`SELECT id, tenant_id FROM buckets
+			  WHERE name = $1 AND deleted_at IS NULL`, tenant, bucket)
+		err := tx.QueryRow(ctx, q+` FOR UPDATE`, args...).
+			Scan(&bucketID, &curTenant)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock bucket %q: %w", bucket, err)
+		}
+
+		if curTenant != newTenant {
+			var busy bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM objects WHERE bucket_id = $1)
+				      OR EXISTS (SELECT 1 FROM uploads WHERE bucket_id = $1)`, bucketID).
+				Scan(&busy); err != nil {
+				return fmt.Errorf("check emptiness of %q: %w", bucket, err)
+			}
+			if busy {
+				return ErrBucketNotEmpty
+			}
+			// Тенант-получатель обязан существовать: FK это подстрахует, но
+			// понятная ошибка здесь дешевле SQLSTATE 23503 снаружи.
+			var exists bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1 AND deleted_at IS NULL)`,
+				newTenant).Scan(&exists); err != nil {
+				return fmt.Errorf("tenant %d: %w", newTenant, err)
+			}
+			if !exists {
+				return ErrNotFound
+			}
+		}
+
+		upd := `UPDATE buckets SET owner = $2, acl = $3, policy = NULL
+		          WHERE name = $1 AND deleted_at IS NULL`
+		updArgs := []any{bucket, owner, acl}
+		if curTenant != newTenant {
+			// Тенант меняется только вместе с пустотой — выше.
+			upd = `UPDATE buckets SET owner = $2, acl = $3, policy = NULL, tenant_id = $4
+			          WHERE name = $1 AND deleted_at IS NULL`
+			updArgs = append(updArgs, newTenant)
+		}
+		q2, args2 := withTenant(upd, tenant, updArgs...)
+		tag, err := tx.Exec(ctx, q2, args2...)
+		if err != nil {
+			return fmt.Errorf("change owner of %q: %w", bucket, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // BucketOwner — пара имя/владелец для админского перечисления.

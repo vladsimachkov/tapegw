@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	stypes "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -11,6 +12,8 @@ import (
 	"github.com/versity/versitygw/s3response"
 
 	"github.com/versity/versitygw/auth"
+
+	"github.com/vladsimachkov/tapegw/internal/meta"
 )
 
 // Bucket Policy, смена владельца и админское перечисление.
@@ -108,7 +111,40 @@ func (t *TapeGW) ChangeBucketOwner(ctx context.Context, bucket, owner string) er
 		return fmt.Errorf("marshal ACL for %q: %w", bucket, err)
 	}
 
-	if err := t.meta.ChangeBucketOwner(ctx, tenant, bucket, owner, acl); err != nil {
+	// Видимость бакета этим тенантом проверяется ДО разбора учётки-получателя.
+	// Иначе отказ «такой владелец не найден» заступил бы стража: чужой тенант
+	// получил бы InvalidRequest вместо AccessDenied, и тест-перебор перестал бы
+	// ловить снятый страж (на нём это и поймалось).
+	if ok, err := t.meta.BucketExists(ctx, tenant, bucket); err != nil {
+		return mapMetaErr(err, bucket)
+	} else if !ok {
+		return t.bucketErr(ctx, bucket, tenant, meta.ErrNotFound)
+	}
+
+	// Тенант нового владельца берётся из IAM (план PR#2b). Без этого бакет
+	// оставался бы в прежнем тенанте, и страж отказывал бы новому владельцу во
+	// всех запросах — основной сценарий роли user не работал бы вовсе.
+	//
+	// Отозванная учётка не может принять бакет: надгробие (PR#2a) сохраняет
+	// строку, и «передать ключ, которым уже нельзя войти» — значит спрятать
+	// бакет в мёртвом тенанте.
+	acc, err := t.meta.GetAccount(ctx, owner)
+	if errors.Is(err, meta.ErrNotFound) {
+		return s3err.GetAPIError(s3err.ErrInvalidRequest)
+	}
+	if err != nil {
+		return fmt.Errorf("account %q: %w", owner, err)
+	}
+	if acc.Status != meta.AccountActive {
+		return s3err.GetAPIError(s3err.ErrInvalidRequest)
+	}
+
+	if err := t.meta.ChangeBucketOwner(ctx, tenant, bucket, owner, acc.TenantID, acl); err != nil {
+		if errors.Is(err, meta.ErrBucketNotEmpty) {
+			// Не «внутренняя ошибка», а осмысленный отказ: перенос между
+			// тенантами с объектами внутри запрещён намеренно.
+			return s3err.GetBucketErr(s3err.ErrInvalidRequest, bucket)
+		}
 		return t.bucketErr(ctx, bucket, tenant, err)
 	}
 	return nil
