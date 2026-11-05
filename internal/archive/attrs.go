@@ -69,6 +69,9 @@ type Version struct {
 	// KEK — версия KEK, которой развёрнута обёртка DEK. Без неё не понять,
 	// каким ключом браться, а ротация KEK (ADR-0014) делает таких версий
 	// несколько.
+	//
+	// Строка, а не число: атрибуты Phobos — текстовые, и держать их тип как есть
+	// честнее, чем молча проглатывать «kek: v2». Числом его отдаёт KEKNum.
 	KEK string
 	// Format — версия формата файла объекта.
 	Format int
@@ -161,7 +164,19 @@ func ParseAttributes(attrs map[string]string) (Version, error) {
 	}, nil
 }
 
-// SortedAttrNames — AttrAttributes в алфавитном порядке, для отчётов и логов.
+// KEKNum — версия KEK как число. Атрибут текстовый, а KeyRing индексируется
+// int, поэтому приведение здесь и оно обязано быть явным: «kek: v2» или пустая
+// строка — ошибка разбора, а не ноль, под который потом подставится попавшийся
+// ключ.
+func (v Version) KEKNum() (int, error) {
+	n, err := strconv.Atoi(v.KEK)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("archive: версия KEK %q у версии %s", v.KEK, v.Version)
+	}
+	return n, nil
+}
+
+// SortedAttrNames — AttrAttributes in алфавитном порядке, для отчётов и логов.
 func SortedAttrNames() []string {
 	out := append([]string(nil), AttrAttributes...)
 	sort.Strings(out)
