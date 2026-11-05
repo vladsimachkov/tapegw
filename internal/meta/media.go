@@ -59,9 +59,15 @@ func (w WriteSpace) Fits(need uint64) bool {
 
 // PoolWriteSpace считает, сколько места доступно для записи в пуле.
 //
-// generations — поколения, разрешённые политикой пула. Пустой список означает
+// generations — поколения, разрешённые политикой пула; пустой список означает
 // «любые»: политика может ничего не запрещать, и тогда запрещать нечего.
-func (m *Meta) PoolWriteSpace(ctx context.Context, poolID int64, generations []string) (*WriteSpace, error) {
+//
+// library — библиотека, в которую пул пишет по своей политике (library_write);
+// nil означает «любая». Это фильтр того же ряда, что и поколение: свойство
+// политики, а не строки media. Пока библиотек одна, фильтр ничего не меняет, но
+// при переезде (С5) ленты пула окажутся в двух библиотеках, и место в старой не
+// должно считаться местом для записи.
+func (m *Meta) PoolWriteSpace(ctx context.Context, poolID int64, generations []string, library *string) (*WriteSpace, error) {
 	const q = `
 WITH s AS (
     SELECT (t.id IS NOT NULL)                              AS writable,
@@ -76,6 +82,7 @@ WITH s AS (
     FROM media m
     LEFT JOIN media_write_targets t ON t.id = m.id
     WHERE m.pool_id = $1
+      AND ($3::text IS NULL OR m.library_cached = $3)
 )
 SELECT count(*)::int                                            AS total,
        count(*) FILTER (WHERE writable AND gen_ok)::int         AS writable,
@@ -86,7 +93,7 @@ SELECT count(*)::int                                            AS total,
 FROM s`
 
 	var out WriteSpace
-	err := m.Pool.QueryRow(ctx, q, poolID, generations).
+	err := m.Pool.QueryRow(ctx, q, poolID, generations, library).
 		Scan(&out.Total, &out.Writable, &out.FreeBytes, &out.MaxFree, &out.ReadOnly, &out.Forbidden)
 	if err != nil {
 		return nil, fmt.Errorf("meta: место пула %d: %w", poolID, err)
@@ -104,15 +111,17 @@ type WritableTape struct {
 }
 
 // WritableTapes перечисляет ленты пула, доступные для записи, по убыванию места.
-func (m *Meta) WritableTapes(ctx context.Context, poolID int64, generations []string) ([]WritableTape, error) {
+// Фильтры те же, что у PoolWriteSpace: поколение и библиотека записи.
+func (m *Meta) WritableTapes(ctx context.Context, poolID int64, generations []string, library *string) ([]WritableTape, error) {
 	const q = `
 SELECT t.id, t.label, t.generation, t.free_bytes
 FROM media_write_targets t
 WHERE t.pool_id = $1
   AND (cardinality(coalesce($2::text[], '{}')) = 0 OR t.generation = ANY($2::text[]))
+  AND ($3::text IS NULL OR t.library_cached = $3)
 ORDER BY t.free_bytes DESC, t.id`
 
-	rows, err := m.Pool.Query(ctx, q, poolID, generations)
+	rows, err := m.Pool.Query(ctx, q, poolID, generations, library)
 	if err != nil {
 		return nil, fmt.Errorf("meta: ленты для записи: %w", err)
 	}

@@ -65,16 +65,15 @@ VALUES ($1, $2, $3, 1, 'L8', 'L8', 100)`, s.label, s.life, reason); err != nil {
 	if n := viewExists(t, ctx, m, "media_write_targets"); n != 1 {
 		t.Fatal("представление не вернулось после Up")
 	}
-	if got := indexPredicate(t, ctx, m, "media_writable"); got != canonicalWritableNormalized {
-		t.Errorf("после Up предикат индекса: %s, ждали %s", got, canonicalWritableNormalized)
+	want := canonicalPredicate(t, ctx, m)
+	if got := indexPredicate(t, ctx, m, "media_writable"); got != want {
+		t.Errorf("после Up предикат индекса: %s, ждали %s", got, want)
 	}
 	if n := countMedia(t, ctx, m); n != 3 {
 		t.Errorf("Up тронул строки media: %d, ждали 3", n)
 	}
 
 }
-
-const canonicalWritableNormalized = "(lifecycle = ANY (ARRAY['formatted'::media_lifecycle, 'active'::media_lifecycle]))"
 
 func viewExists(t *testing.T, ctx context.Context, m *meta.Meta, name string) int {
 	t.Helper()

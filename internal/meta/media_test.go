@@ -12,7 +12,30 @@ import (
 // представлении и в предикате частичного индекса, — и тест сверяет обе копии с
 // этим текстом. Разойтись они могут только молча: индекс уже представления
 // означает тихое деградирование плана, уже уже — нет.
-const canonicalWritable = "lifecycle IN ('formatted', 'active')"
+const canonicalWritable = `lifecycle IN ('formatted', 'active')
+  AND location IN ('in_slot', 'in_drive')
+  AND kind = 'data'
+  AND health NOT IN ('failing', 'degraded')`
+
+// canonicalPredicate — нормализованный канон предиката. Нормализацию делает
+// БД: IN сворачивается в = ANY, скобки расставляются по своим правилам.
+// Сравнивать текст из файла с текстом из pg_get_expr — значит проиграть на
+// первой же скобке, поэтому эталон тоже проходит через БД.
+func canonicalPredicate(t *testing.T, ctx context.Context, m *meta.Meta) string {
+	t.Helper()
+	if _, err := m.Pool.Exec(ctx, `CREATE INDEX canonical_writable ON media (pool_id, generation) WHERE `+canonicalWritable); err != nil {
+		t.Fatalf("эталонный индекс: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = m.Pool.Exec(context.Background(), `DROP INDEX IF EXISTS canonical_writable`)
+	})
+	var canon string
+	if err := m.Pool.QueryRow(ctx, `SELECT pg_get_expr(indpred, indrelid) FROM pg_index
+WHERE indexrelid = 'canonical_writable'::regclass`).Scan(&canon); err != nil {
+		t.Fatalf("предикат эталона: %v", err)
+	}
+	return canon
+}
 
 func TestWriteTargetsMatchesCanonical(t *testing.T) {
 	m := testdb.Connect(t)
@@ -80,9 +103,6 @@ func TestWritableIndexPredicateMatchesView(t *testing.T) {
 	m := testdb.Connect(t)
 	ctx := context.Background()
 
-	// Нормализацию обоих предикатов делает сама БД: IN сворачивается в = ANY,
-	// скобки расставляются по своим правилам. Сравнивать текст из файла с
-	// текстом из pg_get_expr — значит проиграть на первой же скобке.
 	var real string
 	if err := m.Pool.QueryRow(ctx,
 		`SELECT pg_get_expr(indpred, indrelid) FROM pg_index
@@ -90,22 +110,8 @@ func TestWritableIndexPredicateMatchesView(t *testing.T) {
 		t.Fatalf("предикат индекса: %v", err)
 	}
 
-	if _, err := m.Pool.Exec(ctx, `CREATE INDEX canonical_writable ON media (pool_id, generation) WHERE `+canonicalWritable); err != nil {
-		t.Fatalf("эталонный индекс: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = m.Pool.Exec(context.Background(), `DROP INDEX IF EXISTS canonical_writable`)
-	})
-
-	var canon string
-	if err := m.Pool.QueryRow(ctx,
-		`SELECT pg_get_expr(indpred, indrelid) FROM pg_index
-		  WHERE indexrelid = 'canonical_writable'::regclass`).Scan(&canon); err != nil {
-		t.Fatalf("предикат эталона: %v", err)
-	}
-
-	if real != canon {
-		t.Errorf("индекс media_writable больше не соответствует определению\n  индекс: %s\n  эталон: %s", real, canon)
+	if want := canonicalPredicate(t, ctx, m); real != want {
+		t.Errorf("индекс media_writable больше не соответствует определению\n  индекс: %s\n  эталон: %s", real, want)
 	}
 }
 
@@ -115,7 +121,7 @@ func TestPoolWriteSpace(t *testing.T) {
 	testdb.Clean(t, m)
 
 	// Пустой пул: лент нет вовсе.
-	got, err := m.PoolWriteSpace(ctx, 1, nil)
+	got, err := m.PoolWriteSpace(ctx, 1, nil, nil)
 	if err != nil {
 		t.Fatalf("PoolWriteSpace: %v", err)
 	}
@@ -137,7 +143,7 @@ VALUES ($1, $2, $3, 1, $4, $4, $5)`, label, life, reason, gen, free)
 	// первым делом, если условие сузят.
 	add("fresh", "formatted", 700, nil, "L8")
 
-	got, err = m.PoolWriteSpace(ctx, 1, []string{"L8"})
+	got, err = m.PoolWriteSpace(ctx, 1, []string{"L8"}, nil)
 	if err != nil {
 		t.Fatalf("PoolWriteSpace: %v", err)
 	}
@@ -166,7 +172,7 @@ VALUES ($1, $2, $3, 1, $4, $4, $5)`, label, life, reason, gen, free)
 	// а снятием запрета или добавлением лент.
 	mustExec(t, m, `UPDATE media SET lifecycle = 'read_only', read_only_reason = 'полка закрыта'
 WHERE pool_id = 1`)
-	got, err = m.PoolWriteSpace(ctx, 1, []string{"L8"})
+	got, err = m.PoolWriteSpace(ctx, 1, []string{"L8"}, nil)
 	if err != nil {
 		t.Fatalf("PoolWriteSpace: %v", err)
 	}
@@ -180,7 +186,7 @@ WHERE pool_id = 1`)
 	// Запрет по поколению — тоже «closed», а не «нет места»: ленты есть, но
 	// политикой писать на них нельзя.
 	mustExec(t, m, `UPDATE media SET lifecycle = 'active', read_only_reason = NULL, generation = 'L7'`)
-	got, err = m.PoolWriteSpace(ctx, 1, []string{"L8"})
+	got, err = m.PoolWriteSpace(ctx, 1, []string{"L8"}, nil)
 	if err != nil {
 		t.Fatalf("PoolWriteSpace: %v", err)
 	}
@@ -189,7 +195,7 @@ WHERE pool_id = 1`)
 	}
 
 	// Пустой список поколений означает «любые», а не «ничего».
-	got, err = m.PoolWriteSpace(ctx, 1, nil)
+	got, err = m.PoolWriteSpace(ctx, 1, nil, nil)
 	if err != nil {
 		t.Fatalf("PoolWriteSpace: %v", err)
 	}
@@ -324,7 +330,7 @@ VALUES ($1, $2, $3, 1, $4, $4, $5)`, label, life, reason, gen, free)
 	add("draining", "evacuating", "L8", 800, nil)
 
 	// Только L8, по убыванию места; закрытая и эвакуируемая не попадают.
-	got, err := m.WritableTapes(ctx, 1, []string{"L8"})
+	got, err := m.WritableTapes(ctx, 1, []string{"L8"}, nil)
 	if err != nil {
 		t.Fatalf("WritableTapes: %v", err)
 	}
@@ -346,11 +352,91 @@ VALUES ($1, $2, $3, 1, $4, $4, $5)`, label, life, reason, gen, free)
 	}
 
 	// Пустой список поколений — «любые», L7 возвращается.
-	got, err = m.WritableTapes(ctx, 1, nil)
+	got, err = m.WritableTapes(ctx, 1, nil, nil)
 	if err != nil {
 		t.Fatalf("WritableTapes: %v", err)
 	}
 	if len(got) != 3 {
 		t.Errorf("без фильтра по поколению: %d лент, ждали 3", len(got))
+	}
+}
+
+// Каждая исключающая лента заведена с МЕСТОМ БОЛЬШЕ, чем у обычной: иначе тест
+// прошёл бы просто потому, что у неё места меньше, и не проверял бы признак.
+func TestWriteTargetsExcludesUnusableMedia(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	add := func(label string, free int64, mut func()) {
+		mustExec(t, m, `INSERT INTO media (label, lifecycle, pool_id, generation, medium_type, free_bytes_cached)
+VALUES ($1, 'active', 1, 'L8', 'L8', $2)`, label, free)
+		if mut != nil {
+			mut()
+		}
+	}
+	add("good", 100, func() {
+		mustExec(t, m, `UPDATE media SET library_cached = 'lib-new' WHERE label = 'good'`)
+	})
+	// Каждая «лучшая по месту» в своём признаке.
+	add("offsite", 9000, func() {
+		mustExec(t, m, `UPDATE media SET location = 'offsite' WHERE label = 'offsite'`)
+	})
+	add("transit", 9000, func() {
+		mustExec(t, m, `UPDATE media SET location = 'in_transit' WHERE label = 'transit'`)
+	})
+	add("cleaning", 9000, func() {
+		mustExec(t, m, `UPDATE media SET kind = 'cleaning' WHERE label = 'cleaning'`)
+	})
+	add("diagnostic", 9000, func() {
+		mustExec(t, m, `UPDATE media SET kind = 'diagnostic' WHERE label = 'diagnostic'`)
+	})
+	add("failing", 9000, func() {
+		mustExec(t, m, `UPDATE media SET health = 'failing' WHERE label = 'failing'`)
+	})
+	add("degraded", 9000, func() {
+		mustExec(t, m, `UPDATE media SET health = 'degraded' WHERE label = 'degraded'`)
+	})
+	add("other-lib", 9000, func() {
+		mustExec(t, m, `UPDATE media SET library_cached = 'lib-old' WHERE label = 'other-lib'`)
+	})
+	// Остальные — в библиотеке записи: иначе фильтр библиотеки отсекал бы их
+	// «не за свой признак», и тест проверял бы не то.
+	mustExec(t, m, `UPDATE media SET library_cached = 'lib-new'
+WHERE label <> 'other-lib'`)
+
+	// Библиотека записи указана — old не считается.
+	space, err := m.PoolWriteSpace(ctx, 1, nil, strptr("lib-new"))
+	if err != nil {
+		t.Fatalf("PoolWriteSpace: %v", err)
+	}
+	if space.Writable != 1 || space.MaxFree != 100 {
+		t.Errorf("исключаемые ленты попали в место пула: writable=%d max=%d, ждали 1/100",
+			space.Writable, space.MaxFree)
+	}
+	if space.FreeBytes != 100 {
+		t.Errorf("суммарное место: %d, ждали 100", space.FreeBytes)
+	}
+
+	tapes, err := m.WritableTapes(ctx, 1, nil, strptr("lib-new"))
+	if err != nil {
+		t.Fatalf("WritableTapes: %v", err)
+	}
+	if len(tapes) != 1 || tapes[0].Label != "good" {
+		var got []string
+		for _, w := range tapes {
+			got = append(got, w.Label)
+		}
+		t.Errorf("в список доступных попали: %v, ждали [good]", got)
+	}
+
+	// Без указания библиотеки old-лента всё равно не проходит по остальным
+	// признакам, а other-lib — проходит: её исключает только фильтр библиотеки.
+	space, err = m.PoolWriteSpace(ctx, 1, nil, nil)
+	if err != nil {
+		t.Fatalf("PoolWriteSpace: %v", err)
+	}
+	if space.Writable != 2 || space.MaxFree != 9000 {
+		t.Errorf("без фильтра библиотеки: writable=%d max=%d, ждали 2/9000", space.Writable, space.MaxFree)
 	}
 }
