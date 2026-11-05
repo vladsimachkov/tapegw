@@ -1,7 +1,6 @@
 package mover_test
 
 import (
-	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -9,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -47,7 +47,7 @@ func body(n int) []byte {
 
 func putIn(op uuid.UUID, data []byte) mover.PutIn {
 	return mover.PutIn{
-		Op: op, Body: strings.NewReader(string(data)), Size: int64(len(data)),
+		Op: op, ID: op, Body: strings.NewReader(string(data)), Size: int64(len(data)),
 		SHA256: mover.SumBytes(data),
 		Attrs:  map[string]string{"tapegw.version": op.String()},
 	}
@@ -248,7 +248,7 @@ func TestObjectBiggerThanBufferIsNoBuffer(t *testing.T) {
 // «соединение открылось, но ничего не работает».
 func TestClientWithoutCertRejected(t *testing.T) {
 	e := startEnv(t, 1<<20)
-	if _, err := e.dialWith(t, "", "", e.pki.ca); err == nil {
+	if err := e.dialNoCert(t); err == nil {
 		t.Fatalf("соединение без клиентского сертификата обязано отклоняться")
 	}
 }
@@ -256,30 +256,85 @@ func TestClientWithoutCertRejected(t *testing.T) {
 // Сертификат, подписанный чужим CA, — тоже отказ. Иначе «любой в сети»
 // получает возможность писать в архив и читать шифротекст.
 func TestForeignCARejected(t *testing.T) {
-	e := startEnv(t, 128<<10)
-	if _, err := e.dialWith(t, e.pki.evilCert, e.pki.evilKey, e.pki.foreignCA); err == nil {
+	e := startEnv(t, 1<<20)
+	if _, err := e.dialWith(t, e.pki.foreignCliCert, e.pki.foreignCliKey, e.pki.foreignCA); err == nil {
 		t.Fatalf("чужой CA обязан отклоняться")
 	}
-	// Тот же чужой сертификат, но с нашим CA в доверенных: проверка не
+	// Тот же чужой сертификат, но с нашим CA в доверенных: проверяется не
 	// «сертификат вообще валиден», а «выдан ли нашим CA».
-	if _, err := e.dialWith(t, e.pki.evilCert, e.pki.evilKey, e.pki.ca); err == nil {
+	if _, err := e.dialWith(t, e.pki.foreignCliCert, e.pki.foreignCliKey, e.pki.ca); err == nil {
 		t.Errorf("чужой сертификат не должен проходить проверку нашим CA")
 	}
 }
 
-// Роль сверяется при подключении: migrator на месте recaller начал бы
-// архивировать вместо восстановления, и молча.
-func TestRoleMismatch(t *testing.T) {
+// Сертификат mover'а от того же CA, предъявленный в роли клиента, — отказ.
+// Иначе взлом сервера библиотеки (сторона без ключей, меньшее доверие) даёт
+// злоумышленнику полноценный клиентский сертификат и доступ к чужим mover'ам:
+// запись на ленту и чтение шифротекста.
+func TestMoverCertAsClientRejected(t *testing.T) {
 	e := startEnv(t, 1<<20)
-	tlsCfg, err := mover.ClientTLS(e.pki.clientCert, e.pki.clientKey, e.pki.ca, "mover.test")
+	if _, err := e.dialWith(t, e.pki.moverAsClientCert, e.pki.moverAsClientKey, e.pki.ca); err == nil {
+		t.Fatalf("сертификат mover'а не годится в качестве клиентского")
+	}
+}
+
+// Роли клиентов разделяются по SAN-URI: restorer не подключается к mover'у,
+// который ждёт планировщик архивации. Роль из hello для этого не аргумент —
+// её объявляет сам подключающийся.
+func TestWrongRoleRejected(t *testing.T) {
+	e := startEnv(t, 1<<20) // разрешён только scheduler
+	if _, err := e.dialWith(t, e.pki.restorerCert, e.pki.restorerKey, e.pki.ca); err == nil {
+		t.Fatalf("restorer не должен подключаться к mover'у архивации")
+	}
+	// Тот же сертификат проходит туда, где restorer разрешён: отказ был из-за
+	// роли, а не из-за сломанной проверки вообще.
+	e2 := startEnvWith(t, 1<<20, mover.ClientRestorer)
+	c2, err := e2.dialWith(t, e2.pki.restorerCert, e2.pki.restorerKey, e2.pki.ca)
+	if err != nil {
+		t.Errorf("разрешённая роль обязана пускать: %v", err)
+	} else {
+		c2.Close() // сервер ждёт этого соединения в Close, пока оно открыто
+	}
+}
+
+// Клиент проверяет, что подключился именно к ожидаемому mover'у: сертификат
+// другого драйва того же CA — отказ, иначе «записать на драйв A» уедет на B.
+func TestWrongMoverRejected(t *testing.T) {
+	e := startEnv(t, 1<<20) // mover представился drive-A
+	cfg, err := mover.ClientTLS(e.pki.clientCert, e.pki.clientKey, e.pki.ca, e.pki.otherDrive)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = mover.Dial(context.Background(), mover.DialConfig{
-		Addr: e.addr, TLS: tlsCfg, Want: mover.RoleRecaller,
-	})
+	if _, err := mover.Dial(t.Context(), e.addr, cfg); err == nil {
+		t.Fatalf("клиент обязан проверить SAN-URI сервера")
+	}
+	// На своём месте тот же сертификат клиента работает.
+	if c, err := mover.Dial(t.Context(), e.addr, mustClientTLS(t, e, e.pki.drive)); err != nil {
+		t.Errorf("ожидаемый mover обязан проходить: %v", err)
+	} else {
+		c.Close()
+	}
+}
+
+func mustClientTLS(t *testing.T, e *env, drive string) *tls.Config {
+	t.Helper()
+	cfg, err := mover.ClientTLS(e.pki.clientCert, e.pki.clientKey, e.pki.ca, drive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+// Роль mover'а из hello сверяется при подключении: migrator на месте recaller
+// начал бы архивировать вместо восстановления, и молча.
+func TestRoleMismatch(t *testing.T) {
+	e := startEnv(t, 1<<20)
+	_, _, err := mover.DialAs(t.Context(), e.addr, mustClientTLS(t, e, e.pki.drive), mover.RoleRecaller)
 	if !errors.Is(err, mover.ErrRoleMismatch) {
 		t.Errorf("ожидали ErrRoleMismatch, получили %v", err)
+	}
+	if _, _, err := mover.DialAs(t.Context(), e.addr, mustClientTLS(t, e, e.pki.drive), mover.RoleMigrator); err != nil {
+		t.Errorf("ожидаемая роль обязана проходить: %v", err)
 	}
 }
 
@@ -287,7 +342,7 @@ func TestRoleMismatch(t *testing.T) {
 // а не ошибки разбора посреди передачи.
 func TestProtoMismatchRefused(t *testing.T) {
 	e := startEnv(t, 1<<20)
-	srvTLS, err := mover.ServerTLS(e.pki.serverCert, e.pki.serverKey, e.pki.ca)
+	srvTLS, err := mover.ServerTLS(e.pki.serverCert, e.pki.serverKey, e.pki.ca, mover.ClientScheduler)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,13 +360,30 @@ func TestProtoMismatchRefused(t *testing.T) {
 		_ = mover.WriteJSON(c, mover.Hello{Type: "hello", Proto: mover.ProtoVersion + 1, Role: mover.RoleMigrator})
 	}()
 
-	tlsCfg, err := mover.ClientTLS(e.pki.clientCert, e.pki.clientKey, e.pki.ca, "mover.test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = mover.Dial(context.Background(), mover.DialConfig{Addr: ln.Addr().String(), TLS: tlsCfg, Want: mover.RoleMigrator})
+	_, err = mover.Dial(t.Context(), ln.Addr().String(), mustClientTLS(t, e, e.pki.drive))
 	if !errors.Is(err, mover.ErrProtoMismatch) {
 		t.Errorf("ожидали ErrProtoMismatch, получили %v", err)
+	}
+}
+
+// Полуоткрытое соединение или клиент, который открыл соединение и молчит, не
+// должен держать горутину и операцию бесконечно: при разделённых серверах
+// сеть без RST — обычное дело.
+func TestSilentClientClosed(t *testing.T) {
+	e := startEnvTimed(t, 1<<20, 300*time.Millisecond)
+	conn := e.rawConn(t)
+	defer conn.Close()
+
+	// Сервер здоровается первым — это точка отсчёта.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := mover.ReadFrame(conn, mover.MaxFrameBytes); err != nil {
+		t.Fatalf("mover обязан поздороваться: %v", err)
+	}
+	// Дальше клиент молчит. Сервер обязан закрыть соединение сам, а не ждать
+	// вечно: итог начатой операции tapegw всё равно берёт через status/stat.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Errorf("молчание дольше inactivity_timeout обязано закрывать соединение")
 	}
 }
 

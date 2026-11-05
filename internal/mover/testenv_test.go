@@ -9,196 +9,369 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"log/slog"
+	"io"
 	"math/big"
-	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/vladsimachkov/tapegw/internal/mover"
 	"github.com/vladsimachkov/tapegw/internal/store"
-	"github.com/vladsimachkov/tapegw/internal/store/fake"
 )
 
-// Тесты идут поверх настоящего TCP и настоящего mTLS: мок транспорта проверял
-// бы наш собственный мок, а не границу. Сертификаты генерируются в тесте —
-// «выданный нашим CA» и «выданный чужим» должны быть различимы.
+// Тестовая PKI: сертификаты генерируются на лету, потому что проверять нужно
+// именно отказ — чужой CA, клиент без сертификата, сертификат mover'а в роли
+// клиента. Всё это нельзя проверить одним «правильным» сертификатом.
+type testPKI struct {
+	dir string
+	ca  string
 
-type pki struct {
-	ca         string
-	serverCert string
-	serverKey  string
-	clientCert string
-	clientKey  string
-	foreignCA  string
-	evilCert   string
-	evilKey    string
+	// Сертификат mover'а: ServerAuth + SAN-URI драйва.
+	serverCert, serverKey string
+	// Клиентский сертификат tapegw-планировщика: ClientAuth + SAN-URI роли.
+	clientCert, clientKey string
+	// Клиент restorer'а — другая роль того же CA.
+	restorerCert, restorerKey string
+	// Сертификат mover'а другого драйва того же CA: клиент обязан отказаться.
+	otherDriveCert, otherDriveKey string
+	// Тот же CA, но подписанный как серверный: в роли клиента быть не должен.
+	moverAsClientCert, moverAsClientKey string
+
+	foreignCA      string
+	foreignSrvCert string
+	foreignSrvKey  string
+	foreignCliCert string
+	foreignCliKey  string
+	drive          string
+	otherDrive     string
 }
 
+func (p *testPKI) write(name string, b []byte) string {
+	path := filepath.Join(p.dir, name)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		panic(err)
+	}
+	return path
+}
+
+func newPKI(t *testing.T) *testPKI {
+	t.Helper()
+	dir := t.TempDir()
+	p := &testPKI{dir: dir, drive: "drive-A", otherDrive: "drive-B"}
+
+	newCA := func(name string) (*x509.Certificate, *ecdsa.PrivateKey, string) {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			Subject:               pkix.Name{CommonName: name},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(time.Hour),
+			IsCA:                  true,
+			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+			BasicConstraintsValid: true,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tmpl, key, p.write(name+".pem", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	}
+
+	sign := func(ca *x509.Certificate, caKey *ecdsa.PrivateKey, cn string, ext x509.ExtKeyUsage, uris []*url.URL, dns []string) (string, string) {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(time.Now().UnixNano()),
+			Subject:      pkix.Name{CommonName: cn},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:  []x509.ExtKeyUsage{ext},
+			URIs:         uris,
+			DNSNames:     dns,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kb, err := x509.MarshalECPrivateKey(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		certPath := p.write(cn+".crt", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+		keyPath := p.write(cn+".key", pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}))
+		return certPath, keyPath
+	}
+
+	ca, caKey, caPath := newCA("ca")
+	p.ca = caPath
+
+	p.serverCert, p.serverKey = sign(ca, caKey, "mover-A", x509.ExtKeyUsageServerAuth,
+		[]*url.URL{mover.MoverURI(p.drive)}, []string{mover.MoverDNSName})
+	p.otherDriveCert, p.otherDriveKey = sign(ca, caKey, "mover-B", x509.ExtKeyUsageServerAuth,
+		[]*url.URL{mover.MoverURI(p.otherDrive)}, []string{mover.MoverDNSName})
+	// Сертификат mover'а, предъявленный как клиентский: ServerAuth и SAN mover'а.
+	p.moverAsClientCert, p.moverAsClientKey = p.serverCert, p.serverKey
+
+	p.clientCert, p.clientKey = sign(ca, caKey, "tapegw-scheduler", x509.ExtKeyUsageClientAuth,
+		[]*url.URL{mover.ClientURI(mover.ClientScheduler)}, nil)
+	p.restorerCert, p.restorerKey = sign(ca, caKey, "tapegw-restorer", x509.ExtKeyUsageClientAuth,
+		[]*url.URL{mover.ClientURI(mover.ClientRestorer)}, nil)
+
+	fca, fcaKey, fcaPath := newCA("foreign-ca")
+	p.foreignCA = fcaPath
+	p.foreignSrvCert, p.foreignSrvKey = sign(fca, fcaKey, "foreign-mover", x509.ExtKeyUsageServerAuth,
+		[]*url.URL{mover.MoverURI(p.drive)}, []string{mover.MoverDNSName})
+	p.foreignCliCert, p.foreignCliKey = sign(fca, fcaKey, "foreign-client", x509.ExtKeyUsageClientAuth,
+		[]*url.URL{mover.ClientURI(mover.ClientScheduler)}, nil)
+
+	return p
+}
+
+// fakeStore — хранилище без cgo с известным числом вызовов: идемпотентность
+// проверяется счётчиком, а не содержимым.
+type fakeStore struct {
+	mu       sync.Mutex
+	data     map[[16]byte][]byte
+	calls    map[string]int
+	locateOK bool
+}
+
+func (f *fakeStore) init() {
+	if f.data == nil {
+		f.data = map[[16]byte][]byte{}
+		f.calls = map[string]int{}
+		f.locateOK = true
+	}
+}
+
+func (f *fakeStore) Put(_ context.Context, batch []store.PutItem, _ store.PutOptions) []store.Result {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.calls["put"]++
+	out := make([]store.Result, 0, len(batch))
+	for _, it := range batch {
+		b, err := io.ReadAll(it.Reader)
+		if err != nil {
+			out = append(out, store.Result{ID: it.ID, Err: err})
+			continue
+		}
+		f.data[it.ID] = b
+		out = append(out, store.Result{ID: it.ID, Version: 1})
+	}
+	return out
+}
+
+func (f *fakeStore) Get(_ context.Context, items []store.GetItem) []store.Result {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.calls["get"]++
+	out := make([]store.Result, 0, len(items))
+	for _, it := range items {
+		b, ok := f.data[it.ID]
+		if !ok {
+			out = append(out, store.Result{ID: it.ID, Err: store.ErrNotFound})
+			continue
+		}
+		if it.Writer != nil {
+			_, _ = it.Writer.Write(b)
+		}
+		out = append(out, store.Result{ID: it.ID, Version: 1})
+	}
+	return out
+}
+
+func (f *fakeStore) Stat(_ context.Context, id uuid.UUID) (store.Meta, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	b, ok := f.data[id]
+	if !ok {
+		return store.Meta{}, store.ErrNotFound
+	}
+	return store.Meta{ID: id, Size: int64(len(b)), Version: 1, Complete: true}, nil
+}
+
+func (f *fakeStore) Delete(_ context.Context, ids []uuid.UUID) []store.Result {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.calls["delete"]++
+	out := make([]store.Result, 0, len(ids))
+	for _, id := range ids {
+		delete(f.data, id)
+		out = append(out, store.Result{ID: id})
+	}
+	return out
+}
+
+func (f *fakeStore) Extents(_ context.Context, ids []uuid.UUID) (map[uuid.UUID][]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	out := make(map[uuid.UUID][]string, len(ids))
+	for _, id := range ids {
+		if _, ok := f.data[id]; !ok {
+			return nil, store.ErrNotFound
+		}
+		out[id] = []string{"TST001"}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) Locate(_ context.Context, ids []uuid.UUID) ([]store.Location, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	if !f.locateOK {
+		return nil, store.ErrNotSupported
+	}
+	out := make([]store.Location, 0, len(ids))
+	for range ids {
+		out = append(out, store.Location{TapeID: "TST001", DriveHint: "drive-A"})
+	}
+	return out, nil
+}
+
+func (f *fakeStore) Close() error { return nil }
+
+func (f *fakeStore) Len() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	return len(f.data)
+}
+
+func (f *fakeStore) Calls(what string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	return f.calls[what]
+}
+
+// env — запущенный mover поверх настоящего TCP с настоящим mTLS. Отдельного
+// режима «без шифрования» в пакете нет, поэтому и тест идёт по тому же пути,
+// по которому поедут боевые соединения.
 type env struct {
-	srv  *mover.Server
+	st   *fakeStore
 	reg  *mover.Registry
-	st   *fake.Store
-	pki  *pki
+	srv  *mover.Server
+	pki  *testPKI
 	addr string
 }
 
-func startEnv(t *testing.T, bufBytes int64) *env {
-	t.Helper()
-	return startEnvWith(t, fake.New(), bufBytes)
+func startEnv(t *testing.T, bufMax int64) *env { return startEnvWith(t, bufMax, mover.ClientScheduler) }
+
+func startEnvWith(t *testing.T, bufMax int64, allowed ...mover.ClientID) *env {
+	return startEnvTimed(t, bufMax, 0, allowed...)
 }
 
-func startEnvWith(t *testing.T, st store.Store, bufBytes int64) *env {
+// startEnvTimed — env с заданным таймаутом бездействия (0 — значение по
+// умолчанию). Нужен тесту «клиент молчит → соединение закрыто».
+func startEnvTimed(t *testing.T, bufMax int64, inactivity time.Duration, allowed ...mover.ClientID) *env {
 	t.Helper()
-	dir := t.TempDir()
-
-	caPEM, caKey, caCert := mustCA(t, "tapegw-test-ca")
-	sCert, sKey := leaf(t, "mover.test", caCert, caKey)
-	cCert, cKey := leaf(t, "tapegw.test", caCert, caKey)
-	fcaPEM, fcaKey, fcaCert := mustCA(t, "someone-elses-ca")
-	evCert, evKey := leaf(t, "tapegw.test", fcaCert, fcaKey)
-
-	p := &pki{
-		ca:         write(t, dir, "ca.pem", caPEM),
-		serverCert: write(t, dir, "server.pem", sCert),
-		serverKey:  write(t, dir, "server.key", sKey),
-		clientCert: write(t, dir, "client.pem", cCert),
-		clientKey:  write(t, dir, "client.key", cKey),
-		foreignCA:  write(t, dir, "foreign-ca.pem", fcaPEM),
-		evilCert:   write(t, dir, "evil.pem", evCert),
-		evilKey:    write(t, dir, "evil.key", evKey),
+	if len(allowed) == 0 {
+		allowed = []mover.ClientID{mover.ClientScheduler}
 	}
-
-	srvTLS, err := mover.ServerTLS(p.serverCert, p.serverKey, p.ca)
+	p := newPKI(t)
+	st := &fakeStore{}
+	staging := filepath.Join(t.TempDir(), "staging")
+	reg, err := mover.NewRegistry(staging, bufMax, 64<<10, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg, err := mover.NewRegistry(filepath.Join(dir, "staging"), bufBytes, time.Hour, time.Hour)
+	srvTLS, err := mover.ServerTLS(p.serverCert, p.serverKey, p.ca, allowed...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv, err := mover.NewServer(st, reg, mover.ServerConfig{
-		Addr: "127.0.0.1:0", TLS: srvTLS, Role: mover.RoleMigrator,
-		Version: "test", PhobosVer: "test", Family: "dir", Chunk: 64 << 10,
-		Log: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		Addr:       "127.0.0.1:0",
+		TLS:        srvTLS,
+		Role:       mover.RoleMigrator,
+		Version:    "test",
+		PhobosVer:  "test",
+		Inactivity: inactivity,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	go srv.Serve()
 	t.Cleanup(func() { _ = srv.Close() })
-	return &env{srv: srv, reg: reg, st: st.(*fake.Store), pki: p, addr: srv.Addr()}
+	return &env{st: st, reg: reg, srv: srv, pki: p, addr: srv.Addr()}
 }
 
-// dial — штатное подключение tapegw к mover'у.
-func (e *env) dial(t *testing.T) *mover.Client {
+// dialWith подключается конкретным сертификатом. Ошибку возвращает, а не
+// валит тест: половина проверок состоит в том, что подключение не должно
+// состояться.
+func (e *env) dialWith(t *testing.T, cert, key, ca string) (*mover.Client, error) {
 	t.Helper()
-	tlsCfg, err := mover.ClientTLS(e.pki.clientCert, e.pki.clientKey, e.pki.ca, "mover.test")
+	cfg, err := mover.ClientTLS(cert, key, ca, e.pki.drive)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := mover.Dial(context.Background(), mover.DialConfig{
-		Addr: e.addr, TLS: tlsCfg, Want: mover.RoleMigrator, Chunk: 64 << 10,
-	})
+	return mover.Dial(t.Context(), e.addr, cfg)
+}
+
+// rawConn — соединение с валидным сертификатом, но без протокольного клиента:
+// им удобно молчать.
+func (e *env) rawConn(t *testing.T) *tls.Conn {
+	t.Helper()
+	cfg, err := mover.ClientTLS(e.pki.clientCert, e.pki.clientKey, e.pki.ca, e.pki.drive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := tls.Dial("tcp", e.addr, cfg)
+	if err != nil {
+		t.Fatalf("tls.Dial: %v", err)
+	}
+	return conn
+}
+
+func (e *env) dial(t *testing.T) *mover.Client {
+	t.Helper()
+	c, err := e.dialWith(t, e.pki.clientCert, e.pki.clientKey, e.pki.ca)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	return c
 }
 
-// dialWith — подключение с произвольными сертификатами: так проверяется, что
-// чужой CA и отсутствие сертификата действительно отклоняются.
-func (e *env) dialWith(t *testing.T, cert, key, ca string) (*mover.Client, error) {
+// dialNoCert — клиент вообще без сертификата. В TLS 1.3 клиент считает
+// рукопожатие завершённым до того, как сервер проверил его сертификат, поэтому
+// отказ виден не в Dial, а при первом чтении: mover здоровается первым, и
+// оборванное рукопожатие приходит ошибкой чтения.
+func (e *env) dialNoCert(t *testing.T) error {
 	t.Helper()
-	tlsCfg := &tls.Config{RootCAs: mustPool(t, ca), ServerName: "mover.test", MinVersion: tls.VersionTLS13}
-	if cert != "" {
-		pair, err := tls.LoadX509KeyPair(cert, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		tlsCfg.Certificates = []tls.Certificate{pair}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
 	}
-	return mover.Dial(context.Background(), mover.DialConfig{
-		Addr: e.addr, TLS: tlsCfg, Want: mover.RoleMigrator, Chunk: 64 << 10,
-	})
-}
-
-func mustPool(t *testing.T, caFile string) *x509.CertPool {
-	t.Helper()
-	b, err := os.ReadFile(caFile)
+	pemCA, err := os.ReadFile(e.pki.ca)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(b) {
-		t.Fatal("CA не распарсился")
-	}
-	return pool
-}
-
-func mustCA(t *testing.T, cn string) ([]byte, *ecdsa.PrivateKey, *x509.Certificate) {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	pool.AppendCertsFromPEM(pemCA)
+	cfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: mover.MoverDNSName, RootCAs: pool}
+	conn, err := tls.Dial("tcp", e.addr, cfg)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(time.Now().UnixNano()),
-		Subject:               pkix.Name{CommonName: cn},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := mover.ReadFrame(conn, mover.MaxFrameBytes); err != nil {
+		return err
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), key, cert
-}
-
-// leaf — и серверный, и клиентский сертификат: ExtKeyUsage у обоих оба
-// назначения, иначе mTLS не собрать разными ключами.
-func leaf(t *testing.T, cn string, ca *x509.Certificate, caKey *ecdsa.PrivateKey) ([]byte, []byte) {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		Subject:      pkix.Name{CommonName: cn},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		DNSNames:     []string{cn, "mover.test", "tapegw.test"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
-		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-}
-
-func write(t *testing.T, dir, name string, b []byte) string {
-	t.Helper()
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
+	return nil
 }

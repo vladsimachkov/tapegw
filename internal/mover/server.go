@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -29,6 +30,14 @@ type ServerConfig struct {
 	LayoutParams map[string]string
 	Chunk        int
 	Log          *slog.Logger
+	// Inactivity — сколько mover ждёт следующий кадр. Полуоткрытое соединение
+	// (сеть пропала без RST) или клиент, который открыл соединение и молчит,
+	// иначе держит горутину и операцию бесконечно; при разделённых серверах
+	// полуоткрытые соединения — обычное дело.
+	Inactivity time.Duration
+	// OpTimeout — потолок одной операции Phobos: на время записи дедлайны
+	// продлеваются до него, потому что батч на 200 GiB идёт минуты.
+	OpTimeout time.Duration
 }
 
 // Server — mover: слушает, принимает операции и выполняет их через store.
@@ -46,6 +55,9 @@ type Server struct {
 	log      *slog.Logger
 	closed   chan struct{}
 	wg       sync.WaitGroup
+
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
 }
 
 // NewServer поднимает mover на st. store — это Phobos под build tag `phobos`
@@ -62,6 +74,12 @@ func NewServer(st store.Store, reg *Registry, cfg ServerConfig) (*Server, error)
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
+	if cfg.Inactivity <= 0 {
+		cfg.Inactivity = 5 * time.Minute
+	}
+	if cfg.OpTimeout <= cfg.Inactivity {
+		cfg.OpTimeout = 30 * time.Minute
+	}
 	ln, err := tls.Listen("tcp", cfg.Addr, cfg.TLS)
 	if err != nil {
 		return nil, fmt.Errorf("mover: слушать: %w", err)
@@ -73,6 +91,7 @@ func NewServer(st store.Store, reg *Registry, cfg ServerConfig) (*Server, error)
 		ln:     ln,
 		log:    cfg.Log,
 		closed: make(chan struct{}),
+		conns:  map[net.Conn]struct{}{},
 	}, nil
 }
 
@@ -105,16 +124,39 @@ func (s *Server) Serve() {
 func (s *Server) Close() error {
 	close(s.closed)
 	err := s.ln.Close()
+	// Соединения закрываются принудительно: обработчик может ждать кадр, а
+	// «дождаться ответа» — не остановка. Дедлайны вторая линия, а не замена.
+	s.mu.Lock()
+	for c := range s.conns {
+		_ = c.Close()
+	}
+	s.mu.Unlock()
 	s.wg.Wait()
 	return err
 }
 
+// touch продлевает дедлайны на время ожидания кадра.
+func (s *Server) touch(c net.Conn) { _ = c.SetDeadline(time.Now().Add(s.cfg.Inactivity)) }
+
+// touchOp продлевает дедлайны на потолок операции: пока идёт phobos_put, кадров
+// нет, и обычный таймаут оборвал бы запись на середине.
+func (s *Server) touchOp(c net.Conn) { _ = c.SetDeadline(time.Now().Add(s.cfg.OpTimeout)) }
+
 func (s *Server) handle(conn net.Conn) {
-	defer conn.Close()
+	s.mu.Lock()
+	s.conns[conn] = struct{}{}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+		conn.Close()
+	}()
 	tconn, ok := conn.(*tls.Conn)
 	if !ok {
 		return
 	}
+	s.touch(tconn)
 	// Взаимный TLS: без подтверждённого клиентского сертификата соединение не
 	// обслуживается. Проверка здесь, а не «где-то в разборе», потому что
 	// отсутствие проверки должно быть видно в коде границы.
@@ -152,6 +194,7 @@ func (s *Server) handle(conn net.Conn) {
 		f := carry
 		carry = nil
 		if f == nil {
+			s.touch(tconn)
 			var err error
 			f, err = ReadFrame(tconn, MaxFrameBytes)
 			if err != nil {
@@ -217,7 +260,6 @@ func (s *Server) handlePut(conn net.Conn, p *Put) *Frame {
 	rec, created, err := s.reg.Begin(p.Op, p.Size, p.SHA256, p.Attrs, p.Tags)
 	switch {
 	case errors.Is(err, ErrOpConflict):
-		s.log.Info("ДИАГ: op_conflict отправлен")
 		// Тот же op с другой парой (size, sha256). Итоговая сверка тут ничего
 		// бы не поймала: сумма-то пришла своя, правильная.
 		send(Result{Code: CodeOpConflict, State: StateFailed})
@@ -266,6 +308,7 @@ func (s *Server) handlePut(conn net.Conn, p *Put) *Frame {
 
 	received := offset
 	for received < p.Size {
+		s.touch(conn)
 		fr, err := ReadFrame(conn, MaxFrameBytes)
 		if err != nil {
 			return nil
@@ -293,6 +336,7 @@ func (s *Server) handlePut(conn net.Conn, p *Put) *Frame {
 		}
 		// Кредиты восполняются по мере записи: переполнение буфера есть
 		// «подожди», а не ошибка записи.
+		s.touch(conn)
 		if err := WriteJSON(conn, Credit{Type: "credit", Op: p.Op, Credits: int64(len(fr.B))}); err != nil {
 			return nil
 		}
@@ -314,7 +358,11 @@ func (s *Server) handlePut(conn net.Conn, p *Put) *Frame {
 	_ = s.reg.Update(p.Op, func(r *OpRecord) { r.State = StateWriting })
 	_ = WriteJSON(conn, StateMsg{Type: "state", Op: p.Op, State: StateWriting})
 
+	// На время записи дедлайны продлеваются до потолка операции: батч может
+	// идти минуты, и обычный таймаут ожидания кадра оборвал бы её на середине.
+	s.touchOp(conn)
 	res := s.write(p)
+	s.touch(conn)
 	code := res.Code
 	version := res.Version
 	extents := res.Extents
@@ -446,6 +494,7 @@ func (s *Server) handleGet(conn net.Conn, g *Get) *Frame {
 	buf := make([]byte, s.cfg.Chunk)
 	for off := int64(0); off < size; {
 		for credits <= 0 {
+			s.touch(conn)
 			fr, err := ReadFrame(conn, MaxFrameBytes)
 			if err != nil {
 				return nil
@@ -468,6 +517,9 @@ func (s *Server) handleGet(conn net.Conn, g *Get) *Frame {
 			send(Result{Code: CodeIO, State: StateFailed})
 			return nil
 		}
+		// Запись может встать, если клиент не читает: дедлайн обязана держать
+		// и сторона, которая отдаёт.
+		s.touchOp(conn)
 		if err := WriteData(conn, g.Op, buf[:n]); err != nil {
 			return nil
 		}

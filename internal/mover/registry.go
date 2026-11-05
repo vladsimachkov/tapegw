@@ -126,11 +126,46 @@ func (r *Registry) persist(rec *OpRecord) error {
 		return err
 	}
 	tmp := r.metaPath(rec.Op) + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	// Порядок как в спуле: записать → fsync файла → rename → fsync каталога.
+	// Без синхронизации rename переживает перезагрузку раньше содержимого, и на
+	// ext4/XFS вместо записи можно получить файл нулевой длины. Тогда load()
+	// её отвергнет — mover либо не запустится, либо потеряет отметку «done» и
+	// повторит запись объекта на ленту.
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return fmt.Errorf("mover: запись реестра: %w", err)
 	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("mover: запись реестра: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("mover: синхронизация реестра: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("mover: закрыть реестр: %w", err)
+	}
 	if err := os.Rename(tmp, r.metaPath(rec.Op)); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("mover: публикация реестра: %w", err)
+	}
+	return syncDir(r.dir)
+}
+
+// syncDir ставит fsync на каталог: без него сам rename может не пережить
+// отключение питания.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("mover: открыть каталог реестра: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("mover: синхронизация каталога реестра: %w", err)
 	}
 	return nil
 }

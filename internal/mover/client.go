@@ -7,8 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
-	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -16,85 +16,82 @@ import (
 	"github.com/google/uuid"
 )
 
-// Client — сторона tapegw. Одно соединение обслуживает одну операцию за раз:
-// мультиплексирования в протоколе нет (ADR-0021), параллельность дают отдельные
-// процессы mover'а.
+// Ожидание ответа по умолчанию. Записывать на ленту могут быть минуты, поэтому
+// это не «таймаут сети», а верхняя граница одного ожидания кадра.
+const defaultOpTimeout = 30 * time.Minute
+
+// dialTimeout — только на установку TCP-соединения; сама операция идёт минуты.
+const dialTimeout = 10 * time.Second
+
+// Client — соединение tapegw с одним mover'ом. Планировщик держит по соединению
+// на драйв: выбор конкретного mover'а делает планировщик, а не «любой
+// свободный», иначе recaller гонял бы ленты между приводами (ADR-0008).
 type Client struct {
-	conn  net.Conn
-	role  Role
-	log   *slog.Logger
-	chunk int
-
 	mu     sync.Mutex
+	conn   *tls.Conn
 	closed bool
+
+	// chunk — размер кадра данных; window — сколько байт разрешено послать
+	// без подтверждения кредитов.
+	chunk  int
+	window int
+	// bufMax — весь буфер mover'а: объект больше него не примут (no_buffer).
+	bufMax int64
+
+	// opTimeout — верхняя граница ожидания одного ответа. mover пишет на
+	// ленту минуты, поэтому это не сетевой таймаут, а потолок операции.
+	opTimeout time.Duration
 }
 
-// DialConfig — параметры подключения супервизора к mover'у.
-type DialConfig struct {
-	Addr    string
-	TLS     *tls.Config
-	Want    Role
-	Chunk   int
-	Timeout time.Duration
-	Log     *slog.Logger
+// Dial подключается, проверяет рукопожатие и версию протокола.
+func Dial(ctx context.Context, addr string, cfg *tls.Config) (*Client, error) {
+	c, _, err := DialAs(ctx, addr, cfg, "")
+	return c, err
 }
 
-// Dial подключается и проверяет рукопожатие.
-//
-// Роль сверяется здесь, а не «когда-нибудь при разборе»: migrator, вставший на
-// место recaller, молча начал бы архивировать вместо восстановления.
-func Dial(ctx context.Context, cfg DialConfig) (*Client, error) {
-	if cfg.TLS == nil {
-		return nil, ErrNoCert
-	}
-	if cfg.Chunk == 0 {
-		cfg.Chunk = ChunkSize
-	}
-	if cfg.Timeout == 0 {
-		cfg.Timeout = 10 * time.Second
-	}
-	if cfg.Log == nil {
-		cfg.Log = slog.Default()
-	}
-	d := net.Dialer{Timeout: cfg.Timeout}
-	raw, err := d.DialContext(ctx, "tcp", cfg.Addr)
+// DialAs — то же, но с проверкой роли из hello. Роль объявляет сам mover,
+// поэтому это проверка конфигурации, а не безопасности: идентичность держится
+// на SAN сертификата (см. tls.go).
+func DialAs(ctx context.Context, addr string, cfg *tls.Config, want Role) (*Client, Hello, error) {
+	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: dialTimeout}, Config: cfg}
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("mover: подключение к %s: %w", cfg.Addr, err)
+		return nil, Hello{}, err
 	}
-	tc := tls.Client(raw, cfg.TLS)
-	if err := tc.HandshakeContext(ctx); err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("mover: рукопожатие TLS: %w", err)
-	}
+	tc := conn.(*tls.Conn)
 	if len(tc.ConnectionState().PeerCertificates) == 0 {
 		tc.Close()
-		return nil, ErrNoCert
+		return nil, Hello{}, ErrNoCert
 	}
+	c := &Client{conn: tc, chunk: ChunkSize, opTimeout: defaultOpTimeout}
 
-	c := &Client{conn: tc, role: cfg.Want, log: cfg.Log, chunk: cfg.Chunk}
+	// mover здоровается первым: пока не прочитан его hello, неизвестны ни
+	// версия протокола, ни размер буфера.
 	f, err := ReadFrame(tc, MaxFrameBytes)
 	if err != nil {
 		tc.Close()
-		return nil, err
+		return nil, Hello{}, err
 	}
 	var h Hello
 	if err := Decode(f, &h); err != nil || h.Type != "hello" {
 		tc.Close()
-		return nil, errors.New("mover: mover не поздоровался первым")
+		return nil, h, errors.New("mover: mover не поздоровался первым")
 	}
 	if h.Proto != ProtoVersion {
 		tc.Close()
-		return nil, fmt.Errorf("%w: mover на %d, tapegw на %d", ErrProtoMismatch, h.Proto, ProtoVersion)
+		return nil, h, fmt.Errorf("%w: mover на %d, tapegw на %d", ErrProtoMismatch, h.Proto, ProtoVersion)
 	}
-	if cfg.Want != "" && h.Role != cfg.Want {
+	if want != "" && h.Role != want {
 		tc.Close()
-		return nil, fmt.Errorf("%w: mover говорит %q", ErrRoleMismatch, h.Role)
+		return nil, h, fmt.Errorf("%w: mover говорит %q", ErrRoleMismatch, h.Role)
 	}
+	c.window = c.chunk * 4
+	c.bufMax = h.BufferFree
 	if err := WriteJSON(tc, HelloOk{Type: "hello_ok", Proto: ProtoVersion}); err != nil {
 		tc.Close()
-		return nil, err
+		return nil, h, err
 	}
-	return c, nil
+	return c, h, nil
 }
 
 // Close закрывает соединение. Идущую операцию Phobos это не отменяет: отмены в
@@ -109,40 +106,34 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// PutIn — параметры передачи объекта на ленту.
+// PutIn — описание записываемого объекта. Body читается до конца ровно один раз:
+// при resume клиент обязан уметь продолжить с ready.Offset, поэтому Body —
+// именно поток, а не нарезанный заранее буфер.
 type PutIn struct {
-	Op   uuid.UUID
-	Body io.Reader
-	Size int64
-	// SHA256 — hex-сумма всего тела, объявляется **до** передачи. tapegw
-	// собирает объект сам (пачку — тоже), поэтому сумма известна заранее;
-	// mover сверяет её до phobos_put, и это единственное, что делает
-	// безопасной докачку по смещению.
-	SHA256  string
-	Attrs   map[string]string
-	Tags    []string
-	NoSplit bool
+	Op     uuid.UUID
+	ID     uuid.UUID
+	Size   int64
+	SHA256 string
+	Attrs  map[string]string
+	Body   io.Reader
 }
 
-// Put передаёт объект и возвращает итог.
-//
-// Повтор после обрыва — это просто Put с тем же Op: mover ответит Resume с
-// смещением, и передача продолжится оттуда. Уже принятые байты источник
-// пропускает сам — иначе докачка превратилась бы в порчу, а её ловит только
-// итоговая SHA-256.
+// Put отправляет объект на ленту. Возвращает итог операции; коды не-ok — тоже
+// возвращаемое значение, а не error: error здесь только про транспорт.
 func (c *Client) Put(in PutIn) (*Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return nil, errors.New("mover: соединение закрыто")
+
+	if in.Size >= 0 && in.Size > c.bufMax {
+		return &Result{Code: CodeNoBuffer, State: StateFailed}, nil
 	}
-	if in.SHA256 == "" {
-		return nil, errors.New("mover: Put требует SHA-256 всего тела")
+	// Идентификатор объекта в протоколе не передаётся отдельно: oid Phobos есть
+	// UUID операции (ADR-0021), иначе «продолжить» и «записать заново»
+	// различались бы только по смещению.
+	if in.ID != in.Op {
+		return nil, fmt.Errorf("mover: oid объекта — это op, а %s != %s", in.ID, in.Op)
 	}
-	if err := WriteJSON(c.conn, Put{
-		Type: "put", Op: in.Op, Size: in.Size, SHA256: in.SHA256,
-		Attrs: in.Attrs, Tags: in.Tags, NoSplit: in.NoSplit,
-	}); err != nil {
+	if err := WriteJSON(c.conn, Put{Type: "put", Op: in.Op, Size: in.Size, SHA256: in.SHA256, Attrs: in.Attrs}); err != nil {
 		return nil, err
 	}
 
@@ -150,7 +141,7 @@ func (c *Client) Put(in PutIn) (*Result, error) {
 	// no_buffer: на них поток не начинается вовсе).
 	var ready Ready
 	for {
-		res, f, err := c.readControl()
+		res, f, err := c.readControl(c.opTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -158,7 +149,7 @@ func (c *Client) Put(in PutIn) (*Result, error) {
 			return res, nil
 		}
 		if f.Kind != frameJSON {
-			return nil, errors.New("mover: ждали ready, получили данные")
+			return nil, fmt.Errorf("mover: ждали управление, пришёл кадр данных")
 		}
 		if err := Decode(f, &ready); err != nil {
 			return nil, err
@@ -167,44 +158,36 @@ func (c *Client) Put(in PutIn) (*Result, error) {
 			break
 		}
 	}
-
-	// Пропускаем то, что mover уже принял.
 	if ready.Offset > 0 {
-		if n, err := io.CopyN(io.Discard, in.Body, ready.Offset); err != nil {
-			return nil, fmt.Errorf("mover: пропуск %d байт при докачке: %w", ready.Offset, err)
-		} else if n != ready.Offset {
-			return nil, fmt.Errorf("mover: источник короче, чем уже принято (%d < %d)", n, ready.Offset)
+		rs, ok := in.Body.(io.Seeker)
+		if !ok {
+			return nil, fmt.Errorf("mover: просят продолжить с %d, а Body не поддерживает Seek", ready.Offset)
+		}
+		if _, err := rs.Seek(ready.Offset, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("mover: продолжить передачу: %w", err)
 		}
 	}
 
 	credits := ready.Credits
-	buf := make([]byte, c.chunk)
 	sent := ready.Offset
+	buf := make([]byte, c.chunk)
 	for sent < in.Size {
 		for credits <= 0 {
-			res, f, err := c.readControl()
+			cr, err := c.waitCredit()
 			if err != nil {
 				return nil, err
 			}
-			if res != nil {
-				// mover отказал до того, как мы всё послали.
-				return res, nil
-			}
-			var cr Credit
-			if err := Decode(f, &cr); err != nil || cr.Type != "credit" {
-				return nil, errors.New("mover: ждали кредиты")
-			}
-			credits += cr.Credits
+			credits += cr
 		}
 		n := int64(len(buf))
-		if rem := in.Size - sent; rem < n {
-			n = rem
+		if room := in.Size - sent; room < n {
+			n = room
 		}
-		if credits < n {
-			n = credits
+		if win := int64(credits); win < n {
+			n = win
 		}
 		if _, err := io.ReadFull(in.Body, buf[:n]); err != nil {
-			return nil, fmt.Errorf("mover: чтение источника: %w", err)
+			return nil, fmt.Errorf("mover: читать тело объекта: %w", err)
 		}
 		if err := WriteData(c.conn, in.Op, buf[:n]); err != nil {
 			return nil, err
@@ -214,7 +197,7 @@ func (c *Client) Put(in PutIn) (*Result, error) {
 	}
 
 	for {
-		res, _, err := c.readControl()
+		res, _, err := c.readControl(c.opTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -224,76 +207,91 @@ func (c *Client) Put(in PutIn) (*Result, error) {
 	}
 }
 
-// Get читает объект в w и сверяет SHA-256, которую назвал mover. Приёмник
-// проверяет сумму сам: байты с неверным хвостом сегмента GCM иначе всплывут
-// только при чтении клиентом.
+// Get забирает объект с ленты в w. Принимающая сторона сама выдаёт кредиты и
+// сама сверяет SHA-256: байты с неверным хвостом сегмента GCM иначе всплывают
+// только при чтении клиентом, а mover обязан отказать до того, как байты
+// попадут в кэш.
 func (c *Client) Get(op, id uuid.UUID, w io.Writer) (*Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return nil, errors.New("mover: соединение закрыто")
-	}
+
 	if err := WriteJSON(c.conn, Get{Type: "get", Op: op, ID: id}); err != nil {
 		return nil, err
 	}
-	// Кредиты в этом направлении выдаёт принимающая сторона; окно выдаём сразу,
-	// оно дождётся mover'а в буфере сокета.
-	window := int64(c.chunk) * 4
-	if err := WriteJSON(c.conn, Credit{Type: "credit", Op: op, Credits: window}); err != nil {
+	// Стартовое окно кредитов: принимающая сторона выдаёт кредиты, а не ждёт.
+	if err := WriteJSON(c.conn, Credit{Type: "credit", Op: op, Credits: int64(c.window)}); err != nil {
 		return nil, err
 	}
 
-	h := sha256.New()
-	credits := window
+	var (
+		sha  hash.Hash
+		seen int64
+		crc  = int64(c.window)
+	)
 	for {
+		if crc <= 0 {
+			cr, err := c.waitCredit()
+			if err != nil {
+				return nil, err
+			}
+			crc += cr
+		}
 		f, err := ReadFrame(c.conn, MaxFrameBytes)
 		if err != nil {
 			return nil, err
 		}
-		if f.Kind == frameData {
-			if f.Op != op {
-				return nil, errors.New("mover: данные чужой операции")
+		if f.Kind == frameJSON {
+			var res Result
+			if err := Decode(f, &res); err == nil && res.Type == "result" {
+				if res.Code != CodeOK {
+					return &res, nil
+				}
+				if sha != nil && res.SHA256 != "" && hex.EncodeToString(sha.Sum(nil)) != res.SHA256 {
+					return &Result{Code: CodeChecksumMismatch, State: StateFailed},
+						fmt.Errorf("mover: контрольная сумма объекта не совпала")
+				}
+				return &res, nil
 			}
-			if _, err := w.Write(f.B); err != nil {
-				return nil, err
+			var st StateMsg
+			if err := Decode(f, &st); err == nil && st.Type == "state" {
+				sha = sha256.New()
+				continue
 			}
-			h.Write(f.B)
-			credits -= int64(len(f.B))
-			if err := WriteJSON(c.conn, Credit{Type: "credit", Op: op, Credits: int64(len(f.B))}); err != nil {
-				return nil, err
+			var rd Ready
+			if err := Decode(f, &rd); err == nil && rd.Type == "ready" {
+				crc += rd.Credits
+				continue
 			}
-			continue
+			return nil, fmt.Errorf("mover: неизвестный управляющий кадр %q", f.B[:min(40, len(f.B))])
 		}
-		var res Result
-		if err := Decode(f, &res); err != nil {
-			continue
+		if len(f.B) > int(crc) {
+			return nil, fmt.Errorf("mover: mover нарушил кредиты: послал %d при %d", len(f.B), crc)
 		}
-		if res.Type != "result" {
-			continue // state и прочее
+		crc -= int64(len(f.B))
+		if sha != nil {
+			sha.Write(f.B)
 		}
-		if res.Code != CodeOK {
-			return &res, nil
+		n, err := w.Write(f.B)
+		if err != nil {
+			return nil, err
 		}
-		if sum := hex.EncodeToString(h.Sum(nil)); sum != res.SHA256 {
-			return &res, fmt.Errorf("mover: SHA-256 потока не совпала: получили %s, mover объявил %s", sum, res.SHA256)
+		seen += int64(n)
+		// Приняли байты — вернули кредиты: буфер освободился.
+		if err := WriteJSON(c.conn, Credit{Type: "credit", Op: op, Credits: int64(n)}); err != nil {
+			return nil, err
 		}
-		return &res, nil
 	}
 }
 
-// Status спрашивает состояние операции — так tapegw забирает итог после
-// переподключения: обрыв соединения запись не отменяет.
+// Status спрашивает состояние операции после обрыва.
 func (c *Client) Status(op uuid.UUID) (*Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return nil, errors.New("mover: соединение закрыто")
-	}
 	if err := WriteJSON(c.conn, Status{Type: "status", Op: op}); err != nil {
 		return nil, err
 	}
 	for {
-		res, _, err := c.readControl()
+		res, _, err := c.readControl(c.opTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -303,34 +301,58 @@ func (c *Client) Status(op uuid.UUID) (*Result, error) {
 	}
 }
 
-// readControl читает один кадр: возвращает (result, nil) если это итог,
-// иначе (nil, frame) для ready / resume / credit / state.
-func (c *Client) readControl() (*Result, *Frame, error) {
-	f, err := ReadFrame(c.conn, MaxFrameBytes)
+// waitCredit ждёт кадр кредитов, не забывая про потолок ожидания.
+func (c *Client) waitCredit() (int64, error) {
+	for {
+		f, err := c.readFrame(c.opTimeout)
+		if err != nil {
+			return 0, err
+		}
+		if f.Kind != frameJSON {
+			return 0, fmt.Errorf("mover: ждали кредиты, пришёл кадр данных")
+		}
+		var cr Credit
+		if err := Decode(f, &cr); err == nil && cr.Type == "credit" {
+			return cr.Credits, nil
+		}
+		var res Result
+		if err := Decode(f, &res); err == nil && res.Type == "result" {
+			return 0, fmt.Errorf("mover: операция завершилась кодом %q", res.Code)
+		}
+	}
+}
+
+// readControl читает управляющие кадры до первого result. Кадры state и credit
+// возвращаются вызывающему, чтобы он мог отреагировать на размер и кредиты.
+func (c *Client) readControl(timeout time.Duration) (*Result, *Frame, error) {
+	f, err := c.readFrame(timeout)
 	if err != nil {
 		return nil, nil, err
 	}
 	if f.Kind != frameJSON {
 		return nil, f, nil
 	}
-	var head struct {
-		Type string `json:"t"`
-	}
-	if err := Decode(f, &head); err != nil {
-		return nil, nil, err
-	}
-	if head.Type != "result" {
-		return nil, f, nil
-	}
 	var res Result
-	if err := Decode(f, &res); err != nil {
-		return nil, nil, err
+	if err := Decode(f, &res); err == nil && res.Type == "result" {
+		return &res, nil, nil
 	}
-	return &res, nil, nil
+	return nil, f, nil
 }
 
-// SumBytes — hex SHA-256, та же функция, что объявляется в Put.
+// readFrame читает один кадр с потолком ожидания: полуоткрытое соединение не
+// должно держать клиента вечно.
+func (c *Client) readFrame(timeout time.Duration) (*Frame, error) {
+	if timeout > 0 {
+		if err := c.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return nil, err
+		}
+		defer c.conn.SetReadDeadline(time.Time{})
+	}
+	return ReadFrame(c.conn, MaxFrameBytes)
+}
+
+// SumBytes — convenience для контрольной суммы тела при объявлении операции.
 func SumBytes(b []byte) string {
-	s := sha256.Sum256(b)
-	return hex.EncodeToString(s[:])
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
