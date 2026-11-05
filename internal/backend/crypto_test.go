@@ -255,8 +255,16 @@ func TestETagIsOverPlaintext(t *testing.T) {
 	if bytes.Contains(raw, body) {
 		t.Errorf("в файле спула нашёлся открытый текст")
 	}
-	if int64(len(raw)) != encrypt.CipherSize(int64(len(body))) {
-		t.Errorf("размер файла %d, формула обещала %d", len(raw), encrypt.CipherSize(int64(len(body))))
+	// Файл — это шифротекст данных плюс хвост манифеста (ADR-0019), поэтому
+	// формула обязана сходиться для одних данных, а не для файла целиком.
+	// Разбираем футер: заодно проверка, что хвост на месте и он наш.
+	foot, err := encrypt.ParseFooter(raw[len(raw)-encrypt.FooterSize:])
+	if err != nil {
+		t.Fatalf("футер манифеста не разобран: %v", err)
+	}
+	dataLen := int64(len(raw)) - encrypt.FooterSize - int64(foot.CipherLen)
+	if dataLen != encrypt.CipherSize(int64(len(body))) {
+		t.Errorf("данных %d байт, формула обещала %d", dataLen, encrypt.CipherSize(int64(len(body))))
 	}
 }
 

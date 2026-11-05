@@ -391,24 +391,48 @@ func (t *TapeGW) CompleteMultipartUpload(ctx context.Context,
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("переобёртка DEK: %w", err)
 	}
 
-	// 1. Файл: склейка шифротекстов. До любой записи в Postgres.
-	srcs := make([]uuid.UUID, 0, len(parts))
-	for _, p := range parts {
-		srcs = append(srcs, p.FileID)
-	}
-	cipherTotal, err := t.spool.Concatenate(id, srcs)
+	// Object Lock при завершении: явные заголовки Complete либо правило бакета.
+	// Считается до склейки: манифест обязан описывать ровно ту блокировку,
+	// которая уйдёт в строку objects.
+	lockMode, lockUntil, lockHold, err := t.lockAtComplete(ctx, tenant, up.Bucket)
 	if err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("склейка частей: %w", err)
+		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
+
 	// Смещения шифротекста считаются от размеров открытого текста; если бы они
 	// не сошлись с фактическим файлом, чтение потом читало бы мусор.
 	var cipherAcc int64
 	objParts := make([]meta.ObjectPart, 0, len(parts))
+	manParts := make([]encrypt.ManifestPart, 0, len(parts))
 	for _, p := range parts {
 		objParts = append(objParts, meta.ObjectPart{
 			Number: p.Number, PlainSize: p.Size, CipherOffset: cipherAcc, Salt: p.Salt,
 		})
+		manParts = append(manParts, encrypt.ManifestPart{
+			Number: uint32(p.Number), Plain: p.Size, Off: cipherAcc, Salt: p.Salt,
+		})
 		cipherAcc += encrypt.CipherSize(p.Size)
+	}
+
+	trailer, err := t.manifestTrailer(dek, id, manifestInput{
+		Bucket: up.Bucket, Key: up.Key, ETag: strings.Trim(etag, `"`), Size: total,
+		ContentType: str(up.Meta.ContentType), Meta: up.Meta.UserMeta,
+		Mode: lockMode, Until: lockUntil, Hold: lockHold,
+		Parts: manParts,
+	})
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
+	}
+
+	// 1. Файл: склейка шифротекстов плюс хвост манифеста. До любой записи в
+	// Postgres (правило 6).
+	srcs := make([]uuid.UUID, 0, len(parts))
+	for _, p := range parts {
+		srcs = append(srcs, p.FileID)
+	}
+	cipherTotal, err := t.spool.Concatenate(id, srcs, trailer)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("склейка частей: %w", err)
 	}
 	if cipherAcc != cipherTotal {
 		if rmErr := t.spool.Remove(id); rmErr != nil {
@@ -417,13 +441,6 @@ func (t *TapeGW) CompleteMultipartUpload(ctx context.Context,
 		}
 		return s3response.CompleteMultipartUploadResult{}, "",
 			fmt.Errorf("смещения частей (%d) не совпали с файлом (%d)", cipherAcc, cipherTotal)
-	}
-
-	// Object Lock при завершении: явные заголовки Complete либо правило бакета.
-	lockMode, lockUntil, lockHold, err := t.lockAtComplete(ctx, tenant, up.Bucket)
-	if err != nil {
-		t.removeQuietly(id)
-		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 
 	tags := up.Meta.Tags
