@@ -29,3 +29,4 @@ Architectural Decision Records. Порядок задан в `docs/ARCHITECTURE.
 | [0019](0019-object-manifest-trailer.md) | Манифест объекта в конце файла, таблица частей там | принято |
 | [0020](0020-tape-record-format.md) | Формат записи на ленту: атрибуты, пачка, журнал, снимок | принято |
 | [0021](0021-mover-protocol.md) | Протокол tapegw ↔ mover: mTLS, данные в протоколе, «итог неизвестен» | принято |
+| [0022](0022-copies-as-separate-objects.md) | Каждая копия — самостоятельный объект Phobos; `archive_copies`; «архивный = все копии» | принято |
