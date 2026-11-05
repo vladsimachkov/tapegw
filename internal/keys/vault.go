@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -160,6 +161,10 @@ func (v *Vault) RotateKEK(ctx context.Context) (int, error) {
 	}
 	active := v.ring.Active()
 	rotated := 0
+	// Версии, с которых в этом прогоне уезжают строки. Как только последняя
+	// строка ушла — версия устарела, и именно этот момент надо записать: раньше
+	// ключ ещё нужен, позже — оператор будет ждать дольше обещанного.
+	moved := map[int]bool{}
 	for _, row := range tenants {
 		if row.KekVersion == active {
 			continue
@@ -176,7 +181,16 @@ func (v *Vault) RotateKEK(ctx context.Context) (int, error) {
 		if err := v.meta.SetTenantKey(ctx, row.ID, wrapped, kekVersion); err != nil {
 			return rotated, err
 		}
+		moved[row.KekVersion] = true
 		rotated++
+	}
+	// Отметка ставится ПОСЛЕ переоборачивания: до него версия ещё на что-то
+	// ссылается. Прерванный прогон не теряет отметку — повторный прогон дойдёт
+	// до тех же версий, а COALESCE в метке оставит первый момент.
+	for old := range moved {
+		if err := v.meta.MarkKEKSuperseded(ctx, old, time.Now().UTC()); err != nil {
+			return rotated, err
+		}
 	}
 	return rotated, nil
 }

@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 )
 
 // Размеры AES-GCM. Nonce 12 байт — стандартный размер GCM, при котором
@@ -136,6 +137,19 @@ func LoadKeyRing(path string, active int) (*KeyRing, error) {
 
 // Active — версия KEK, которой заворачивают новые секреты.
 func (r *KeyRing) Active() int { return r.active }
+
+// Versions — все версии KEK в кольце, по возрастанию. Нужен экспорту ключей
+// тенантов (ADR-0014): в заголовке файла обязано быть перечислено, какими KEK
+// завернуты лежащие ниже обёртки, иначе rebuild-meta не поймёт, каким ключом
+// браться, и не отличит «нужного KEK нет в кольце» от «файл испорчен».
+func (r *KeyRing) Versions() []int {
+	out := make([]int, 0, len(r.keys))
+	for v := range r.keys {
+		out = append(out, v)
+	}
+	sort.Ints(out)
+	return out
+}
 
 // Seal заворачивает plaintext открытым текстом в AES-256-GCM. aad — контекст
 // аутентификации (для учётки это access_key): обёртка, снятая с одной строки и

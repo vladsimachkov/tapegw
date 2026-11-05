@@ -36,6 +36,9 @@ type manifestInput struct {
 	Until *time.Time
 	Hold  bool
 	Parts []encrypt.ManifestPart
+	// Created — время записи версии. Ноль means «сейчас»: обычная запись не
+	// передаёт его, а тестам нужен детерминированный манифест.
+	Created time.Time
 }
 
 // hasLock — блокировка есть, если задан хоть один из трёх признаков. Отдельный
@@ -54,6 +57,10 @@ func buildManifestDoc(in manifestInput) *encrypt.ManifestDoc {
 		Size:        in.Size,
 		ContentType: in.ContentType,
 		Parts:       in.Parts,
+		Created:     in.Created.UTC(),
+	}
+	if in.Created.IsZero() {
+		doc.Created = time.Now().UTC()
 	}
 	if len(in.Meta) > 0 {
 		doc.Meta = make(map[string]string, len(in.Meta))

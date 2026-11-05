@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -94,6 +95,17 @@ type ManifestDoc struct {
 	Meta        map[string]string `json:"meta,omitempty"`
 	Lock        *ManifestLock     `json:"lock,omitempty"`
 	Parts       []ManifestPart    `json:"parts"`
+	// Created — когда версия была записана. Нужен исключительно восстановлению:
+	// порядок версий одного ключа в живой базе задаёт version_seq, а его
+	// назначает Postgres уже ПОСЛЕ записи файла (advisory-лок + max+1), так что
+	// в момент сборки манифеста его просто нет. Без времени rebuild-meta не смог
+	// бы ни упорядочить версии в ListObjectVersions, ни выбрать, какая из них
+	// текущая, — а это единственное, что он обязан угадать правильно.
+	//
+	// Динамика с created_at строки отличается на микросекунды; порядок от этого
+	// не меняется, и version_seq при восстановлении считается заново по этому
+	// времени, а не переносится.
+	Created time.Time `json:"created"`
 }
 
 // Footer — разобранный открытый футер.

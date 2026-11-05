@@ -114,6 +114,21 @@ func (m *Meta) DestroyTenantKey(ctx context.Context, tenant int64) error {
 	return nil
 }
 
+// TenantPool — пул тенанта. Нужен восстановлению: pool_id у objects NOT NULL,
+// а взять его при rebuild неоткуда, кроме как из строки тенанта.
+func (m *Meta) TenantPool(ctx context.Context, tenant int64) (int64, error) {
+	var pool int64
+	err := m.Pool.QueryRow(ctx,
+		`SELECT pool_id FROM tenants WHERE id = $1`, tenant).Scan(&pool)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("meta: пул тенанта %d: %w", tenant, err)
+	}
+	return pool, nil
+}
+
 // TenantKeyRowWithID — строка для прогона ротации KEK: нужен id тенанта.
 type TenantKeyRowWithID struct {
 	ID         int64

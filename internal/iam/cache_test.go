@@ -293,13 +293,26 @@ func TestCacheKekRotationAcrossRestart(t *testing.T) {
 // надгробие, тем же access_key его не создать). Если окно не откроется ни в
 // одной попытке, тест падает, а не проходит молча.
 func TestCacheResubscribeFlushesAfterLostEvent(t *testing.T) {
-	const appName = "tapegw-iam-cache-test"
+	// Имя обязано быть уникальным на запуск. Тест ищет соединение листенера в
+	// pg_stat_activity по application_name, а имя «просто константа» собирает в
+	// pg_stat_activity листенеры предыдущих прогонов того же пакета
+	// (go test -count=2, -race -count=3): pg_terminate_backend рвёт чужое
+	// соединение, «обрыв» не наступает, и тест падает с сообщением про
+	// листенера, хотя дело в порядке прогонов.
+	appName := fmt.Sprintf("tapegw-iam-cache-test-%d", time.Now().UnixNano())
 	// Границы нужны, чтобы тест не превращался в бесконечное ожидание на
 	// медленном раннере: попыток — фиксированное число, и суммарно они уложены
 	// в бюджет. За пределами бюджета тест падает с внятным сообщением, а не
 	// висит до таймаута CI.
+	//
+	// Бюджет не может быть меньше стоимости одной попытки: листенер после обрыва
+	// поднимается по бэкоффу (1с, далее удвоение), и на второй итерации цикла
+	// его ещё нет в pg_stat_activity в тот момент, когда тест хочет его
+	// оборвать. Требовать соединение немедленно — значит падать на второй
+	// попытке на медленном раннере; ровно так CI и поймал этот тест.
 	const attempts = 5
-	const budget = 40 * time.Second
+	const listenerWait = 15 * time.Second
+	const budget = 120 * time.Second
 	deadline := time.Now().Add(budget)
 
 	e := setup(t)
@@ -311,9 +324,21 @@ func TestCacheResubscribeFlushesAfterLostEvent(t *testing.T) {
 		mustCreate(t, cache, access, "secret", auth.RoleUser, tenantClient)
 		warmUntilCached(t, cache, access)
 
-		pid, err := listenerBackendPID(context.Background(), e, appName)
-		if err != nil {
-			t.Fatalf("попытка %d: найти соединение листенера: %v", i, err)
+		var pid int
+		var lastErr error
+		// Соединение листенера надо ДОЖДАТЬСЯ, а не зафиксировать его отсутствие
+		// как ошибку: между предыдущим pg_terminate_backend и этой попыткой
+		// прошло меньше секунды бэкоффа.
+		if !waitFor(listenerWait, func() bool {
+			p, err := listenerBackendPID(context.Background(), e, appName)
+			if err != nil {
+				lastErr = err
+				return false
+			}
+			pid = p
+			return true
+		}) {
+			t.Fatalf("попытка %d: найти соединение листенера за %v: %v", i, listenerWait, lastErr)
 		}
 		if _, err := e.m.Pool.Exec(context.Background(),
 			`SELECT pg_terminate_backend($1)`, pid); err != nil {

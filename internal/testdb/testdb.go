@@ -177,7 +177,7 @@ func Clean(t *testing.T, m *meta.Meta) {
 // перечислены: они не мусор, и их проверяет тот же тест отдельно.
 var CleanTables = []string{
 	"upload_parts", "uploads", "object_parts", "restores", "objects", "buckets",
-	"accounts",
+	"accounts", "kek_versions",
 }
 
 // SeedID — id строк, которые в таблицы сида кладут миграции: системный
