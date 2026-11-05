@@ -12,8 +12,9 @@
 --   2) живые байты пачки считаются сразу: без live_bytes планировщик уплотнения
 --      не знает, какие ленты пустеют, и вынужден читать содержимое лент.
 --
--- medium — массив: при repl_count = 2 объект лежит на двух носителях, и
--- `phobos extent list` отдаёт список (ADR-0008).
+-- Носителей у пачки здесь нет: при repl_count = 2 и при двух копиях объект
+-- лежит на нескольких лентах, и описывает это таблица archive_copies
+-- (предложение 0013), где каждая копия — отдельная строка.
 
 CREATE TYPE pack_kind AS ENUM ('data', 'journal');
 CREATE TYPE pack_state AS ENUM ('open', 'sealed', 'archived', 'compacting', 'retired');
@@ -30,7 +31,11 @@ CREATE TABLE packs (
   live_bytes    bigint NOT NULL DEFAULT 0 CHECK (live_bytes >= 0 AND live_bytes <= total_bytes),
   members_total int    NOT NULL DEFAULT 0 CHECK (members_total >= 0),
   members_live  int    NOT NULL DEFAULT 0 CHECK (members_live >= 0 AND members_live <= members_total),
-  medium        text[] NOT NULL DEFAULT '{}',
+  -- Носителя здесь нет намеренно: место хранения каждой копии описывает
+  -- таблица archive_copies (предложение 0013), а не колонка. У объекта может
+  -- быть несколько копий на разных лентах, и одна колонка их не описывает, а
+  -- после первой записи на ленту замена колонки таблицей стала бы миграцией
+  -- всего архива. Пока данных нет — бесплатно.
   created_at    timestamptz NOT NULL DEFAULT now(),
   sealed_at     timestamptz,
   archived_at   timestamptz,
@@ -41,13 +46,13 @@ CREATE TABLE packs (
 -- «есть ли уже открытая пачка этого пула под данные» — первый вопрос маршрутизации.
 CREATE INDEX packs_open ON packs (pool_id, kind, created_at) WHERE state = 'open';
 
--- Носитель крупного объекта и ссылка участника пачки. В момент 'pending' оба
--- пустые: носитель узнают при архивации (ADR-0008), пачку назначит планировщик.
+-- Ссылка участника пачки. В момент 'pending' пустая: пачку назначит
+-- планировщик. Носитель — не здесь и не колонкой: у объекта их может быть
+-- несколько, и описывает их archive_copies (предложение 0013).
 ALTER TABLE objects
   ADD COLUMN pack_id      uuid REFERENCES packs (id),
   ADD COLUMN pack_offset  bigint,
-  ADD COLUMN pack_length  bigint,
-  ADD COLUMN phobos_medium text[];
+  ADD COLUMN pack_length  bigint;
 
 -- Участник пачки обязан знать, где в ней лежит: смещение и длину. Отдельная
 -- проверка, а не «разберёмся при чтении», — иначе потерянный offset читает
@@ -63,15 +68,6 @@ ALTER TABLE objects
   ) NOT VALID;
 ALTER TABLE objects VALIDATE CONSTRAINT objects_pack_member;
 
--- Носитель пачки лежит в packs.medium, а не в строке участника: после
--- уплотнения пачка одна, а участников много, и переписывать массив носителей
--- на каждом участнике — значит иметь два источника правды об одной ленте.
-ALTER TABLE objects
-  ADD CONSTRAINT objects_medium_xor_pack CHECK (
-    pack_id IS NULL OR phobos_medium IS NULL
-  ) NOT VALID;
-ALTER TABLE objects VALIDATE CONSTRAINT objects_medium_xor_pack;
-
 -- «Кто лежит в этой пачке» — запрос планировщика уплотнения и проверки
 -- инварианта live_bytes. Частичный индекс: участников у крупных объектов нет.
 CREATE INDEX objects_pack ON objects (pack_id) WHERE pack_id IS NOT NULL;
@@ -79,9 +75,7 @@ CREATE INDEX objects_pack ON objects (pack_id) WHERE pack_id IS NOT NULL;
 -- +goose Down
 DROP INDEX IF EXISTS objects_pack;
 ALTER TABLE objects
-  DROP CONSTRAINT IF EXISTS objects_medium_xor_pack,
   DROP CONSTRAINT IF EXISTS objects_pack_member,
-  DROP COLUMN IF EXISTS phobos_medium,
   DROP COLUMN IF EXISTS pack_length,
   DROP COLUMN IF EXISTS pack_offset,
   DROP COLUMN IF EXISTS pack_id;

@@ -26,7 +26,7 @@ func TestMigration0017Packs(t *testing.T) {
 
 	// Таблица и её колонки.
 	for _, col := range []string{"id", "pool_id", "kind", "state", "total_bytes",
-		"live_bytes", "members_total", "members_live", "medium",
+		"live_bytes", "members_total", "members_live",
 		"created_at", "sealed_at", "archived_at", "retired_at"} {
 		var n int
 		if err := m.Pool.QueryRow(ctx,
@@ -58,8 +58,8 @@ func TestMigration0017Packs(t *testing.T) {
 
 	packID := uuid.New()
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO packs (id, pool_id, kind, total_bytes, live_bytes, members_total, members_live, medium)
-		  VALUES ($1, 1, 'data', 1000, 600, 2, 1, ARRAY['TST001','TST002'])`, packID); err != nil {
+		`INSERT INTO packs (id, pool_id, kind, total_bytes, live_bytes, members_total, members_live)
+		  VALUES ($1, 1, 'data', 1000, 600, 2, 1)`, packID); err != nil {
 		t.Fatalf("вставка пачки: %v", err)
 	}
 	if _, err := m.Pool.Exec(ctx,
@@ -75,13 +75,16 @@ func TestMigration0017Packs(t *testing.T) {
 		t.Fatalf("вернуть счётчики: %v", err)
 	}
 
-	// medium — массив: при repl_count = 2 объект лежит на двух носителях.
-	var med []string
-	if err := m.Pool.QueryRow(ctx, `SELECT medium FROM packs WHERE id = $1`, packID).Scan(&med); err != nil {
-		t.Fatalf("medium: %v", err)
-	}
-	if len(med) != 2 {
-		t.Errorf("medium = %v, ожидали два носителя при repl_count = 2", med)
+	// Носителя в схеме нет ни у пачки, ни у объекта: место хранения каждой копии
+	// описывает таблица archive_copies (предложение 0013), и одна колонка их не
+	// описывает. Проверка обратная — колонки быть не должно. Пока таблица пуста,
+	// это дешёвое решение; после первой записи на ленту возврат к колонке стал бы
+	// миграцией всего архива, поэтому он и закрыт тестом.
+	for _, col := range []string{"medium", "phobos_medium"} {
+		if n := columnCountAny(t, ctx, m, col); n != 0 {
+			t.Errorf("колонка %s существует: носитель должен жить в archive_copies, "+
+				"а не колонкой (предложение 0013)", col)
+		}
 	}
 
 	// Участник пачки: ссылка обязана нести смещение и длину.
@@ -106,35 +109,23 @@ func TestMigration0017Packs(t *testing.T) {
 		t.Errorf("участник пачки без pack_offset прошёл: потерянное смещение читает чужие байты молча")
 	}
 
-	// Носитель пачки лежит в packs.medium, а не в строке участника: иначе про
-	// одну ленту будет два источника правды.
-	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class, state,
-		                      landing, online_until, tenant_id, pool_id, is_current,
-		                      wrapped_dek, pack_id, pack_offset, pack_length, phobos_medium)
-		  VALUES ($1, $2, 'member-medium', 100, 'etag', 'GLACIER', 'archived', false,
-		          now() + interval '1 day', 1, 1, true, 'x'::bytea, $3, 0, 100, ARRAY['TST001'])`,
-		uuid.New(), bucketID, packID); err == nil {
-		t.Errorf("участник пачки со своим phobos_medium прошёл: два источника правды о ленте")
-	}
-
 	// Крупный объект вне пачки носит свой носитель — это путь ADR-0008.
 	big := uuid.New()
 	if _, err := m.Pool.Exec(ctx,
 		`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class, state,
 		                      landing, online_until, tenant_id, pool_id, is_current,
-		                      wrapped_dek, phobos_medium)
+		                      wrapped_dek)
 		  VALUES ($1, $2, 'big-object', 100, 'etag', 'GLACIER', 'archived', false,
-		          now() + interval '1 day', 1, 1, true, 'x'::bytea, ARRAY['TST002'])`,
+		          now() + interval '1 day', 1, 1, true, 'x'::bytea)`,
 		big, bucketID); err != nil {
-		t.Fatalf("крупный объект со своим носителем: %v", err)
+		t.Fatalf("крупный объект вне пачки: %v", err)
 	}
 
 	// Down и повторный Up — текстом файла и на наполненной таблице.
 	if _, err := m.Pool.Exec(ctx, section(t, migration0017, "Down")); err != nil {
 		t.Fatalf("Down 0017 на таблице с данными: %v", err)
 	}
-	for _, col := range []string{"pack_id", "pack_offset", "pack_length", "phobos_medium"} {
+	for _, col := range []string{"pack_id", "pack_offset", "pack_length"} {
 		if n := columnCount(t, ctx, m, col); n != 0 {
 			t.Errorf("после Down колонка objects.%s осталась", col)
 		}
@@ -148,7 +139,7 @@ func TestMigration0017Packs(t *testing.T) {
 	if n := tableCount(t, ctx, m, "packs"); n != 1 {
 		t.Errorf("после повторного Up таблица packs не вернулась")
 	}
-	for _, col := range []string{"pack_id", "pack_offset", "pack_length", "phobos_medium"} {
+	for _, col := range []string{"pack_id", "pack_offset", "pack_length"} {
 		if n := columnCount(t, ctx, m, col); n != 1 {
 			t.Errorf("после повторного Up колонка objects.%s не вернулась", col)
 		}
@@ -164,6 +155,19 @@ func TestMigration0017Packs(t *testing.T) {
 		Scan(&validated); err == nil && !validated {
 		t.Errorf("objects_pack_member осталось NOT VALID после повторного Up")
 	}
+}
+
+// columnCountAny считает колонку по всему списку таблиц: проверка «носителя нет
+// в схеме» должна ловить его в любой таблице, а не только в objects.
+func columnCountAny(t *testing.T, ctx context.Context, m *meta.Meta, col string) int {
+	t.Helper()
+	var n int
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.columns
+		  WHERE table_schema = current_schema() AND column_name = $1`, col).Scan(&n); err != nil {
+		t.Fatalf("счётчик колонок %s: %v", col, err)
+	}
+	return n
 }
 
 func tableCount(t *testing.T, ctx context.Context, m *meta.Meta, tbl string) int {
