@@ -161,8 +161,9 @@ func TestMigration0018MediaRegistry(t *testing.T) {
 	// Носитель обязан быть из реестра: метка в массиве не была связана ни с чем,
 	// и опечатка прошла бы незамеченной.
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO archive_copies (pack_id, spec, phobos_oid, format, medium_id, state)
-		  VALUES ($1, 'side:left', 'oid-bad-medium', 1, 999999, 'done')`,
+		`INSERT INTO archive_copies (pack_id, spec, phobos_oid, format, medium_id, state, sha256)
+		  VALUES ($1, 'side:left', 'oid-bad-medium', 1, 999999, 'done',
+		          decode('000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f', 'hex'))`,
 		packID); err == nil {
 		t.Error("копия на несуществующий носитель прошла: связь с реестром не работает")
 	}
@@ -314,6 +315,9 @@ func TestMigration0018MediaRegistry(t *testing.T) {
 
 	// --- Down / повторный Up на наполненной схеме ---
 
+	if _, err := m.Pool.Exec(ctx, section(t, migration0019, "Down")); err != nil {
+		t.Fatalf("Down 0019 перед 0018: %v", err)
+	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0018, "Down")); err != nil {
 		t.Fatalf("Down 0018 на схеме с данными: %v", err)
 	}
@@ -324,6 +328,9 @@ func TestMigration0018MediaRegistry(t *testing.T) {
 	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0018, "Up")); err != nil {
 		t.Fatalf("повторный Up 0018: %v", err)
+	}
+	if _, err := m.Pool.Exec(ctx, section(t, migration0019, "Up")); err != nil {
+		t.Fatalf("повторный Up 0019 после 0018: %v", err)
 	}
 	// Триггер обязан вернуться вместе со схемой: Down/Up без него — это
 	// «журнал снова только на добавление» только на словах.
