@@ -57,9 +57,10 @@ func loadPool(caFile string) (*x509.CertPool, error) {
 
 // peerURIs возвращает SAN-URI листа и проверяет назначенное использование.
 //
-// Проверка ExtKeyUsage здесь обязательна: сертификат без этого расширения Go
-// считает годным на любое назначение, поэтому «клиентский» сертификат без
-// ClientAuth прошёл бы и как серверный, и наоборот.
+// Пустое расширение есть отказ. Go сертификат без ExtKeyUsage считает годным на
+// любое назначение, поэтому «клиентский» сертификат без ClientAuth прошёл бы и
+// как серверный, и наоборот; проверка назначения обязана быть второй линией
+// после SAN-URI, а не первой и не единственной.
 func peerURIs(rawCerts [][]byte, wantExt x509.ExtKeyUsage) ([]*url.URL, error) {
 	if len(rawCerts) == 0 {
 		return nil, errors.New("mover: сертификат не предъявлен")
@@ -68,17 +69,15 @@ func peerURIs(rawCerts [][]byte, wantExt x509.ExtKeyUsage) ([]*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mover: разбор сертификата: %w", err)
 	}
-	if len(cert.ExtKeyUsage) > 0 {
-		found := false
-		for _, u := range cert.ExtKeyUsage {
-			if u == wantExt {
-				found = true
-				break
-			}
+	found := false
+	for _, u := range cert.ExtKeyUsage {
+		if u == wantExt {
+			found = true
+			break
 		}
-		if !found {
-			return nil, fmt.Errorf("mover: сертификат не назначен для %v", wantExt)
-		}
+	}
+	if !found {
+		return nil, fmt.Errorf("mover: сертификат не назначен для %v", wantExt)
 	}
 	return cert.URIs, nil
 }

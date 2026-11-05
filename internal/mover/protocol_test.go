@@ -297,6 +297,17 @@ func TestWrongRoleRejected(t *testing.T) {
 	}
 }
 
+// SAN-URI роли на месте, но расширение ExtKeyUsage отсутствует. Go такой
+// сертификат считает годным на любое назначение, поэтому отказ обязан исходить
+// от нашей проверки, а не от стандартной: иначе защита держится одной линией,
+// хотя обещаны две.
+func TestCertWithoutExtKeyUsageRejected(t *testing.T) {
+	e := startEnv(t, 1<<20)
+	if _, err := e.dialWith(t, e.pki.noExtKeyCert, e.pki.noExtKeyKey, e.pki.ca); err == nil {
+		t.Fatalf("сертификат без ExtKeyUsage обязан отклоняться, даже если SAN-URI роли подходит")
+	}
+}
+
 // Клиент проверяет, что подключился именно к ожидаемому mover'у: сертификат
 // другого драйва того же CA — отказ, иначе «записать на драйв A» уедет на B.
 func TestWrongMoverRejected(t *testing.T) {

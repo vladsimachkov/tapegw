@@ -41,6 +41,8 @@ type testPKI struct {
 	otherDriveCert, otherDriveKey string
 	// Тот же CA, но подписанный как серверный: в роли клиента быть не должен.
 	moverAsClientCert, moverAsClientKey string
+	// SAN-URI роли на месте, ExtKeyUsage отсутствует.
+	noExtKeyCert, noExtKeyKey string
 
 	foreignCA      string
 	foreignSrvCert string
@@ -113,6 +115,32 @@ func newPKI(t *testing.T) *testPKI {
 		return certPath, keyPath
 	}
 
+	signNoExt := func(ca *x509.Certificate, caKey *ecdsa.PrivateKey, cn string, uris []*url.URL, dns []string) (string, string) {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(time.Now().UnixNano()),
+			Subject:      pkix.Name{CommonName: cn},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature,
+			URIs:         uris,
+			DNSNames:     dns,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kb, err := x509.MarshalECPrivateKey(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p.write(cn+".crt", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+			p.write(cn+".key", pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}))
+	}
+
 	ca, caKey, caPath := newCA("ca")
 	p.ca = caPath
 
@@ -122,6 +150,12 @@ func newPKI(t *testing.T) *testPKI {
 		[]*url.URL{mover.MoverURI(p.otherDrive)}, []string{mover.MoverDNSName})
 	// Сертификат mover'а, предъявленный как клиентский: ServerAuth и SAN mover'а.
 	p.moverAsClientCert, p.moverAsClientKey = p.serverCert, p.serverKey
+
+	// Правильный SAN-URI роли, но расширение ExtKeyUsage отсутствует вовсе.
+	// Go такой сертификат считает годным на любое назначение, поэтому отказ
+	// обязан исходить от нас.
+	p.noExtKeyCert, p.noExtKeyKey = signNoExt(ca, caKey, "tapegw-noext",
+		[]*url.URL{mover.ClientURI(mover.ClientScheduler)}, nil)
 
 	p.clientCert, p.clientKey = sign(ca, caKey, "tapegw-scheduler", x509.ExtKeyUsageClientAuth,
 		[]*url.URL{mover.ClientURI(mover.ClientScheduler)}, nil)
