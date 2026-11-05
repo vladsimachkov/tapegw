@@ -5,30 +5,56 @@
 //
 //	internal/store/phobos  — cgo, build tag `phobos`
 //	internal/store/fake    — in-memory, с инъекцией сбоев
+//
+// Интерфейс намеренно не про дескрипторы файлов: mover живёт на сервере
+// библиотеки, а данные приходят к нему по протоколу (ADR-0021), поэтому Put
+// принимает поток, а Get — приёмник.
 package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
-	"os"
 
 	"github.com/google/uuid"
 )
 
-// PutItem — один объект в батче записи. File нужно держать открытым до возврата
-// из Put: Phobos читает дескриптор, а не путь.
-type PutItem struct {
-	ID    uuid.UUID
-	File  *os.File
-	Size  int64
-	Attrs map[string]string
+// AttrBudgetBytes — сколько байт занимают наши атрибуты объекта на ленте.
+//
+// Phobos сериализует все пользовательские атрибуты в один JSON в xattr
+// user.user_md, а LTFS ограничивает одно значение xattr 4096 байтами. Замер
+// M2-01: значение 4079 проходит, 4080 — ENOSPC; разница 17 байт — обёртка
+// JSON, которую добавляет Phobos. Проверка обязана случиться ДО обращения к
+// ленте: ENOSPC в середине батча неотличим от «нет ленты с тегом» (M0-08).
+const AttrBudgetBytes = 4079
+
+// AttrSize — сколько байт займут атрибуты в JSON, который пишет Phobos.
+// Считается так же, как его сериализует encoding/json, потому что ровно этот
+// JSON и упирается в лимит LTFS.
+func AttrSize(attrs map[string]string) int {
+	b, err := json.Marshal(attrs)
+	if err != nil {
+		// Значения атрибутов — строки, отказать может только не-UTF-8, и то
+		// не здесь. Пусть это будет явная ошибка, а не «влезло».
+		return 1 << 30
+	}
+	return len(b)
 }
 
-// GetItem — один объект в батче чтения. File — куда писать.
+// PutItem — один объект в батче записи. Reader читается до конца самим
+// хранилищем; закрывать его не нужно.
+type PutItem struct {
+	ID     uuid.UUID
+	Reader io.Reader
+	Size   int64
+	Attrs  map[string]string
+}
+
+// GetItem — один объект в батче чтения. Writer — куда писать прочитанное.
 type GetItem struct {
-	ID   uuid.UUID
-	File *os.File
+	ID     uuid.UUID
+	Writer io.Writer
 }
 
 // Result — итог по одному объекту батча. Батч может частично удалиться,
@@ -45,14 +71,17 @@ type PutOptions struct {
 	Layout       string
 	LayoutParams map[string]string
 	Tags         []string
+	// NoSplit запрещает дробить батч по носителям: Phobos обязан выбрать
+	// ленту, куда влезет весь батц целиком.
+	NoSplit bool
 }
 
 // Location — где объект лежит на ленте. Нужен recaller-у, чтобы отсортировать
 // батч по ленте и смещению и не мотать каретку туда-сюда.
 //
-// Доступность этих данных — вопрос спайка M0-4; если API Phobos их не отдаёт,
-// Locate возвращает ErrNotSupported и recaller полагается на переупорядочивание
-// в LRS.
+// Locate в TLC-протоколе нет (спайк M0-04), поэтому реализация обязана
+// возвращать ErrNotSupported, а носитель узнаётся при архивации через
+// extent list (ADR-0008).
 type Location struct {
 	TapeID    string
 	Offset    int64
@@ -60,19 +89,23 @@ type Location struct {
 }
 
 // Meta — метаданные объекта на стороне Phobos.
+//
+// Complete отдельен, а не «Size > 0»: phobos_getmd возвращает объект и при
+// copy_status = incomplete (спайк M0-02). Считать такой объект
+// заархивированным — значит потерять данные молча.
 type Meta struct {
-	ID      uuid.UUID
-	Size    int64
-	Version int
-	Attrs   map[string]string
+	ID       uuid.UUID
+	Size     int64
+	Version  int
+	Complete bool
+	Attrs    map[string]string
 }
 
 // Store — клиент Phobos. Все методы батчевые: один вызов = один xfer, это
 // и требование производительности ленты, и способ держать каретку в покое.
 //
-// Вызовы блокирующие. Их разрешено делать только из пула размером
-// phobos.max_inflight (по умолчанию 1, до подтверждения потокобезопасности
-// libphobos спайком M0-3). Отмена ctx не прерывает идущий C-вызов: воркер при
+// Вызовы блокирующие. Их разрешено делать только из процесса mover, один
+// вызов за раз (ADR-0007). Отмена ctx не прерывает идущий C-вызов: воркер при
 // остановке дожидается текущего батча.
 type Store interface {
 	Put(ctx context.Context, items []PutItem, opt PutOptions) []Result
@@ -80,17 +113,32 @@ type Store interface {
 	Stat(ctx context.Context, id uuid.UUID) (Meta, error)
 	Delete(ctx context.Context, ids []uuid.UUID) []Result
 
-	// Locate может вернуть ErrNotSupported.
+	// Extents — носители, на которые лёг объект. Нужны, чтобы обновить
+	// objects.phobos_medium после архивации и после repack (ADR-0008).
+	// Может вернуть ErrNotSupported.
+	Extents(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]string, error)
+
+	// Locate может вернуть ErrNotSupported — в TLC-протоколе Locate нет.
 	Locate(ctx context.Context, ids []uuid.UUID) ([]Location, error)
 
 	io.Closer
 }
 
-// Типизированные ошибки хранилища. Воркеры по ним решают, ретраить или сдаваться:
-// ErrBusy и ErrNoSpace ретраятся, прочие фатальны для конкретного объекта.
+// Типизированные ошибки хранилища. Воркеры по ним решают, ретраить или
+// сдаваться: ErrBusy и ErrNoSpace ретраятся, прочие фатальны для объекта.
 var (
 	ErrNotFound     = errors.New("store: object not found")
 	ErrNoSpace      = errors.New("store: no space on tape")
 	ErrBusy         = errors.New("store: phobos busy")
 	ErrNotSupported = errors.New("store: not supported by this backend")
+	// ErrIncomplete — объект есть в индексе, но копия неполная. Отдельная
+	// ошибка именно потому, что «есть» и «полон» — разные условия (M0-02).
+	ErrIncomplete = errors.New("store: copy is incomplete")
+	// ErrExists — объект с таким oid уже записан. Повторная запись не
+	// перезаписывает: oid уникален, и молча перезаписать — значит подменить
+	// данные у того же version UUID.
+	ErrExists = errors.New("store: object already exists")
+	// ErrAttrTooLarge — атрибуты не влезут в бюджет LTFS. Ошибка
+	// конфигурации вызывающей стороны, а не лента: обнаруживается до xfer.
+	ErrAttrTooLarge = errors.New("store: attributes exceed LTFS budget")
 )
