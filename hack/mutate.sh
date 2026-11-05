@@ -26,7 +26,9 @@
 #                   sed одной строкой многрочный SQL не вырежет.
 #                   Пример: MODE=perl EXPR='s/\s*AND kind = .data.\n//'
 #   DROP_SCHEMA=<имя>  схема пересоздаётся перед базовым прогоном и перед
-#                   прогоном после мутации. Нужно для мутаций *.sql.
+#                   прогоном после мутации. Нужно для мутаций *.sql. Имя
+#                   обязано быть вида tapegw_test_<имя> — иначе отказ (rc=5):
+#                   CASCADE с неверным именем удаляет чужие данные.
 #   PSQL=<команда>  чем ронять схему, по умолчанию psql.
 set -euo pipefail
 
@@ -54,12 +56,24 @@ trap restore EXIT INT TERM
 
 drop_schema() {
 	[ -n "${DROP_SCHEMA:-}" ] || return 0
+	# Скрипт роняет схемы с CASCADE, значит защищаться от неверного имени он
+	# обязан сам, а не полагаться на внимательность запускающего: опечатка
+	# DROP_SCHEMA=tapegw при DSN на рабочий стенд (тот же Postgres, где живут
+	# Phobos DSS и e2e-данные) снесла бы основную схему со всем содержимым.
+	# Проходить могут только схемы, которые создаёт testdb.
+	if [[ ! "$DROP_SCHEMA" =~ ^tapegw_test_[a-z0-9_]+$ ]]; then
+		echo "DROP_SCHEMA='$DROP_SCHEMA' не похоже на тестовую схему: разрешены только вида tapegw_test_<имя> " >&2
+		echo "(те, что создаёт testdb). Разыменование идёт в CASCADE, и ошибиться здесь — значит удалить чужие данные." >&2
+		exit 5
+	fi
 	if [ -z "${TAPEGW_TEST_DSN:-}" ]; then
 		echo "DROP_SCHEMA задан, а TAPEGW_TEST_DSN нет: схема не пересоздана, и мутация миграции ничего не проверит" >&2
 		exit 4
 	fi
+	# Имя — идентификатор, в двойных кавычках: без них оно подставлялось в SQL
+	# как есть.
 	${PSQL:-psql} "$TAPEGW_TEST_DSN" -qc \
-		"DROP SCHEMA IF EXISTS $DROP_SCHEMA CASCADE" >/dev/null
+		"DROP SCHEMA IF EXISTS \"$DROP_SCHEMA\" CASCADE" >/dev/null
 }
 
 apply_mutation() {
