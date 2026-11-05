@@ -145,6 +145,74 @@ func TestClaimBatchFairness(t *testing.T) {
 
 // Доля тенанта ограничена и по байтам: тенант с десятью объектами по 20 GiB
 // забирает батч целиком, формально не нарушив лимит по числу.
+// Голодание по id тенанта. Одна выборка осматривает не больше
+// MaxTenantsPerClaim тенантов, и если ожидающих больше, порядок этой выборки
+// решает, кто ест. Порядок «по tenant_id» кормит младших бесконечно: при
+// постоянном потоке старшие id не попадают в батч никогда.
+//
+// Здесь тенантов больше, чем осматривает выборка, и дольше всех ждёт тенант с
+// НАИБОЛЬШИМ id — ровно тот, кого «ORDER BY tenant_id ... LIMIT n» отсекает.
+// Младшие при этом продолжают писать: новый объект приходит раньше, чем очередь
+// успевает рассосаться.
+func TestClaimBatchNoStarvationByTenantID(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+
+	n := meta.MaxTenantsPerClaim + 6
+	// Старший id — самый старый объект. Длительность ожидания задаётся
+	// created_at, потому что next_try_at у всех пуст: «сбоя ещё не было».
+	oldest := int64(1) + int64(n)
+	for i := 1; i <= n; i++ {
+		tid := int64(1) + int64(i)
+		bucket := "starv-" + strconv.FormatInt(tid, 10)
+		tenantWithObjects(t, m, tid, bucket, 10, 1)
+		if _, err := m.Pool.Exec(ctx,
+			`UPDATE objects SET created_at = now() - make_interval(mins => $2)
+			  WHERE tenant_id = $1`, tid, i); err != nil {
+			t.Fatalf("создал tenant %d: %v", tid, err)
+		}
+	}
+
+	lim := meta.BatchLimits{MaxObjects: 4, PerTenantObjects: 1}
+
+	// Ограниченное число циклов: за это время старший обязан быть взят, даже
+	// если младшие подкладывают новые объекты.
+	const cycles = 3
+	served := false
+	for cycle := 0; cycle < cycles && !served; cycle++ {
+		got, err := m.ClaimMigrationBatch(ctx, 1, lim)
+		if err != nil {
+			t.Fatalf("цикл %d: %v", cycle, err)
+		}
+		if len(got) == 0 {
+			t.Fatalf("цикл %d: батч пуст при %d ожидающих тенантах", cycle, n)
+		}
+		for _, c := range got {
+			if c.TenantID == oldest {
+				served = true
+			}
+		}
+		// Младший тенант не даёт очереди рассосаться: у него всегда свежий
+		// объект, поэтому по давности он в хвосте, но выборка под ним всё
+		// равно живая.
+		if _, err := m.Pool.Exec(ctx,
+			`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class, state,
+			                      landing, online_until, tenant_id, pool_id, is_current,
+			                      wrapped_dek)
+			  SELECT gen_random_uuid(), b.id, 'late-' || $1, 10,
+			         'etag', 'GLACIER', 'pending', true,
+			         now() + interval '1 day', 2, 1, true, 'x'::bytea
+			    FROM buckets b WHERE b.name = 'starv-2'`, strconv.Itoa(cycle)); err != nil {
+			t.Fatalf("свежий объект младшего: %v", err)
+		}
+	}
+	if !served {
+		t.Errorf("тенант %d (наибольший id, ждёт дольше всех) не попал ни в один из %d батчей: "+
+			"выборка кормит тенантов по возрастанию id, а не по давности ожидания", oldest, cycles)
+	}
+}
+
 func TestClaimBatchPerTenantBytes(t *testing.T) {
 	m := testdb.Connect(t)
 	testdb.Clean(t, m)

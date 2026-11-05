@@ -3,7 +3,6 @@ package meta
 import (
 	"context"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,10 +30,13 @@ import (
 // кандидата — батч получится меньше, и это нормальный исход SKIP LOCKED, а не
 // ошибка: недобор сегодня добирается следующим батчем.
 
-// maxTenantsPerClaim — сколько тенантов осмотреть за одну выборку. Больше —
+// MaxTenantsPerClaim — сколько тенантов осмотреть за одну выборку. Больше —
 // значит гонять больше запросов ради батча, который всё равно упрётся в
-// MaxObjects раньше.
-const maxTenantsPerClaim = 64
+// MaxObjects раньше. Экспортирован не для красоты: тест на голодание обязан
+// построить очередь длиннее этого порога, и повторять число литералом — значит
+// получить тест, который молча перестанет что-либо проверять после правки
+// константы.
+const MaxTenantsPerClaim = 64
 
 // BatchLimits — ограничения одного батча migrator'а.
 type BatchLimits struct {
@@ -102,34 +104,54 @@ func (m *Meta) ClaimMigrationBatch(ctx context.Context, poolID int64, lim BatchL
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // после commit ничего не откатывается
 
-	// Шаг 1 — кто вообще ждёт. Перебирать тысячи тенантов нельзя (ADR-0016),
-	// поэтому DISTINCT ON по частичному индексу objects_tenant_queue: он
-	// останавливается, набрав нужное число различных тенантов, и до пустых
-	// очередей не доходит.
+	// Шаг 1 — кто вообще ждёт и в каком порядке. Перебирать тысячи тенантов
+	// нельзя (ADR-0016), поэтому берём не больше MaxTenantsPerClaim, но порядок
+	// — по давности самого старого ожидающего объекта среди ВСЕХ тенантов пула.
+	//
+	// Здесь раньше был DISTINCT ON (tenant_id) ... ORDER BY tenant_id, и это
+	// было голодание: DISTINCT ON требует сортировки по tenant_id в начале,
+	// поэтому LIMIT всегда брал тенантов с наименьшими id. Сортировка по
+	// давности в Go происходила уже внутри этого обрезанного набора, то есть
+	// честность считалась только по допущенным. Если тенантов с ожидающими
+	// объектами больше MaxTenantsPerClaim, старшие id не попадали в батч, пока
+	// младшие что-то пишут, — при постоянном потоке это длится бесконечно.
+	//
+	// created_at в coalesce нужен не для порядка вообще, а чтобы различать
+	// между собой объекты без next_try_at: без него все «ещё не было сбоя»
+	// одинаково самые старые, и голодание повторяется внутри этой кучи.
+	//
+	// Цена. Агрегат проходит по всем ожидающим пула и не может остановиться на
+	// 64-м тенанте: чтобы упорядочить по давности, надо посчитать минимум у
+	// каждого. Замер на 350k строк objects, из них 50k pending и 500 тенантов:
+	// 9.8 мс против 3.0 мс у прежней DISTINCT ON, которая обрывалась на 6401
+	// строке. Рост — по размеру бэклога, а не по размеру таблицы: план
+	// выбирает bitmap scan по objects_queue, и архивные строки в деле не
+	// участвуют. Выборка делается раз на батч, батч пишется минуты, поэтому
+	// лишние 7 мс тонут в работе; но это не бесплатная правка, и при бэклоге в
+	// сотни тысяч объектов её придётся вспоминать.
 	tenants, err := tx.Query(ctx, `
-		SELECT DISTINCT ON (tenant_id) tenant_id, next_try_at
+		SELECT tenant_id, min(coalesce(next_try_at, created_at)) AS oldest
 		  FROM objects
 		 WHERE state = 'pending'
 		   AND pool_id = $1
 		   AND (next_try_at IS NULL OR next_try_at <= now())
-		 ORDER BY tenant_id, next_try_at NULLS FIRST, id
-		 LIMIT $2`, poolID, maxTenantsPerClaim)
+		 GROUP BY tenant_id
+		 ORDER BY oldest
+		 LIMIT $2`, poolID, MaxTenantsPerClaim)
 	if err != nil {
 		return nil, fmt.Errorf("claim batch: tenants: %w", err)
 	}
 
-	type tenantWait struct {
-		id   int64
-		wait *time.Time
-	}
-	var waiting []tenantWait
+	var waiting []int64
 	for tenants.Next() {
-		var tw tenantWait
-		if err := tenants.Scan(&tw.id, &tw.wait); err != nil {
+		var id int64
+		var oldest time.Time
+		if err := tenants.Scan(&id, &oldest); err != nil {
 			tenants.Close()
 			return nil, fmt.Errorf("claim batch: tenants scan: %w", err)
 		}
-		waiting = append(waiting, tw)
+		_ = oldest // порядок уже задал SQL; сам момент здесь не нужен
+		waiting = append(waiting, id)
 	}
 	tenants.Close()
 	if err := tenants.Err(); err != nil {
@@ -138,18 +160,6 @@ func (m *Meta) ClaimMigrationBatch(ctx context.Context, poolID int64, lim BatchL
 	if len(waiting) == 0 {
 		return nil, nil
 	}
-	// Кого зовут первым — того, кто ждёт дольше всех. NULL (ещё не было сбоя)
-	// считается самым старым: такой объект ждёт с момента записи.
-	sort.SliceStable(waiting, func(i, j int) bool {
-		a, b := waiting[i].wait, waiting[j].wait
-		if a == nil {
-			return b != nil
-		}
-		if b == nil {
-			return false
-		}
-		return a.Before(*b)
-	})
 
 	// Шаг 2 — занять по очереди у каждого тенанта.
 	//
@@ -167,7 +177,7 @@ func (m *Meta) ClaimMigrationBatch(ctx context.Context, poolID int64, lim BatchL
 	var chosen []picked
 	perTenantBytes := map[int64]int64{}
 	var total int64
-	for _, tw := range waiting {
+	for _, tenantID := range waiting {
 		if len(chosen) >= lim.MaxObjects {
 			break
 		}
@@ -177,9 +187,9 @@ func (m *Meta) ClaimMigrationBatch(ctx context.Context, poolID int64, lim BatchL
 			   AND (next_try_at IS NULL OR next_try_at <= now())
 			 ORDER BY next_try_at NULLS FIRST, created_at, id
 			 LIMIT $3
-			 FOR UPDATE SKIP LOCKED`, tw.id, poolID, lim.PerTenantObjects)
+			 FOR UPDATE SKIP LOCKED`, tenantID, poolID, lim.PerTenantObjects)
 		if err != nil {
-			return nil, fmt.Errorf("claim batch: lock tenant %d: %w", tw.id, err)
+			return nil, fmt.Errorf("claim batch: lock tenant %d: %w", tenantID, err)
 		}
 		n := 0
 		for rows.Next() {
@@ -200,12 +210,12 @@ func (m *Meta) ClaimMigrationBatch(ctx context.Context, poolID int64, lim BatchL
 				if lim.MaxBytes > 0 && total+size > lim.MaxBytes {
 					continue
 				}
-				if lim.PerTenantBytes > 0 && perTenantBytes[tw.id]+size > lim.PerTenantBytes {
+				if lim.PerTenantBytes > 0 && perTenantBytes[tenantID]+size > lim.PerTenantBytes {
 					continue
 				}
 			}
-			chosen = append(chosen, picked{id: id, tenant: tw.id, size: size})
-			perTenantBytes[tw.id] += size
+			chosen = append(chosen, picked{id: id, tenant: tenantID, size: size})
+			perTenantBytes[tenantID] += size
 			total += size
 			n++
 		}
