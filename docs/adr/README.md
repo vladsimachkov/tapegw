@@ -26,3 +26,4 @@ Architectural Decision Records. Порядок задан в `docs/ARCHITECTURE.
 | [0016](0016-thousands-of-tenants.md) | Решения под тысячи тенантов | принято |
 | [0017](0017-tenant-guard.md) | Страж тенанта: AccessDenied, тенант параметром meta | принято |
 | [0018](0018-system-tenant.md) | Системный тенант: id = 1 закрыт для клиентов | принято |
+| [0019](0019-object-manifest-trailer.md) | Манифест объекта в конце файла, таблица частей там | принято |
