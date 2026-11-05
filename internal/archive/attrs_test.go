@@ -14,7 +14,6 @@ func testVersion() archive.Version {
 		Version:    uuid.New(),
 		Tenant:     42,
 		WrappedDEK: []byte("обёртка DEK — 48 байт на самом деле"),
-		WrappedTEK: []byte("обёртка TEK тенанта"),
 		KEK:        "v3",
 	}
 }
@@ -78,6 +77,39 @@ func TestAttributesCarryNoNames(t *testing.T) {
 	}
 }
 
+// TestAttributesHaveNoTEK — обёрнутой TEK в атрибутах быть не может.
+//
+// Это не «лишний ключ», а отмена крипто-уничтожения. Цепочка:
+//
+//   - удаление тенанта (ADR-0014) — это уничтожение его TEK в tenants;
+//   - атрибуты Phobos записаны в индекс LTFS на КАЖДОЙ ленте, где есть объект
+//     тенанта, и переписать их там нельзя;
+//   - KEK по тому же ADR хранится, пока на его версию ссылается хоть одна
+//     обёртка, а теперь ссылаются обёртки на лентах — то есть почти навсегда;
+//   - итог: «уничтоженный» TEK разворачивается из любой ленты тем же KEK, а за
+//     ним все DEK и все данные тенанта.
+//
+// Обёрнутые TEK живут в отдельном экспорте ключей тенантов (ADR-0014), который
+// хранится отдельно от лент и перестаёт содержать тенант сразу после его
+// удаления. Проверка дублирует TestAttributeSetIsExactlyWhatIsAllowed намеренно:
+// тот ловит «появился новый ключ», этот — «вернули именно TEK».
+func TestAttributesHaveNoTEK(t *testing.T) {
+	attrs, err := archive.Attributes(testVersion())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k := range attrs {
+		if strings.Contains(strings.ToLower(k), "tek") {
+			t.Fatalf("в атрибуты попала обёртка TEK (%q): крипто-уничтожение тенанта перестанет быть окончательным", k)
+		}
+	}
+	for _, a := range archive.AttrAttributes {
+		if strings.Contains(strings.ToLower(a), "tek") {
+			t.Fatalf("в списке разрешённых атрибутов есть TEK-ключ %q", a)
+		}
+	}
+}
+
 func TestAttributesRoundTrip(t *testing.T) {
 	v := testVersion()
 	attrs, err := archive.Attributes(v)
@@ -91,8 +123,8 @@ func TestAttributesRoundTrip(t *testing.T) {
 	if got.Version != v.Version || got.Tenant != v.Tenant || got.KEK != v.KEK {
 		t.Fatalf("разъехались скаляры: %+v", got)
 	}
-	if string(got.WrappedDEK) != string(v.WrappedDEK) || string(got.WrappedTEK) != string(v.WrappedTEK) {
-		t.Fatal("обёртки ключей испорчены при переносе")
+	if string(got.WrappedDEK) != string(v.WrappedDEK) {
+		t.Fatal("обёртка DEK испорчена при переносе")
 	}
 }
 
@@ -104,11 +136,6 @@ func TestAttributesRejectEmpty(t *testing.T) {
 	v.WrappedDEK = nil
 	if _, err := archive.Attributes(v); err == nil {
 		t.Fatal("пустая обёртка DEK принята")
-	}
-	v = testVersion()
-	v.WrappedTEK = nil
-	if _, err := archive.Attributes(v); err == nil {
-		t.Fatal("пустая обёртка TEK принята: без неё rebuild-meta не развернёт DEK")
 	}
 	v = testVersion()
 	v.Tenant = 0

@@ -11,6 +11,13 @@
 // открытом виде в индексе LTFS на каждой ленте и в DSS. Оставь в них имена, и
 // после крипто-уничтожения тенанта (ADR-0014) имена его объектов переживут сами
 // данные, а обещание «удалим ваши данные» будет выполнено только наполовину.
+//
+// Второе правило, строже первого: на ленту не попадает НИЧЕГО, что вместе с KEK
+// даёт доступ к данным тенанта после его удаления (ADR-0014). Поэтому здесь нет
+// обёртки TEK. Она расшифровывается тем же KEK, лежит в индексе каждой ленты и
+// непереписываема, так что «уничтоженный» тенант поднялся бы из любого своего
+// объекта — а KEK как раз и хранится, пока на него кто-то ссылается. Обёрнутый
+// DEK при этом остаётся: без TEK он бесполезен.
 package archive
 
 import (
@@ -29,7 +36,6 @@ const (
 	AttrVersion = "tapegw.version"
 	AttrTenant  = "tapegw.tenant"
 	AttrDEK     = "tapegw.dek"
-	AttrTEK     = "tapegw.tek"
 	AttrKEK     = "tapegw.kek"
 	AttrFormat  = "tapegw.format"
 )
@@ -46,24 +52,21 @@ type Version struct {
 	// Tenant — id тенанта: по нему ищется TEK, которым обёрнут DEK, и в отчёте
 	// rebuild-meta группы объектов собираются по тенанту.
 	Tenant int64
-	// WrappedDEK — обёрнутый DEK версии, сырые байты.
-	// WrappedTEK — обёрнутый TEK тенанта, сырые байты.
+	// WrappedDEK — обёрнутый DEK версии, сырые байты. Кладётся base64: Phobos
+	// молча заменяет не-UTF-8 байты на U+FFFD (спайк M2-01), и двоичное значение
+	// иначе было бы испорчено без единого признака ошибки.
 	//
-	// Оба кладутся base64: Phobos молча заменяет не-UTF-8 байты на U+FFFD
-	// (спайк M2-01), и двоичное значение иначе было бы испорчено без единого
-	// признака ошибки.
+	// Обёртки TEK здесь НЕТ, и это не недосмотр, а правило ADR-0014: на ленту не
+	// попадает ничего, что вместе с KEK даёт доступ к данным тенанта после его
+	// удаления. Обёрнутый DEK можно — без TEK он бесполезен. Обёрнутая TEK
+	// нельзя: она лежит в индексе LTFS на каждой ленте, переписать её нельзя, и
+	// «уничтоженный» тенант восстановился бы из любого его объекта.
 	//
-	// TEK нужен здесь, а не в нашей БД, потому что вся цепочка разворачивания
-	// ключа живёт в Postgres: DEK завёрнут в TEK, TEK — в KEK. Если БД
-	// потеряна, а требование «восстановить объект по ленте и KEK» остаётся,
-	// обёртка TEK обязана лежать рядом с объектом. Иначе rebuild-meta
-	// развёртывает KEK и упирается в нечего.
-	//
-	// Секрета в этом нет: обёртка TEK расшифровывается только тем же KEK,
-	// который оператор держит отдельно, и именно для этого KEK и существует.
+	// Обёрнутые TEK живут в отдельном хранилище ключей тенантов (экспорт
+	// tenants.wrapped_key), которое хранится там же, где копия KEK, и
+	// перестает содержать тенант сразу после его удаления. См. ADR-0014.
 	WrappedDEK []byte
-	WrappedTEK []byte
-	// KEK — версия KEK, которой развёртываются обе обёртки. Без неё не понять,
+	// KEK — версия KEK, которой развёрнута обёртка DEK. Без неё не понять,
 	// каким ключом браться, а ротация KEK (ADR-0014) делает таких версий
 	// несколько.
 	KEK string
@@ -81,9 +84,6 @@ func Attributes(v Version) (map[string]string, error) {
 	if len(v.WrappedDEK) == 0 {
 		return nil, fmt.Errorf("archive: пустая обёртка DEK для версии %s", v.Version)
 	}
-	if len(v.WrappedTEK) == 0 {
-		return nil, fmt.Errorf("archive: пустая обёртка TEK для версии %s", v.Version)
-	}
 	if v.Tenant <= 0 {
 		return nil, fmt.Errorf("archive: тенант %d у версии %s", v.Tenant, v.Version)
 	}
@@ -98,7 +98,6 @@ func Attributes(v Version) (map[string]string, error) {
 		AttrVersion: v.Version.String(),
 		AttrTenant:  strconv.FormatInt(v.Tenant, 10),
 		AttrDEK:     base64.StdEncoding.EncodeToString(v.WrappedDEK),
-		AttrTEK:     base64.StdEncoding.EncodeToString(v.WrappedTEK),
 		AttrKEK:     v.KEK,
 		AttrFormat:  strconv.Itoa(f),
 	}, nil
@@ -110,7 +109,7 @@ func Attributes(v Version) (map[string]string, error) {
 // photos/2027/01/договор-4.pdf» появилась бы здесь как расхождение, а не
 // осталась незамеченной до первой ленты.
 var AttrAttributes = []string{
-	AttrDEK, AttrFormat, AttrKEK, AttrTEK, AttrTenant, AttrVersion,
+	AttrDEK, AttrFormat, AttrKEK, AttrTenant, AttrVersion,
 }
 
 // ParseAttributes — разобрать атрибуты, снятые с объекта Phobos. Обратная к
@@ -146,10 +145,6 @@ func ParseAttributes(attrs map[string]string) (Version, error) {
 	if err != nil {
 		return Version{}, fmt.Errorf("archive: атрибут %q не base64: %w", AttrDEK, err)
 	}
-	tek, err := base64.StdEncoding.DecodeString(attrs[AttrTEK])
-	if err != nil {
-		return Version{}, fmt.Errorf("archive: атрибут %q не base64: %w", AttrTEK, err)
-	}
 	format, err := strconv.Atoi(attrs[AttrFormat])
 	if err != nil {
 		return Version{}, fmt.Errorf("archive: атрибут %q: %w", AttrFormat, err)
@@ -160,11 +155,8 @@ func ParseAttributes(attrs map[string]string) (Version, error) {
 	if len(dek) == 0 {
 		return Version{}, fmt.Errorf("archive: пустая обёртка DEK у версии %s", ver)
 	}
-	if len(tek) == 0 {
-		return Version{}, fmt.Errorf("archive: пустая обёртка TEK у версии %s", ver)
-	}
 	return Version{
-		Version: ver, Tenant: tenant, WrappedDEK: dek, WrappedTEK: tek,
+		Version: ver, Tenant: tenant, WrappedDEK: dek,
 		KEK: attrs[AttrKEK], Format: format,
 	}, nil
 }
