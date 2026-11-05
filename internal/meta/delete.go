@@ -100,13 +100,15 @@ func (m *Meta) deleteCurrent(ctx context.Context, tx pgx.Tx, bucketID int64,
 	case VersioningUnversioned:
 		// Версий нет, маркера тоже: объект удаляется целиком. Строка уходит в
 		// deleting — deleter снимет копию с диска и с ленты.
-		tag, err := tx.Exec(ctx,
-			`UPDATE objects SET is_current = false, state = 'deleting'
-			  WHERE bucket_id = $1 AND key = $2 AND is_current`, bucketID, in.Key)
+		//
+		// markDeleting, а не голый UPDATE: если версия лежит в пачке, её байты
+		// снимаются с живого остатка пачки этим же запросом.
+		n, err := markDeleting(ctx, tx, "",
+			"bucket_id = $1 AND key = $2 AND is_current", bucketID, in.Key)
 		if err != nil {
 			return fmt.Errorf("delete object %s/%s: %w", in.Bucket, in.Key, err)
 		}
-		if tag.RowsAffected() == 0 {
+		if n == 0 {
 			return ErrNotFound
 		}
 		out.VersionID = "null"
@@ -123,10 +125,8 @@ func (m *Meta) deleteCurrent(ctx context.Context, tx pgx.Tx, bucketID int64,
 			bucketID, in.Key); err != nil {
 			return fmt.Errorf("retire current version of %s/%s: %w", in.Bucket, in.Key, err)
 		}
-		if _, err := tx.Exec(ctx,
-			`UPDATE objects SET is_current = false, state = 'deleting', is_null_version = false
-			  WHERE bucket_id = $1 AND key = $2 AND is_null_version`,
-			bucketID, in.Key); err != nil {
+		if _, err := markDeleting(ctx, tx, ", is_null_version = false",
+			"bucket_id = $1 AND key = $2 AND is_null_version", bucketID, in.Key); err != nil {
 			return fmt.Errorf("replace null version of %s/%s: %w", in.Bucket, in.Key, err)
 		}
 		id, err := insertDeleteMarker(ctx, tx, bucketID, in, true)
@@ -256,12 +256,11 @@ func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID int64,
 	// Если на T3 появится квота на число объектов, здесь же нужно уменьшать
 	// счётчик: по ADR-0015 маркеры в квоту входят.
 	if isMarker {
-		if _, err := tx.Exec(ctx, `DELETE FROM objects WHERE id = $1`, verID); err != nil {
+		if err := deleteMarkerRow(ctx, tx, verID); err != nil {
 			return fmt.Errorf("delete marker %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
 		}
-	} else if _, err := tx.Exec(ctx,
-		`UPDATE objects SET is_current = false, state = 'deleting', retired_at = NULL
-		  WHERE id = $1`, verID); err != nil {
+	} else if _, err := markDeleting(ctx, tx, ", retired_at = NULL",
+		"id = $1", verID); err != nil {
 		return fmt.Errorf("delete version %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
 	}
 
