@@ -3,6 +3,7 @@ package pack_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 
@@ -11,13 +12,14 @@ import (
 	"github.com/vladsimachkov/tapegw/internal/pack"
 )
 
-func member(t *testing.T, tenant, seq uint64, body string) pack.Member {
+func member(t testing.TB, tenant, seq uint64, body string) pack.Member {
 	t.Helper()
 	return pack.Member{
 		Version:    uuid.New(),
 		Tenant:     tenant,
 		VersionSeq: seq,
 		PlainLen:   uint64(len(body)) * 3,
+		CipherLen:  uint64(len(body)),
 		KekVersion: 7,
 		WrappedDEK: []byte("wrapped-dek-" + body),
 		Flags:      0,
@@ -38,6 +40,7 @@ func build(t *testing.T, members ...pack.Member) (*bytes.Reader, pack.Summary, [
 		data, _ := io.ReadAll(body)
 		bodies = append(bodies, data)
 		m.Cipher = bytes.NewReader(data)
+		m.CipherLen = uint64(len(data))
 		if _, err := w.AddMember(m); err != nil {
 			t.Fatalf("AddMember: %v", err)
 		}
@@ -223,4 +226,154 @@ func mustFooter(t *testing.T, raw []byte) pack.Footer {
 		t.Fatalf("футер: %v", err)
 	}
 	return f
+}
+
+// Сборка обязана быть детерминированной: та же последовательность участников
+// даёт побайтно одинаковую пачку. На этом держится двухпроходная отправка
+// (ADR-0021): в первом проходе tapegw считает размер и сумму в io.Discard,
+// во втором — те же байты идут в соединение с mover'ом, и сумма из первого
+// прохода обязана совпасть со второй.
+//
+// Если в заголовок когда-нибудь попадёт time.Now(), тест упадёт здесь, а не
+// на ленте с checksum_mismatch после минут записи.
+func TestBuildIsDeterministic(t *testing.T) {
+	// Участники фиксируются один раз: детерминизм про «те же участники в том
+	// же порядке», а не про «сгенерировать ещё раз то же самое».
+	type spec struct {
+		pack.Member
+		body string
+	}
+	var specs []spec
+	for i := 0; i < 5; i++ {
+		body := fmt.Sprintf("тело-%d", i)
+		m := member(t, uint64(10+i), uint64(i), body)
+		specs = append(specs, spec{m, body})
+	}
+
+	mk := func() []byte {
+		var buf bytes.Buffer
+		w := pack.NewWriter(&buf)
+		for _, sp := range specs {
+			m := sp.Member
+			m.Cipher = bytes.NewReader([]byte(sp.body))
+			m.CipherLen = uint64(len(sp.body))
+			if _, err := w.AddMember(m); err != nil {
+				t.Fatalf("AddMember: %v", err)
+			}
+		}
+		if _, err := w.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		return buf.Bytes()
+	}
+
+	first, second := mk(), mk()
+	if !bytes.Equal(first, second) {
+		t.Errorf("две сборки одной последовательности различаются: %d и %d байт", len(first), len(second))
+	}
+	// Сумма индекса — та же: на неё смотрит migrator между проходами.
+	f1, err := pack.ReadFooter(bytes.NewReader(first), int64(len(first)))
+	if err != nil {
+		t.Fatalf("футер первой: %v", err)
+	}
+	f2, err := pack.ReadFooter(bytes.NewReader(second), int64(len(second)))
+	if err != nil {
+		t.Fatalf("футер второй: %v", err)
+	}
+	if f1.IndexSHA != f2.IndexSHA {
+		t.Error("сумма индекса различается между сборками")
+	}
+}
+
+func TestMemberLengthMustMatchDeclared(t *testing.T) {
+	// Короткий участник: заголовок обещает больше, чем есть.
+	var buf bytes.Buffer
+	w := pack.NewWriter(&buf)
+	m := member(t, 10, 1, "short")
+	m.CipherLen = 100
+	if _, err := w.AddMember(m); err == nil {
+		t.Error("участник короче объявленного принят: заголовок врёт о размере")
+	}
+
+	// Длинный участник: лишние байты сдвинули бы следующий участник.
+	w2 := pack.NewWriter(&buf)
+	m2 := member(t, 10, 1, "short")
+	m2.CipherLen = 2
+	if _, err := w2.AddMember(m2); err == nil {
+		t.Error("участник длиннее объявленного принят: следующий начался бы с середины данных")
+	}
+}
+
+// --- фаззинг читателя ---
+//
+// Читатель разбирает то, что пришло с ленты, а оно может быть испорчено —
+// особенно на запасном пути по tar-заголовкам, где сумма индекса уже не
+// сошлась. Разбор не должен паниковать и не должен выделять гигабайты из
+// испорченного поля длины.
+
+func FuzzReadFooter(f *testing.F) {
+	var buf bytes.Buffer
+	w := pack.NewWriter(&buf)
+	m := member(f, 10, 1, "seed")
+	m.Cipher = bytes.NewReader([]byte("seed"))
+	m.CipherLen = 4
+	if _, err := w.AddMember(m); err != nil {
+		f.Fatal(err)
+	}
+	if _, err := w.Close(); err != nil {
+		f.Fatal(err)
+	}
+	seed := buf.Bytes()
+	f.Add(seed)
+	f.Add(seed[:len(seed)/2])
+	f.Add(make([]byte, 64))
+
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) < pack.FooterSize {
+			return
+		}
+		r := bytes.NewReader(raw)
+		foot, err := pack.ReadFooter(r, int64(len(raw)))
+		if err != nil {
+			return
+		}
+		// Индекс обязан читаться в пределах размера, сколько бы ни обещал
+		// испорченный index_len: иначе одно поле длины превращает разбор в
+		// выделение памяти по размеру вслепую.
+		if foot.IndexOffset+foot.IndexLen+pack.FooterSize > uint64(len(raw)) {
+			t.Fatalf("индекс не влезает в объект: off=%d len=%d size=%d",
+				foot.IndexOffset, foot.IndexLen, len(raw))
+		}
+		if _, err := pack.ReadIndex(r, foot); err != nil {
+			return
+		}
+	})
+}
+
+func FuzzWalk(f *testing.F) {
+	var buf bytes.Buffer
+	w := pack.NewWriter(&buf)
+	m := member(f, 10, 1, "seed")
+	m.Cipher = bytes.NewReader([]byte("seed"))
+	m.CipherLen = 4
+	if _, err := w.AddMember(m); err != nil {
+		f.Fatal(err)
+	}
+	if _, err := w.Close(); err != nil {
+		f.Fatal(err)
+	}
+	seed := buf.Bytes()
+	f.Add(seed)
+	f.Add(seed[:256])
+	f.Add([]byte("ustar\x0000"))
+
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		err := pack.Walk(bytes.NewReader(raw), func(pack.MemberHeader, io.Reader) error {
+			// Содержимое не читаем целиком: цель — разбор заголовков.
+			return nil
+		})
+		if err != nil && errors.Is(err, io.ErrNoProgress) {
+			t.Fatalf("читатель зациклился: %v", err)
+		}
+	})
 }

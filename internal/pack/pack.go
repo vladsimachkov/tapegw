@@ -66,7 +66,15 @@ type Member struct {
 	WrappedDEK []byte
 	Flags      uint8
 
-	// Cipher — шифротекст участника.
+	// CipherLen — объявленная длина шифротекста. Она известна из БД
+	// (object_parts / objects.size после шифрования), и без неё tar не может
+	// выставить размер заголовка, а значит поток нельзя читать по заголовкам.
+	// Сборщик проверяет, что фактическая длина совпала.
+	CipherLen uint64
+
+	// Cipher — шифротекст участника. Читается потоком, целиком в память не
+	// кладется: пачку предполагается собирать в два прохода (ADR-0021), и
+	// буферизовать по 25 МБ на участника при каждом проходе незачем.
 	Cipher io.Reader
 }
 
@@ -137,15 +145,14 @@ func (w *Writer) AddMember(m Member) (uint64, error) {
 	if len(m.WrappedDEK) > maxDEKLen {
 		return 0, fmt.Errorf("%w: %d байт", ErrDEKTooLong, len(m.WrappedDEK))
 	}
-	data, err := io.ReadAll(m.Cipher)
-	if err != nil {
-		return 0, fmt.Errorf("pack: прочитать шифротекст: %w", err)
+	if m.CipherLen > math.MaxInt64 {
+		return 0, fmt.Errorf("pack: участник %d байт не помещается в заголовок tar", m.CipherLen)
 	}
 
 	hdr := &tar.Header{
 		Name:   uuidString(m.Version),
 		Mode:   0400,
-		Size:   int64(len(data)),
+		Size:   int64(m.CipherLen),
 		Format: tar.FormatPAX,
 		// POSIX требует vendor-ключей вида VENDOR.keyword. Эти четыре поля —
 		// то же, что лежит в индексе, и без них запасной путь пустой: в самом
@@ -164,8 +171,18 @@ func (w *Writer) AddMember(m Member) (uint64, error) {
 	// Смещение данных — уже после заголовка: именно отсюда читатель будет
 	// брать шифротекст, не разбирая tar.
 	off := w.counted.n
-	if _, err := w.tw.Write(data); err != nil {
+	n, err := io.CopyN(w.tw, m.Cipher, int64(m.CipherLen))
+	if err != nil && !errors.Is(err, io.EOF) {
 		return 0, fmt.Errorf("pack: данные участника: %w", err)
+	}
+	if uint64(n) != m.CipherLen {
+		return 0, fmt.Errorf("pack: участник %s короче объявленного: %d из %d байт",
+			uuidString(m.Version), n, m.CipherLen)
+	}
+	// Лишние байты — тоже ошибка, а не «запишем сколько дали»: заголовок
+	// обещает CipherLen, и следующий участник начался бы с середины данных.
+	if extra, err := m.Cipher.Read([]byte{0}); err != io.EOF || extra != 0 {
+		return 0, fmt.Errorf("pack: участник %s длиннее объявленного", uuidString(m.Version))
 	}
 	if err := w.tw.Flush(); err != nil {
 		return 0, fmt.Errorf("pack: flush участника: %w", err)
@@ -173,7 +190,7 @@ func (w *Writer) AddMember(m Member) (uint64, error) {
 
 	w.index = append(w.index, Record{
 		Version: m.Version, Tenant: m.Tenant, VersionSeq: m.VersionSeq,
-		PlainLen: m.PlainLen, CipherOff: off, CipherLen: uint64(len(data)),
+		PlainLen: m.PlainLen, CipherOff: off, CipherLen: m.CipherLen,
 		WrappedDEK: m.WrappedDEK, Flags: m.Flags,
 	}.encode()...)
 	w.count++
