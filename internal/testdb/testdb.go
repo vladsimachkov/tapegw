@@ -240,6 +240,12 @@ var SeedTables = []SeedTable{
 // tapegw_test_backend. Детерминированно, поэтому схему можно почистить руками.
 // Экспортирована, чтобы тест миграций мог взять свою схему рядом с общей
 // (ConnectSchema) и не откатывать общую.
+//
+// TAPEGW_TEST_SCHEMA_NS разводит прогоны по разным схемам: с ns=mut бинарь meta
+// работает в tapegw_test_mut_meta. Это нужно hack/mutate.sh: мутация роняет свою
+// схему, а запущенный параллельно обычный прогон уже выполнил миграции через свой
+// sync.Once и работает со схемой, которой больше нет. Развести прогоны надёжнее,
+// чем помнить «не запускай одновременно».
 func PackageSchema(t *testing.T) string {
 	t.Helper()
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), ".test")
@@ -247,7 +253,18 @@ func PackageSchema(t *testing.T) string {
 	if base == "" {
 		base = "default"
 	}
-	return "tapegw_test_" + base
+
+	prefix := "tapegw_test_"
+	if ns := sanitizeIdent(os.Getenv("TAPEGW_TEST_SCHEMA_NS")); ns != "" {
+		prefix += ns + "_"
+	}
+	return prefix + base
+}
+
+// sanitizeIdent оставляет из переменной окружения только то, что может быть
+// частью идентификатора: имя схемы подставляется в DSN и в SQL.
+func sanitizeIdent(s string) string {
+	return strings.Trim(nonIdent.ReplaceAllString(strings.TrimSpace(s), "_"), "_")
 }
 
 var nonIdent = regexp.MustCompile(`[^a-z0-9_]`)
