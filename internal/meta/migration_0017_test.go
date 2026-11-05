@@ -109,7 +109,49 @@ func TestMigration0017Packs(t *testing.T) {
 		t.Errorf("участник пачки без pack_offset прошёл: потерянное смещение читает чужие байты молча")
 	}
 
-	// Крупный объект вне пачки носит свой носитель — это путь ADR-0008.
+	// Границы смещения и длины. Отрицательный offset и нулевая длина проходят
+	// как «не NULL» и обнаруживаются только при чтении, где выглядят порчей
+	// шифротекста, а не ошибкой учётных данных.
+	for _, bad := range []struct {
+		name    string
+		off, ln int64
+	}{
+		{"отрицательный offset", -1, 100},
+		{"нулевая длина", 0, 0},
+	} {
+		if _, err := m.Pool.Exec(ctx,
+			`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class, state,
+			                      landing, online_until, tenant_id, pool_id, is_current,
+			                      wrapped_dek, pack_id, pack_offset, pack_length)
+			  VALUES ($1, $2, '`+bad.name+`', 100, 'etag', 'GLACIER', 'archived', false,
+			          now() + interval '1 day', 1, 1, true, 'x'::bytea, $4, $3, $5)`,
+			uuid.New(), bucketID, bad.off, packID, bad.ln); err == nil {
+			t.Errorf("%s в пачке прошёл: CHECK не работает", bad.name)
+		}
+	}
+
+	// Объект не может лечь в пачку чужого пула. Для выделенного пула это дыра в
+	// изоляции: ошибка в планировщике положит объект тенанта в общую пачку, а
+	// значит на общую ленту, и ни одна проверка этого не заметит — видно это
+	// будет только по содержимому ленты.
+	otherPool := int64(77)
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO pools (id, name, kind, phobos_tag)
+		  VALUES ($1, 'm17-other-pool', 'dedicated', 'm17-other')`,
+		otherPool); err != nil {
+		t.Fatalf("второй пул: %v", err)
+	}
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class, state,
+		                      landing, online_until, tenant_id, pool_id, is_current,
+		                      wrapped_dek, pack_id, pack_offset, pack_length)
+		  VALUES ($1, $2, 'cross-pool', 100, 'etag', 'GLACIER', 'archived', false,
+		          now() + interval '1 day', 1, $3, true, 'x'::bytea, $4, 0, 100)`,
+		uuid.New(), bucketID, otherPool, packID); err == nil {
+		t.Errorf("объект чужого пула лёг в пачку: изоляция выделенного пула держится только на коде планировщика")
+	}
+
+	// Крупный объект вне пачки — путь ADR-0008, ссылки на пачку нет.
 	big := uuid.New()
 	if _, err := m.Pool.Exec(ctx,
 		`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class, state,

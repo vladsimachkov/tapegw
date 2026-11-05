@@ -64,9 +64,31 @@ ALTER TABLE objects
 -- ограничение сразу, а VALIDATE не мешает записи.
 ALTER TABLE objects
   ADD CONSTRAINT objects_pack_member CHECK (
-    pack_id IS NULL OR (pack_offset IS NOT NULL AND pack_length IS NOT NULL)
+    pack_id IS NULL OR (
+      pack_offset IS NOT NULL AND pack_length IS NOT NULL
+      -- Отрицательное смещение и нулевая длина проходят как «не NULL» и
+      -- обнаруживаются только при чтении, где выглядят порчей шифротекста.
+      AND pack_offset >= 0 AND pack_length > 0
+    )
   ) NOT VALID;
 ALTER TABLE objects VALIDATE CONSTRAINT objects_pack_member;
+
+-- Объект не может лечь в пачку чужого пула. Без этой связи схема не мешает
+-- положить объект выделенного тенанта в общую пачку — а значит, на общую ленту,
+-- и ни одна проверка этого не заметит: ошибка на несколько строк в коде
+-- планировщика превращается в нарушение изоляции, которую видно только по
+-- содержимому ленты.
+--
+-- Приём тот же, что с системным тенантом в ADR-0018: ограничение в схеме, а не
+-- проверка в коде. Ключ (id, pool_id) уникален, поэтому внешний ключ на паре
+-- работает как «тот же пул», а не как «существующая пачка».
+ALTER TABLE packs
+  ADD CONSTRAINT packs_id_pool UNIQUE (id, pool_id);
+
+ALTER TABLE objects
+  ADD CONSTRAINT objects_pack_same_pool
+    FOREIGN KEY (pack_id, pool_id) REFERENCES packs (id, pool_id) NOT VALID;
+ALTER TABLE objects VALIDATE CONSTRAINT objects_pack_same_pool;
 
 -- «Кто лежит в этой пачке» — запрос планировщика уплотнения и проверки
 -- инварианта live_bytes. Частичный индекс: участников у крупных объектов нет.
@@ -74,6 +96,10 @@ CREATE INDEX objects_pack ON objects (pack_id) WHERE pack_id IS NOT NULL;
 
 -- +goose Down
 DROP INDEX IF EXISTS objects_pack;
+-- Внешний ключ на packs снимается до DROP TABLE packs: иначе DROP TABLE
+-- упадёт на зависимом FK и Down не пройдёт вовсе.
+ALTER TABLE objects
+  DROP CONSTRAINT IF EXISTS objects_pack_same_pool;
 ALTER TABLE objects
   DROP CONSTRAINT IF EXISTS objects_pack_member,
   DROP COLUMN IF EXISTS pack_length,
