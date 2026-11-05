@@ -161,6 +161,15 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrMissingContentLength)
 	}
 
+	// Object Lock при записи: явные заголовки либо правило бакета по умолчанию.
+	// Считается ДО записи тела: манифест обязан описывать ровно ту блокировку,
+	// которая уйдёт в строку objects, а хвост дописывается в тот же проход по
+	// телу. Плюс отказ до гигабайт на диске дешевле отказа после них.
+	lockMode, lockUntil, lockHold, err := t.lockAtWrite(ctx, tenant, bucket, &po)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+
 	// UUID генерируем здесь, а не в базе: имя файла в спуле обязано совпасть со
 	// строкой, и mover потом соберёт тот же путь по UUID из строки (ADR-0007).
 	// Соль — на каждую запись версии своя, она входит в nonce сегментов.
@@ -168,12 +177,22 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
+	// Хвост манифеста строится внутри записи, когда MD5 от тела уже посчитан:
+	// ETag обычного PUT — этот MD5, а второго прохода по телу не будет.
+	trailerFor := func(info spool.ObjectInfo) ([]byte, error) {
+		return t.manifestTrailer(dek, id, manifestInput{
+			Bucket: bucket, Key: key, ETag: info.MD5Hex, Size: declared,
+			ContentType: str(po.ContentType), Meta: po.Metadata,
+			Mode: lockMode, Until: lockUntil, Hold: lockHold,
+			Parts: putManifestParts(declared, salt),
+		})
+	}
 	info, err := t.spool.WriteEncrypted(id, po.Body, spool.SumSpec{
 		ContentMD5:              str(po.ContentMD5),
 		Algorithm:               algo,
 		Expected:                checksumExpected(&po, algo),
 		SkipAlgorithmValidation: trailing,
-	}, limit, dek, declared, salt)
+	}, limit, dek, declared, salt, trailerFor)
 	if err != nil {
 		if errors.Is(err, spool.ErrTooLarge) {
 			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrEntityTooLarge)
@@ -201,15 +220,6 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 			return s3response.PutObjectOutput{}, fmt.Errorf("spool remove %s: %w", id, rmErr)
 		}
 		return s3response.PutObjectOutput{}, s3err.GetChecksumBadDigestErr(algo)
-	}
-
-	// Object Lock при записи: явные заголовки либо правило бакета по умолчанию.
-	lockMode, lockUntil, lockHold, err := t.lockAtWrite(ctx, tenant, bucket, &po)
-	if err != nil {
-		if rmErr := t.spool.Remove(id); rmErr != nil {
-			return s3response.PutObjectOutput{}, fmt.Errorf("%w (и спул-файл %s не удалён: %v)", err, id, rmErr)
-		}
-		return s3response.PutObjectOutput{}, err
 	}
 
 	obj, err := t.meta.PutObject(ctx, tenant, meta.PutObjectInput{

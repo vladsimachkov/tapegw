@@ -69,7 +69,7 @@ type ObjectInfo struct {
 //
 // limit > 0 ограничивает размер; превышение — ErrTooLarge, файл не остаётся.
 func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (ObjectInfo, error) {
-	return s.write(id, id, r, spec, limit, nil, 0, 0, nil)
+	return s.write(id, id, r, spec, limit, nil, 0, 0, nil, nil)
 }
 
 // WriteEncrypted — то же, что Write, но на диск ложится шифротекст (ADR-0014).
@@ -80,15 +80,23 @@ func (s *Spool) Write(id uuid.UUID, r io.Reader, spec SumSpec, limit int64) (Obj
 // перестанет сверять загрузки — молча, потому что сумма «сошлась бы» сама с
 // собой.
 //
-// version — UUID версии объекта (он же id файла спула), part = 0: у обычного PUT
-// частей нет.
+// version — UUID версии объекта (он же id файла спула), part = 1: обычный PUT —
+// это одна часть (см. meta.PutObject), номер входит в nonce и должен совпасть с
+// номером из object_parts.
 // plainSize — объявленный размер открытого тела. Он обязателен: входит в AAD
 // каждого сегмента (ADR-0014), поэтому шифровать можно только зная длину
 // заранее. Факт несовпадения с фактическими байтами — ErrSizeMismatch.
-func (s *Spool) WriteEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, key []byte, plainSize int64, salt []byte) (ObjectInfo, error) {
-	// Часть №1: обычный PUT — это одна часть (см. meta.PutObject), номер входит
-	// в nonce и должен совпасть с номером из object_parts.
-	return s.write(id, id, r, spec, limit, key, plainSize, 1, salt)
+//
+// trailerFor — хвост манифеста (encrypt.ManifestTrailer): вызывается после того,
+// как открытые данные записаны и суммы посчитаны, но до fsync и rename. Отложен
+// он именно затем, что ETag обычного PUT — MD5 от тела, а второго прохода по
+// телу не будет: манифест обязан влезть в тот же проход.
+//
+// Размер в ObjectInfo при этом остаётся размером открытых данных — манифест
+// клиенту не виден.
+func (s *Spool) WriteEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit int64, key []byte, plainSize int64, salt []byte,
+	trailerFor func(ObjectInfo) ([]byte, error)) (ObjectInfo, error) {
+	return s.write(id, id, r, spec, limit, key, plainSize, 1, salt, trailerFor)
 }
 
 // WritePartEncrypted — та же запись для одной части multipart: part — номер
@@ -102,10 +110,13 @@ func (s *Spool) WriteEncrypted(id uuid.UUID, r io.Reader, spec SumSpec, limit in
 // два разных UUID, и путать их нельзя.
 func (s *Spool) WritePartEncrypted(id, version uuid.UUID, r io.Reader, spec SumSpec, limit int64,
 	key []byte, plainSize int64, part uint32, salt []byte) (ObjectInfo, error) {
-	return s.write(id, version, r, spec, limit, key, plainSize, part, salt)
+	// Хвоста здесь нет намеренно: файл части склеивается с другими, а манифест
+	// бывает один на весь объект и дописывается после последней части.
+	return s.write(id, version, r, spec, limit, key, plainSize, part, salt, nil)
 }
 
-func (s *Spool) write(id, version uuid.UUID, r io.Reader, spec SumSpec, limit int64, encKey []byte, plainSize int64, part uint32, salt []byte) (ObjectInfo, error) {
+func (s *Spool) write(id, version uuid.UUID, r io.Reader, spec SumSpec, limit int64, encKey []byte, plainSize int64, part uint32, salt []byte,
+	trailerFor func(ObjectInfo) ([]byte, error)) (ObjectInfo, error) {
 	var info ObjectInfo
 
 	// Ограничитель ставим ниже сверителей, чтобы HashReader увидел EOF и успел
@@ -228,6 +239,23 @@ func (s *Spool) write(id, version uuid.UUID, r io.Reader, spec SumSpec, limit in
 		}
 	}
 
+	// Хвост манифеста дописывается в последнюю очередь и уже в сам файл:
+	// шифрование данных к этому моменту закрыто (enc.Close), суммы посчитаны,
+	// а fsync ещё впереди — весь объект уходит на диск одним проходом.
+	if trailerFor != nil {
+		tr, err := trailerFor(info)
+		if err != nil {
+			tmp.Close()
+			return info, err
+		}
+		if len(tr) > 0 {
+			if _, err := tmp.Write(tr); err != nil {
+				tmp.Close()
+				return info, fmt.Errorf("spool: хвост манифеста: %w", err)
+			}
+		}
+	}
+
 	// fsync файла до rename: иначе после падения машины в каталоге может
 	// оказаться запись о файле с нулевым содержимым.
 	if err := tmp.Sync(); err != nil {
@@ -290,7 +318,14 @@ func hashTypeFor(a types.ChecksumAlgorithm) (utils.HashType, bool) {
 // Копирование идёт через io.Copy: между двумя os.File ядро использует
 // copy_file_range, а на reflink-файловой системе это почти clone. Posix-бэкенд
 // versitygw делает так же (posix.go:2975-2990), изобретать своё нет причины.
-func (s *Spool) Concatenate(dst uuid.UUID, srcs []uuid.UUID) (int64, error) {
+//
+// trailer — хвост манифеста (encrypt.ManifestTrailer): дописывается после
+// последней части, поэтому Complete остаётся конкатенацией и перешифрования
+// частей не требует.
+//
+// Возвращает суммарный размер шифротекстов частей, БЕЗ хвоста: на этой цифре
+// вызывающий сверяет смещения частей, и примешивать к ней манифест нельзя.
+func (s *Spool) Concatenate(dst uuid.UUID, srcs []uuid.UUID, trailer []byte) (int64, error) {
 	tmp, err := os.CreateTemp(s.tmp, "cat-*")
 	if err != nil {
 		return 0, fmt.Errorf("spool: временный файл склейки: %w", err)
@@ -316,6 +351,13 @@ func (s *Spool) Concatenate(dst uuid.UUID, srcs []uuid.UUID) (int64, error) {
 			return total, fmt.Errorf("spool: склейка %s: %w", src, err)
 		}
 		total += n
+	}
+
+	if len(trailer) > 0 {
+		if _, err := tmp.Write(trailer); err != nil {
+			tmp.Close()
+			return total, fmt.Errorf("spool: хвост манифеста: %w", err)
+		}
 	}
 
 	if err := tmp.Sync(); err != nil {
