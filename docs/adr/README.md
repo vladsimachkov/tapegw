@@ -28,4 +28,4 @@ Architectural Decision Records. Порядок задан в `docs/ARCHITECTURE.
 | [0018](0018-system-tenant.md) | Системный тенант: id = 1 закрыт для клиентов | принято |
 | [0019](0019-object-manifest-trailer.md) | Манифест объекта в конце файла, таблица частей там | принято |
 | [0020](0020-tape-record-format.md) | Формат записи на ленту: атрибуты, пачка, журнал, снимок | принято |
-| [0021](0021-mover-protocol.md) | Протокол tapegw ↔ mover (область; детали — отдельным PR) | предложено |
+| [0021](0021-mover-protocol.md) | Протокол tapegw ↔ mover: pipes, NDJSON, «итог неизвестен» | принято |
