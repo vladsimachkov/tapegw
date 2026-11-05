@@ -81,8 +81,8 @@ func TestMigration0017Packs(t *testing.T) {
 	// это дешёвое решение; после первой записи на ленту возврат к колонке стал бы
 	// миграцией всего архива, поэтому он и закрыт тестом.
 	for _, col := range []string{"medium", "phobos_medium"} {
-		if n := columnCountAny(t, ctx, m, col); n != 0 {
-			t.Errorf("колонка %s существует: носитель должен жить в archive_copies, "+
+		if n := columnOutside(t, ctx, m, col, "archive_copies"); n != 0 {
+			t.Errorf("колонка %s существует вне archive_copies: носитель должен жить в archive_copies, "+
 				"а не колонкой (предложение 0013)", col)
 		}
 	}
@@ -164,6 +164,14 @@ func TestMigration0017Packs(t *testing.T) {
 	}
 
 	// Down и повторный Up — текстом файла и на наполненной таблице.
+	//
+	// 0018 снимается первым: archive_copies.pack_id ссылается на packs, и
+	// Down-миграции всегда идут в обратном порядке. Соблазн закрыть это
+	// DROP TABLE ... CASCADE в самом 0017 здесь вреден: он бы молча уносил
+	// реестр копий вместе с пачками, а это ровно то, что должно быть видно.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0018, "Down")); err != nil {
+		t.Fatalf("Down 0018 перед 0017: %v", err)
+	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0017, "Down")); err != nil {
 		t.Fatalf("Down 0017 на таблице с данными: %v", err)
 	}
@@ -181,6 +189,11 @@ func TestMigration0017Packs(t *testing.T) {
 	if n := tableCount(t, ctx, m, "packs"); n != 1 {
 		t.Errorf("после повторного Up таблица packs не вернулась")
 	}
+	// 0018 возвращается следом: без неё TestCleanCoversEveryTable не найдёт
+	// таблиц, которые Clean перечисляет.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0018, "Up")); err != nil {
+		t.Fatalf("повторный Up 0018 после 0017: %v", err)
+	}
 	for _, col := range []string{"pack_id", "pack_offset", "pack_length"} {
 		if n := columnCount(t, ctx, m, col); n != 1 {
 			t.Errorf("после повторного Up колонка objects.%s не вернулась", col)
@@ -197,19 +210,6 @@ func TestMigration0017Packs(t *testing.T) {
 		Scan(&validated); err == nil && !validated {
 		t.Errorf("objects_pack_member осталось NOT VALID после повторного Up")
 	}
-}
-
-// columnCountAny считает колонку по всему списку таблиц: проверка «носителя нет
-// в схеме» должна ловить его в любой таблице, а не только в objects.
-func columnCountAny(t *testing.T, ctx context.Context, m *meta.Meta, col string) int {
-	t.Helper()
-	var n int
-	if err := m.Pool.QueryRow(ctx,
-		`SELECT count(*) FROM information_schema.columns
-		  WHERE table_schema = current_schema() AND column_name = $1`, col).Scan(&n); err != nil {
-		t.Fatalf("счётчик колонок %s: %v", col, err)
-	}
-	return n
 }
 
 func tableCount(t *testing.T, ctx context.Context, m *meta.Meta, tbl string) int {
