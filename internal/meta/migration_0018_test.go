@@ -315,6 +315,9 @@ func TestMigration0018MediaRegistry(t *testing.T) {
 
 	// --- Down / повторный Up на наполненной схеме ---
 
+	if _, err := m.Pool.Exec(ctx, section(t, migration0020, "Down")); err != nil {
+		t.Fatalf("Down 0020 перед 0019: %v", err)
+	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0019, "Down")); err != nil {
 		t.Fatalf("Down 0019 перед 0018: %v", err)
 	}
@@ -328,6 +331,9 @@ func TestMigration0018MediaRegistry(t *testing.T) {
 	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0018, "Up")); err != nil {
 		t.Fatalf("повторный Up 0018: %v", err)
+	}
+	if _, err := m.Pool.Exec(ctx, section(t, migration0020, "Up")); err != nil {
+		t.Fatalf("Up 0020: %v", err)
 	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0019, "Up")); err != nil {
 		t.Fatalf("повторный Up 0019 после 0018: %v", err)
