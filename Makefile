@@ -25,7 +25,11 @@ check:
 
 # make mutate FILE=internal/meta/lock.go 'EXPR=s/return ErrRetentionShorten/_ = 0/' \
 #        PKG=./internal/backend/ ARGS="-run TestCompliance"
+#
+# Многострочная правка (SQL): MODE=perl, а выражение применяется perl -0777.
+# Мутация файла миграции требует DROP_SCHEMA=<имя>, иначе goose держит уже
+# применённую версию и правка файла до теста не доходит.
 mutate:
-	./hack/mutate.sh "$(FILE)" "$(EXPR)" "$(PKG)" $(ARGS)
+	MODE="$(MODE)" DROP_SCHEMA="$(DROP_SCHEMA)" PSQL="$(PSQL)" ./hack/mutate.sh "$(FILE)" "$(EXPR)" "$(PKG)" $(ARGS)
 
 .PHONY: check mutate
