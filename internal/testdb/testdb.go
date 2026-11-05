@@ -178,6 +178,12 @@ func Clean(t *testing.T, m *meta.Meta) {
 var CleanTables = []string{
 	"upload_parts", "uploads", "object_parts", "restores", "objects", "buckets",
 	"accounts", "kek_versions", "packs",
+	// media и drives связаны друг с другом внешними ключами (в драйве лежит
+	// лента, у ленты — адрес драйва), поэтому порядок здесь не спасает:
+	// TRUNCATE идёт с CASCADE. Журналы чистятся вместе с родителями — и это
+	// единственный способ их почистить: триггер «только на добавление» на
+	// TRUNCATE не срабатывает, а на DELETE отказывает без override.
+	"media_events", "drive_events", "archive_copies", "media", "drives",
 }
 
 // SeedID — id строк, которые в таблицы сида кладут миграции: системный

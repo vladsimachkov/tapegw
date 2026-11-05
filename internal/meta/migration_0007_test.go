@@ -62,7 +62,10 @@ func section(t *testing.T, file, want string) string {
 
 	var out []string
 	for _, ln := range lines[start:] {
-		if strings.HasPrefix(strings.TrimSpace(ln), "-- +goose") {
+		// Обрываем только на следующей секции. Маркеры StatementBegin/End —
+		// тоже строки «-- +goose», но для нас они комментарии: без них goose
+		// разрежет тело функции-триггера по точкам с запятой.
+		if s := strings.TrimSpace(ln); s == "-- +goose Up" || s == "-- +goose Down" {
 			break
 		}
 		out = append(out, ln)
