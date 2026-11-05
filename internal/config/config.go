@@ -81,6 +81,19 @@ type IAM struct {
 	// версии остаются в файле, пока на них ссылается хоть одна строка accounts
 	// (ADR-0014), поэтому номер — настройка, а не «максимальная в файле».
 	KEKVersion int `yaml:"kek_version"`
+	// ExportRetention — срок, в течение которого обёрнутые TEK переживают
+	// удаление тенанта (ADR-0014). Именно его надо называть в договоре как
+	// «данные становятся недоступны необратимо через N».
+	//
+	// Обязателен: без него «мы удалили» означает только «мы стёрли строку».
+	ExportRetention time.Duration `yaml:"export_retention"`
+	// BackupRetention — сколько живут PITR-бэкапы Postgres и WAL-архив.
+	//
+	// Это не справочное поле: tenants.wrapped_key лежит в каждом дампе и в каждом
+	// WAL-сегменте, поэтому реальная окончательность = max(export_retention,
+	// backup_retention). Оператор обязан указать правду; ноль означает «не
+	// указано», и тогда CLI отказа от старой версии KEK не даётся — см. ADR-0014.
+	BackupRetention time.Duration `yaml:"backup_retention"`
 	// CacheTTL — срок жизни записи кэша учёток. Инвалидация мгновенная и не по
 	// TTL (LISTEN/NOTIFY, ADR-0016); TTL — страховка на правку accounts мимо
 	// tapegw, поэтому он обязан быть: без него отозванная вручную учётка
@@ -269,6 +282,7 @@ func Default() *Config {
 		},
 		IAM: IAM{
 			KEKVersion:      1,
+			ExportRetention: 30 * 24 * time.Hour,
 			CacheTTL:        5 * time.Minute,
 			CacheMaxEntries: 10000,
 		},
@@ -515,6 +529,22 @@ func (c *Config) Validate() error {
 	}
 	if c.IAM.KEKFile != "" && c.IAM.KEKVersion < 1 {
 		add("iam.kek_version: %d, должно быть >= 1", c.IAM.KEKVersion)
+	}
+	if c.IAM.ExportRetention <= 0 {
+		add("iam.export_retention: %v, должно быть > 0 — без него «удалить тенанта» означает «стереть строку», а не «данные пропали»",
+			c.IAM.ExportRetention)
+	}
+	if c.IAM.BackupRetention < 0 {
+		add("iam.backup_retention: %v, не может быть отрицательным", c.IAM.BackupRetention)
+	}
+	// Окончательность — максимум по всем хранилищам (ADR-0014). Разрешить
+	// бэкапы дольше экспорта — значит разрешить себе обещание, которое не
+	// выполняется: удалённый тенант будет восстановим из дампа дольше, чем
+	// мы обещали. Проще заставить согласовать сроки здесь, чем считать
+	// максимум вручную при разборе инцидента.
+	if c.IAM.BackupRetention > c.IAM.ExportRetention {
+		add("iam.backup_retention (%v) больше iam.export_retention (%v): удалённый тенант переживёт обещанный срок на %v — поднимите export_retention или сократите срок бэкапов",
+			c.IAM.BackupRetention, c.IAM.ExportRetention, c.IAM.BackupRetention-c.IAM.ExportRetention)
 	}
 	// Ноль здесь — не «бессрочный кэш», а дыра: правка accounts мимо tapegw
 	// вообще не имела бы границы устаревания.

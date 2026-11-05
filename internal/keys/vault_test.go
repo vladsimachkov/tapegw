@@ -325,3 +325,74 @@ func hex(b []byte) string {
 	}
 	return string(out)
 }
+
+// TestRotateKEKMarksSuperseded — ротация записывает момент уступки версии.
+//
+// Без этой отметки «когда версию KEK можно выбросить» остаётся вопросом к памяти
+// оператора, а отсчёт срока окончательности (ADR-0014) неоткуда вести. Тест
+// проверяет и обратное: версия, которая ещё не была активной, отмечена не бывает.
+func TestRotateKEKMarksSuperseded(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	clearKeys(t, m)
+	ctx := context.Background()
+	seedTenant(t, m, 2, "ротация")
+
+	kek1, kek2 := genKey(t), genKey(t)
+	v := keys.New(m, ringOf(t, 1, map[int][]byte{1: kek1}))
+	if _, _, err := v.NewVersionDEK(ctx, 2, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.EnsureKEKVersion(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.EnsureKEKVersion(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	// До ротации ни одна версия не устарела.
+	v1, err := m.GetKEKVersion(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1.SupersededAt != nil {
+		t.Fatalf("версия 1 отмечена устаревшей до ротации: %v", v1.SupersededAt)
+	}
+
+	// Ротация 1 → 2: все TEK переезжают, версия 1 устарела.
+	v = keys.New(m, ringOf(t, 2, map[int][]byte{1: kek1, 2: kek2}))
+	n, err := v.RotateKEK(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("нечего переоборачивать — тест ничего не проверяет")
+	}
+	v1, err = m.GetKEKVersion(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1.SupersededAt == nil {
+		t.Fatal("версия 1 не отмечена устаревшей после ротации: срок «когда можно выбросить» неоткуда считать")
+	}
+	v2, err := m.GetKEKVersion(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v2.SupersededAt != nil {
+		t.Errorf("активная версия 2 отмечена устаревшей: %v", v2.SupersededAt)
+	}
+
+	// Повторный запуск ротации не двигает момент: COALESCE обязан оставить первый.
+	first := *v1.SupersededAt
+	if _, err := v.RotateKEK(ctx); err != nil {
+		t.Fatal(err)
+	}
+	again, err := m.GetKEKVersion(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.SupersededAt.Equal(first) {
+		t.Errorf("момент уступки сдвинулся при повторной ротации: %s вместо %s", again.SupersededAt, first)
+	}
+}
