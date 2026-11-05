@@ -81,9 +81,9 @@ func TestMigration0017Packs(t *testing.T) {
 	// это дешёвое решение; после первой записи на ленту возврат к колонке стал бы
 	// миграцией всего архива, поэтому он и закрыт тестом.
 	for _, col := range []string{"medium", "phobos_medium"} {
-		if n := columnOutside(t, ctx, m, col, "archive_copies"); n != 0 {
-			t.Errorf("колонка %s существует вне archive_copies: носитель должен жить в archive_copies, "+
-				"а не колонкой (предложение 0013)", col)
+		if n := columnAnywhere(t, ctx, m, col); n != 0 {
+			t.Errorf("колонка %s существует: носитель — ссылка archive_copies.medium_id, "+
+				"а не колонка (предложение 0013, ADR-0022)", col)
 		}
 	}
 
