@@ -98,6 +98,11 @@ type Options struct {
 	Ring    *iam.KeyRing
 	Export  *keys.Export
 	Log     *slog.Logger
+	// DryRun — собрать отчёт и ничего не записать. Нужен не «посмотреть и так
+	// понятно», а потому что восстановление запускают на живой системе, где
+	// часть ключей могла не пережить удаление тенанта: сначала отчёт, потом
+	// решение.
+	DryRun bool
 }
 
 // entry — объект, для которого удалось собрать метаданные.
@@ -174,7 +179,7 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 			return rep, fmt.Errorf("rebuild: база недоступна: %w", err)
 		}
 
-		bucketID, newBucket, err := ensureBucket(ctx, o, e, created)
+		bucketID, newBucket, err := ensureBucket(ctx, o, e, created, rep)
 		if err != nil {
 			rep.Skipped = append(rep.Skipped, Skip{Oid: e.oid, Bucket: g[0], Key: g[1],
 				Reason: ReasonStore, Err: err})
@@ -196,6 +201,13 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 		}
 
 		in := rebuildInput(e, bucketID, pool, seq, isCur)
+		if o.DryRun {
+			// Счётчик тот же: отчёт обязан показывать ровно то, что сделал бы
+			// настоящий прогон, иначе «прогнали dry-run, потом боевой — и
+			// результаты разные» станет сюрпризом.
+			rep.Restored++
+			continue
+		}
 		inserted, err := o.Meta.RebuildObject(ctx, in)
 		if err != nil {
 			rep.Skipped = append(rep.Skipped, Skip{Oid: e.oid, Bucket: g[0], Key: g[1],
@@ -272,7 +284,10 @@ func (r archiveReader) ReadAt(p []byte, off int64) (int, error) {
 //
 // Конфигурацию бакета взять неоткуда: на ленте живут только объекты. Поэтому он
 // заводится с дефолтами и попадает в BucketsCreated.
-func ensureBucket(ctx context.Context, o Options, e entry, seen map[string]bool) (int64, bool, error) {
+//
+// В dry-run бакет не создаётся, но в отчёт попадает: «восстановим N объектов и
+// заведём вот эти бакеты» — ровно то, что покажет боевой прогон.
+func ensureBucket(ctx context.Context, o Options, e entry, seen map[string]bool, rep *Report) (int64, bool, error) {
 	name := e.doc.Bucket
 	if name == "" {
 		return 0, false, errors.New("в манифесте пустой бакет")
@@ -283,6 +298,9 @@ func ensureBucket(ctx context.Context, o Options, e entry, seen map[string]bool)
 	}
 	if !errors.Is(err, meta.ErrNotFound) {
 		return 0, false, err
+	}
+	if o.DryRun {
+		return 0, true, nil
 	}
 	if seen[name] {
 		// Уже создали в этом прогоне, но GetBucket его не видит: значит бакет

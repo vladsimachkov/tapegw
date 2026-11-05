@@ -506,3 +506,39 @@ func seedTenant(t *testing.T, m *meta.Meta, id int64) {
 		t.Fatal(err)
 	}
 }
+
+// TestRebuildDryRun — отчёт есть, записи нет.
+//
+// Счётчики обязаны совпасть с боевым прогоном: dry-run смотрят именно затем,
+// чтобы решить, запускать ли восстановление, и «в dry-run 5, в бою 3» обесценивает
+// такое решение.
+func TestRebuildDryRun(t *testing.T) {
+	h := setup(t)
+	h.putOne(t, "single", 4096)
+	h.snapshot(t)
+	h.wipe(t)
+
+	exp, err := keys.BuildExport(h.ctx, h.m, h.ring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := rebuild.Run(h.ctx, rebuild.Options{
+		Archive: h.arch, Meta: h.m, Ring: h.ring, Export: exp,
+		Log: slog.New(slog.NewTextHandler(os.Stderr, nil)), DryRun: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Restored != 1 {
+		t.Errorf("dry-run: Restored=%d, ждали 1 — отчёт обязан совпадать с боевым прогоном", rep.Restored)
+	}
+	if len(rep.BucketsCreated) != 1 {
+		t.Errorf("dry-run: бакетов %d, ждали 1", len(rep.BucketsCreated))
+	}
+	if h.count(t) != 0 {
+		t.Errorf("dry-run записал %d объектов", h.count(t))
+	}
+	if _, err := h.m.GetBucket(h.ctx, meta.NewTenant(int(tenantID)), bucketName); err == nil {
+		t.Error("dry-run создал бакет")
+	}
+}
