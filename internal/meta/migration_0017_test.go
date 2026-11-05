@@ -169,6 +169,9 @@ func TestMigration0017Packs(t *testing.T) {
 	// Down-миграции всегда идут в обратном порядке. Соблазн закрыть это
 	// DROP TABLE ... CASCADE в самом 0017 здесь вреден: он бы молча уносил
 	// реестр копий вместе с пачками, а это ровно то, что должно быть видно.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0019, "Down")); err != nil {
+		t.Fatalf("Down 0019 перед 0018: %v", err)
+	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0018, "Down")); err != nil {
 		t.Fatalf("Down 0018 перед 0017: %v", err)
 	}
@@ -193,6 +196,9 @@ func TestMigration0017Packs(t *testing.T) {
 	// таблиц, которые Clean перечисляет.
 	if _, err := m.Pool.Exec(ctx, section(t, migration0018, "Up")); err != nil {
 		t.Fatalf("повторный Up 0018 после 0017: %v", err)
+	}
+	if _, err := m.Pool.Exec(ctx, section(t, migration0019, "Up")); err != nil {
+		t.Fatalf("повторный Up 0019 после 0018: %v", err)
 	}
 	for _, col := range []string{"pack_id", "pack_offset", "pack_length"} {
 		if n := columnCount(t, ctx, m, col); n != 1 {
