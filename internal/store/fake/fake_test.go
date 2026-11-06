@@ -326,3 +326,49 @@ func TestExtentsReportsMedia(t *testing.T) {
 		t.Errorf("Extents пуст — migrator некуда записать objects.phobos_medium")
 	}
 }
+
+// Смещение в файле — контракт хранилища, а не вежливость вызывающего. Файл
+// буфера к моменту записи уже прочитан до конца (по нему считают SHA-256), и
+// если реализация не перематывает, на носитель уходит ноль байт вместо объекта.
+func TestPutRewindsFile(t *testing.T) {
+	s := fake.New()
+	id := uuid.New()
+	f := putFile(t, "полный объект")
+	if _, err := io.ReadAll(f); err != nil {
+		t.Fatal(err) // читаем до конца — как mover перед записью
+	}
+
+	if r := s.Put(context.Background(),
+		[]store.PutItem{{ID: id, File: f, Size: 13}}, store.PutOptions{Family: "dir"})[0]; r.Err != nil {
+		t.Fatalf("put: %v", r.Err)
+	}
+	got, err := get(t, s, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(got) != "полный объект" {
+		t.Errorf("сохранено %q: файл не перемотан, записан хвост или пустота", got)
+	}
+}
+
+// Файл под результат обязан быть обнулён: иначе остатки прошлых данных
+// смешаются с объектом, и лишний хвост не виден ни по размеру, ни по сумме,
+// посчитанной по файлу.
+func TestGetTruncatesFile(t *testing.T) {
+	s := fake.New()
+	id := uuid.New()
+	if r := put(t, s, id, "короткий", nil); r.Err != nil {
+		t.Fatalf("put: %v", r.Err)
+	}
+
+	dst := getFile(t)
+	if _, err := dst.WriteString("мусор от прошлой операции"); err != nil {
+		t.Fatal(err)
+	}
+	if r := s.Get(context.Background(), []store.GetItem{{ID: id, File: dst}})[0]; r.Err != nil {
+		t.Fatalf("get: %v", r.Err)
+	}
+	if got := readBack(t, dst); got != "короткий" {
+		t.Errorf("в файле %q: хвост прошлых данных не обрезан", got)
+	}
+}
