@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Поднять чистый стенд ci-dir (Phobos на dir, без лент), проверить put→stat,
+# по желанию прогнать тесты каркаса и убрать за собой.
+#
+# Скрипт нужен потому, что состояние стенда уже подводило несколько раз подряд:
+# проверка «окружение чистое» должна быть командой, а не памятью.
+#
+#   hack/ci-dir-up            собрать, поднять, проверить CLI put→stat
+#   hack/ci-dir-up --test     то же + go test -tags phobos ./internal/store/phobos
+#   hack/ci-dir-up --down     остановить и удалить
+set -uo pipefail
+
+IMAGE=tapegw-ci-dir
+NAME=tapegw-ci-dir
+here=$(cd "$(dirname "$0")/.." && pwd)
+
+if [ "${1:-}" = "--down" ]; then
+    podman rm -f "$NAME" >/dev/null 2>&1
+    echo "остановлен и удалён $NAME"
+    exit 0
+fi
+
+echo "== подготовка контекста"
+mkdir -p "$here/.build"
+if [ ! -f "$here/.build/go.tgz" ]; then
+    echo "   упаковываю Go $(go env GOVERSION) из локального GOROOT"
+    tar czf "$here/.build/go.tgz" -C "$(go env GOROOT)" . || exit 1
+fi
+
+echo "== сборка образа (первый раз несколько минут: собирается Phobos)"
+podman build -f "$here/deploy/Containerfile.ci-dir" -t "$IMAGE" "$here" || exit 1
+
+podman rm -f "$NAME" >/dev/null 2>&1
+# Репозиторий монтируем сразу: тесты каркаса (go test -tags phobos) должны идти
+# внутри контейнера, где есть заголовки и библиотеки Phobos и сокет phobosd.
+podman run -d --name "$NAME" -v "$here:/src:ro" "$IMAGE" >/dev/null || exit 1
+
+echo "== ожидание готовности"
+for _ in $(seq 1 60); do
+    podman logs "$NAME" 2>&1 | grep -q 'ci-dir: готов' && break
+    sleep 2
+done
+if ! podman logs "$NAME" 2>&1 | grep -q 'ci-dir: готов'; then
+    echo "FAIL: контейнер не поднялся:"
+    podman logs "$NAME" 2>&1 | tail -20
+    exit 1
+fi
+
+echo "== put → stat через CLI"
+podman exec "$NAME" bash -c \
+    'phobos put -f dir -L dirlib -l raid1 /etc/hosts ci/probe 2>&1 | tail -2; phobos getmd ci/probe 2>&1 | tail -2'
+
+if [ "${1:-}" = "--test" ]; then
+    echo "== тесты каркаса cgo внутри контейнера"
+    podman exec -w /src "$NAME" go test -tags phobos -count=1 ./internal/store/phobos
+fi
+
+echo "== остаётся запущенным: podman exec -it $NAME bash"
