@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/uuid"
 
@@ -17,6 +18,19 @@ import (
 // (С8), и делать для этого TLS не нужно.
 type Putter interface {
 	Put(in mover.PutIn) (*mover.Result, error)
+
+	// Status нужен не для отчётов, а для разбора неизвестного итога: после
+	// обрыва соединения tapegw не знает, записалась пачка или нет.
+	Status(op uuid.UUID) (*mover.Result, error)
+}
+
+// definiteRefusals — коды, по которым известно: на ленту ничего не попало.
+// Только для них пачку можно выбросить. Всё остальное — «итог неизвестен»,
+// и там пачка остаётся.
+var definiteRefusals = map[mover.Code]bool{
+	mover.CodeNoSpace:          true,
+	mover.CodeAttrTooLarge:     true,
+	mover.CodeChecksumMismatch: true,
 }
 
 // Archiver поднимает пачку объектов на ленту.
@@ -29,6 +43,59 @@ type Archiver struct {
 	// различаться (ADR-0022), и по format читатель выбирает декодер.
 	Spec   string
 	Format int
+
+	// Log — куда писать про ленту вне реестра. По умолчанию slog.Default().
+	Log *slog.Logger
+}
+
+// sendPack — одна попытка put. Ошибка здесь означает «итог неизвестен», а не
+// «отказ»: различает их вызывающий, а не этот вызов.
+func (a *Archiver) sendPack(ctx context.Context, packID uuid.UUID, plan *Plan, attrs map[string]string, body []byte) (*mover.Result, error) {
+	return a.Put.Put(mover.PutIn{
+		Op:     packID,
+		ID:     packID, // oid Phobos = UUID пачки: повтор бьёт в тот же объект
+		Size:   plan.Size,
+		SHA256: plan.SHA256,
+		Attrs:  attrs,
+		Body:   bytes.NewReader(body),
+	})
+}
+
+// resolveUnknown разбирает итог операции, по которой оборвалась связь.
+//
+// Спрашиваем mover про операцию; если он её не помнит (упал вместе с реестром)
+// — пересылаем ТУ ЖЕ пачку. Повтор не создаёт дубль: oid объекта Phobos это
+// UUID пачки, он не меняется, сборка детерминирована, байты те же, и Phobos на
+// повтор отвечает EEXIST, а не пишет второй экземпляр.
+//
+// Запасной путь на случай «реестр потерян, и EEXIST не помог бы» — stat по oid
+// через Phobos. Команды stat в протоколе mover'а пока нет (ADR-0021 её описывает,
+// реализация не написана), поэтому он помечен, а не реализован.
+func (a *Archiver) resolveUnknown(ctx context.Context, packID uuid.UUID, plan *Plan, attrs map[string]string, body []byte, firstErr error) (*mover.Result, error) {
+	st, serr := a.Put.Status(packID)
+	if serr == nil {
+		switch st.State {
+		case mover.StateDone:
+			// Запись прошла, оборвался только ответ. Это успех, а не отказ.
+			return &mover.Result{Op: packID, Code: mover.CodeOK, State: st.State,
+				Version: st.Version, Extents: st.Extents}, nil
+		case mover.StateFailed:
+			return &mover.Result{Op: packID, Code: st.Code, State: st.State}, nil
+		}
+	}
+	res, err := a.sendPack(ctx, packID, plan, attrs, body)
+	if err != nil {
+		return nil, fmt.Errorf("migrator: итог put неизвестен (%v), повтор тоже не прошёл (%v) — пачка остаётся в archiving",
+			firstErr, err)
+	}
+	return res, nil
+}
+
+func (a *Archiver) logger() *slog.Logger {
+	if a.Log != nil {
+		return a.Log
+	}
+	return slog.Default()
 }
 
 func metaPlacements(ps []Placement) []meta.Placement {
@@ -83,24 +150,24 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 		return nil, err
 	}
 
-	res, err := a.Put.Put(mover.PutIn{
-		Op:     packID,
-		ID:     packID,
-		Size:   plan.Size,
-		SHA256: plan.SHA256,
-		Attrs:  attrs,
-		Body:   bytes.NewReader(buf.Bytes()),
-	})
+	res, err := a.sendPack(ctx, packID, plan, attrs, buf.Bytes())
 	if err != nil {
-		// Транспортная ошибка — итог неизвестен, но транзакции мы уже не
-		// держим, поэтому откат безопасен: повтор упрётся в EEXIST и
-		// разберётся через stat.
-		a.Meta.FailPackArchive(ctx, packID, ids, "put: "+err.Error())
-		return nil, err
+		// Итог неизвестен. Пачку НЕ выбрасываем: если запись успела пройти,
+		// объекты остаются в archiving, а строка пачки живёт, и следующий
+		// цикл придёт с тем же oid. Разбор — ниже.
+		res, err = a.resolveUnknown(ctx, packID, plan, attrs, buf.Bytes(), err)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if res.Code != mover.CodeOK {
-		a.Meta.FailPackArchive(ctx, packID, ids, "mover: "+string(res.Code))
-		return nil, fmt.Errorf("mover отверг пачку: %s", res.Code)
+		if definiteRefusals[res.Code] {
+			// Известно, что на ленту ничего не легло, — выбрасывать можно.
+			a.Meta.FailPackArchive(ctx, packID, ids, "mover: "+string(res.Code))
+			return nil, fmt.Errorf("mover отверг пачку: %s", res.Code)
+		}
+		// Неизвестный код — не «отказ», а «не понятно». Пачка остаётся.
+		return nil, fmt.Errorf("mover не ответил ok: %s", res.Code)
 	}
 
 	raw, err := hex.DecodeString(plan.SHA256)
@@ -116,6 +183,19 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 		mediumID, err = a.Meta.MediaIDByLabel(ctx, res.Extents[0])
 		if err != nil {
 			return nil, err
+		}
+		if mediumID == 0 {
+			// Данные легли на ленту, которой нет в нашем реестре. Причина
+			// всегда одна: ленту добавили в Phobos в обход tapegw, и теги
+			// разъехались. Повторно писать нельзя — данные уже на ленте;
+			// копия остаётся в 'writing' и будет доведена до 'done'
+			// (BindCopyMedium), когда ленту зарегистрируют штатно.
+			//
+			// Счётчика метрик пока нет: пакет metrics — каркас до M9. Алерт
+			// идёт ERROR-строкой в JSON-лог, на него и настраивается реакция,
+			// пока метрики нет.
+			a.logger().Error("копия записана на ленту вне реестра",
+				"label", res.Extents[0], "pack", packID.String(), "spec", a.Spec)
 		}
 	}
 	if err := a.Meta.FinishPackArchive(ctx, packID, metaPlacements(placements), a.Spec, packID.String(), res.Version, a.Format, raw, mediumID); err != nil {

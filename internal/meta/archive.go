@@ -126,11 +126,14 @@ WHERE id = $4 AND state = 'archiving'`,
 		}
 	}
 	if _, err := tx.Exec(ctx, `
-UPDATE packs SET state = 'sealed', total_bytes = (
-        SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1
-    ), members_total = (
-        SELECT count(*) FROM objects WHERE pack_id = $1
-    )
+-- live_bytes приравнивается total_bytes прямо здесь: пачка только что
+    -- записана, мёртвых байт в ней быть не может, а планировщик ёмкости читает
+    -- именно live_bytes.
+UPDATE packs SET state = 'sealed',
+       total_bytes = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
+       live_bytes  = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
+       members_total = (SELECT count(*) FROM objects WHERE pack_id = $1),
+       members_live  = (SELECT count(*) FROM objects WHERE pack_id = $1)
 WHERE id = $1`, packID); err != nil {
 		return fmt.Errorf("meta: закрыть пачку: %w", err)
 	}
@@ -169,4 +172,20 @@ func (m *Meta) MediaIDByLabel(ctx context.Context, label string) (int64, error) 
 		return 0, fmt.Errorf("meta: лента %s: %w", label, err)
 	}
 	return id, nil
+}
+
+// BindCopyMedium доводит копию из 'writing' до 'done', когда лента наконец
+// зарегистрирована в реестре. Перезаписи не происходит: данные лежат на ленте
+// с момента записи, не хватало только строки media.
+func (m *Meta) BindCopyMedium(ctx context.Context, copyID, mediaID int64) error {
+	tag, err := m.Pool.Exec(ctx, `
+UPDATE archive_copies SET medium_id = $2, state = 'done', done_at = now()
+WHERE id = $1 AND state = 'writing'`, copyID, mediaID)
+	if err != nil {
+		return fmt.Errorf("meta: привязать ленту к копии: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("meta: копия %d не в writing", copyID)
+	}
+	return nil
 }

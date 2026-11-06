@@ -38,6 +38,17 @@ type probeMover struct {
 	Detail   string
 	accept   bool
 	medium   string // что mover сообщит в extents
+
+	// written — что реально легло «на ленту», по oid. Именно по нему тест
+	// считает дубли.
+	written map[uuid.UUID]int
+	replays map[uuid.UUID]int // повторы той же пачки: Phobos на них не пишет
+	// dropReply — сымитировать обрыв после записи, но до ответа.
+	dropReply bool
+	// forget — mover «потерял реестр»: Status ничего не знает.
+	forget      bool
+	statusCalls int
+	lastOp      uuid.UUID
 }
 
 func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
@@ -69,8 +80,40 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 			p.SQLState, p.Detail)
 	}
 
+	p.lastOp = in.Op
 	p.accept = true
+	if p.written == nil {
+		p.written = map[uuid.UUID]int{}
+	}
+	if p.replays == nil {
+		p.replays = map[uuid.UUID]int{}
+	}
+	// Так ведёт себя Phobos: повторная запись с тем же oid не создаёт второй
+	// объект. Именно это и делает пересылку той же пачки безопасной.
+	if _, ok := p.written[in.ID]; ok {
+		p.replays[in.ID]++
+	} else {
+		p.written[in.ID] = 1
+	}
+	if p.dropReply {
+		// Запись прошла, ответ не дошёл — ровно тот обрыв, на котором
+		// «вернуть FailPackArchive» даёт дубль.
+		p.dropReply = false
+		return nil, errors.New("соединение оборвано после записи")
+	}
 	return &mover.Result{Op: in.Op, Code: mover.CodeOK, Version: 1, Extents: []string{p.medium}}, nil
+}
+
+func (p *probeMover) Status(op uuid.UUID) (*mover.Result, error) {
+	p.statusCalls++
+	if p.forget {
+		return &mover.Result{Op: op, Code: mover.CodeNotFound}, nil
+	}
+	if n := p.written[op]; n > 0 {
+		return &mover.Result{Op: op, Code: mover.CodeOK, State: mover.StateDone, Version: 1,
+			Extents: []string{p.medium}}, nil
+	}
+	return &mover.Result{Op: op, Code: mover.CodeNotFound}, nil
 }
 
 // seedObjects заводит тенанта, бакет и n pending-объектов.
@@ -241,5 +284,72 @@ func TestRefusedPackReturnsObjectsToPending(t *testing.T) {
 	}
 	if state != "pending" {
 		t.Errorf("объект после отказа в %s, ждали pending — в archiving его не возьмёт ни один повтор", state)
+	}
+}
+
+// Блокер: обрыв после записи, но до ответа.
+//
+// Если на транспортной ошибке выбросить пачку, следующий цикл соберёт НОВУЮ
+// пачку с новым UUID и новым oid, и первая запись останется на ленте никем не
+// учтённой: данные дважды, live_bytes нет, reconciler не видит. Поэтому при
+// неизвестном итоге пачка остаётся, а итог разбирается через Status.
+func TestTransportBreakAfterWriteDoesNotDuplicate(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "break", 2)
+	a, pm := archiver(t, m, ids[0])
+	pm.dropReply = true
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err != nil {
+		t.Fatalf("ArchivePack должен разобрать итог сам, а вернул ошибку: %v", err)
+	}
+	if len(pm.written) != 1 {
+		t.Errorf("на ленте %d объектов, ждали 1 — дубль, который никто не учёл", len(pm.written))
+	}
+	if pm.statusCalls == 0 {
+		t.Error("итог не разбирались через Status: откуда migrator знает, что запись прошла?")
+	}
+
+	var state string
+	if err := m.Pool.QueryRow(ctx, `SELECT state::text FROM objects WHERE id = $1`, ids[0]).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "archived" {
+		t.Errorf("объект в %s, ждали archived", state)
+	}
+
+	// Место должно быть учтено: иначе планировщик ёмкости считает враньё.
+	var live int64
+	if err := m.Pool.QueryRow(ctx, `SELECT live_bytes FROM packs ORDER BY created_at DESC LIMIT 1`).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live == 0 {
+		t.Error("live_bytes пачки равен нулю — байты на ленте есть, а в учёте их нет")
+	}
+}
+
+// Тот же обрыв, но mover потерял реестр: Status ничего не знает. Тогда
+// пересылается ТА ЖЕ пачка — тот же op и тот же oid, и Phobos на повтор не
+// пишет. Дубля не будет даже без stat по oid.
+func TestLostRegistryResendsSamePack(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "lostreg", 2)
+	a, pm := archiver(t, m, ids[0])
+	pm.dropReply = true
+	pm.forget = true
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err != nil {
+		t.Fatalf("ArchivePack: %v", err)
+	}
+	if len(pm.written) != 1 {
+		t.Errorf("объектов на ленте %d, ждали 1", len(pm.written))
+	}
+	if pm.replays[pm.lastOp] != 1 {
+		t.Errorf("повторов той же пачки %d, ждали 1 — пересылать надо тот же op, а не новый", pm.replays[pm.lastOp])
 	}
 }

@@ -48,13 +48,45 @@ testargs=("$@")
 
 [ -f "$file" ] || { echo "нет файла $file" >&2; exit 1; }
 
-backup=$(mktemp "${TMPDIR:-/tmp}/mutate.XXXXXX")
+# Прерванный в прошлом запуске (Ctrl-C, SIGKILL) trap не отработал, и файл
+# остался изменённым: следующий прогон падает или висит по причине, которая
+# выглядит как баг кода. Ищем свою копию и восстанавливаем её ДО всего
+# остального — тогда прерванная мутация чинится тем же запуском.
+#
+# Две дыры, которые тут легко проглядеть:
+#
+#   * шаблон намеренно узкий: mktemp пишет ровно шесть символов после префикса,
+#     а «mutate.*» подобрал бы и посторонний /tmp/mutate.py — и скопировал бы
+#     его поверх целевого файла;
+#   * копия привязана к имени файла (.name рядом с ней). Без привязки осколок от
+#     pack.go восстановился бы поверх meta.go, и это уже не «вернуть как было»,
+#     а порча другого файла.
+for leftover in "$(ls -t "${TMPDIR:-/tmp}"/mutate-backup-?????? 2>/dev/null || true)"; do
+	[ -f "$leftover" ] || continue
+	stored=$(cat "$leftover.name" 2>/dev/null || true)
+	if [ "$stored" != "$file" ]; then
+		# Копия от другого файла: удалить молча нельзя (вдруг она от всё ещё
+		# прерванной мутации), но и восстанавливать некуда.
+		echo "КОПИЯ $leftover относится к '$stored', а не к '$file' — оставляем её в покое" >&2
+		continue
+	fi
+	if ! diff -q "$leftover" "$file" >/dev/null 2>&1; then
+		echo "НАЙДЕНА КОПИЯ ПРОШЛОГО ЗАПУСКА ($leftover), файл от неё отличается."
+		echo "Восстанавливаю: похоже, прошлая мутация была прервана и осталась в рабочем дереве."
+		cp "$leftover" "$file"
+	fi
+	rm -f "$leftover" "$leftover.name"
+done
+
+backup=$(mktemp "${TMPDIR:-/tmp}/mutate-backup-XXXXXX")
 cp "$file" "$backup"
 # Восстанавливаем из копии при любом выходе — по ошибке тестов, по Ctrl-C, по
 # чему угодно. git checkout здесь не используется намеренно.
+printf '%s' "$file" > "$backup.name"
+
 restore() {
 	cp "$backup" "$file"
-	rm -f "$backup"
+	rm -f "$backup" "$backup.name"
 	echo "--- восстановлено из копии ---"
 }
 trap restore EXIT INT TERM

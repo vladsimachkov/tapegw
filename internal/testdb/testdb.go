@@ -86,7 +86,18 @@ func ConnectSchema(t *testing.T, schema string) *meta.Meta {
 	if err != nil {
 		t.Fatalf("подключение: %v", err)
 	}
-	t.Cleanup(m.Close)
+	// Закрытие пула с таймаутом: утечка соединения (незакрытая транзакция)
+	// иначе вешает CI без сообщения. Таймаут превращает зависание в падение
+	// теста с внятной причиной.
+	t.Cleanup(func() {
+		done := make(chan struct{})
+		go func() { m.Close(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			panic("testdb: пул не закрылся за 15s — похоже, соединение занято незакрытой транзакцией")
+		}
+	})
 
 	return m
 }
