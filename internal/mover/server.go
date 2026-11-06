@@ -3,6 +3,7 @@ package mover
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -57,7 +58,7 @@ type Server struct {
 	wg       sync.WaitGroup
 
 	mu    sync.Mutex
-	conns map[net.Conn]struct{}
+	conns map[net.Conn]ClientID
 }
 
 // NewServer поднимает mover на st. store — это Phobos под build tag `phobos`
@@ -91,7 +92,7 @@ func NewServer(st store.Store, reg *Registry, cfg ServerConfig) (*Server, error)
 		ln:     ln,
 		log:    cfg.Log,
 		closed: make(chan struct{}),
-		conns:  map[net.Conn]struct{}{},
+		conns:  map[net.Conn]ClientID{},
 	}, nil
 }
 
@@ -144,7 +145,7 @@ func (s *Server) touchOp(c net.Conn) { _ = c.SetDeadline(time.Now().Add(s.cfg.Op
 
 func (s *Server) handle(conn net.Conn) {
 	s.mu.Lock()
-	s.conns[conn] = struct{}{}
+	s.conns[conn] = ""
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -167,6 +168,13 @@ func (s *Server) handle(conn net.Conn) {
 	if len(tconn.ConnectionState().PeerCertificates) == 0 {
 		s.log.Warn("mover: соединение без клиентского сертификата", "peer", conn.RemoteAddr().String())
 		return
+	}
+	// Роль берём из SAN-URI подтверждённого сертификата, а не из hello: hello
+	// пишет сам клиент, и проверять его — значит не проверять ничего.
+	if cid, err := clientIDOf(tconn); err == nil {
+		s.mu.Lock()
+		s.conns[tconn] = cid
+		s.mu.Unlock()
 	}
 
 	if err := WriteJSON(tconn, Hello{
@@ -257,7 +265,14 @@ func (s *Server) handleStatus(conn net.Conn, op uuid.UUID) {
 func (s *Server) handlePut(conn net.Conn, p *Put) *Frame {
 	send := func(r Result) { r.Type = "result"; r.Op = p.Op; _ = WriteJSON(conn, r) }
 
-	rec, created, err := s.reg.Begin(p.Op, p.Size, p.SHA256, p.Attrs, p.Tags)
+	if p.FromOp != uuid.Nil {
+		// Локальная передача (Ф0.4): содержимое берётся из буфера другой
+		// операции этого же mover'а, байты по сети не идут.
+		s.handlePutFrom(conn, p)
+		return nil
+	}
+
+	rec, created, err := s.reg.Begin(p.Op, p.Size, p.SHA256, p.Attrs, p.Tags, string(s.clientOf(conn)))
 	switch {
 	case errors.Is(err, ErrOpConflict):
 		// Тот же op с другой парой (size, sha256). Итоговая сверка тут ничего
@@ -371,9 +386,12 @@ func (s *Server) handlePut(conn net.Conn, p *Put) *Frame {
 		_ = s.reg.Update(p.Op, func(r *OpRecord) {
 			r.State, r.Code, r.Version, r.Extents = StateDone, CodeOK, version, extents
 		})
-		// Буфер освобождаем, запись об операции оставляем: по ней повтор
-		// после обрыва ответит «уже записано», а не перепишет объект.
-		_ = s.reg.ReleaseData(p.Op)
+		// Буфер освобождаем, запись об операции оставляем: по ней повтор после
+		// обрыва ответит «уже записано», а не перепишет объект. Кроме hold:
+		// с этого буфера ещё будут писаться копии (Ф0.4).
+		if !p.Hold {
+			_ = s.reg.ReleaseData(p.Op)
+		}
 	} else {
 		_ = s.reg.Update(p.Op, func(r *OpRecord) { r.State, r.Code = StateFailed, code })
 	}
@@ -389,14 +407,32 @@ func (s *Server) handlePut(conn net.Conn, p *Put) *Frame {
 // write — собственно вызов Phobos. Сериализован: один процесс = один
 // phobos_init = одна операция.
 func (s *Server) write(p *Put) Result {
-	s.phobosMu.Lock()
-	defer s.phobosMu.Unlock()
-
 	f, err := s.reg.DataFile(p.Op)
 	if err != nil {
 		return Result{Code: CodeIO}
 	}
 	defer f.Close()
+	return s.putReader(p, f)
+}
+
+// writeFrom — та же запись, но содержимое читается из буфера другой операции
+// (Ф0.4). Отдельный метод, а не параметр: источник обязан быть открыт и
+// проверен до вызова Phobos, и смешивать это с обычным путём нельзя.
+func (s *Server) writeFrom(p *Put, src uuid.UUID) Result {
+	f, err := s.reg.DataFile(src)
+	if err != nil {
+		return Result{Code: CodeIO}
+	}
+	defer f.Close()
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return Result{Code: CodeIO}
+	}
+	return s.putReader(p, f)
+}
+
+func (s *Server) putReader(p *Put, f io.Reader) Result {
+	s.phobosMu.Lock()
+	defer s.phobosMu.Unlock()
 
 	opt := store.PutOptions{
 		Family: s.cfg.Family, Layout: s.cfg.Layout,
@@ -432,7 +468,7 @@ func (s *Server) write(p *Put) Result {
 func (s *Server) handleGet(conn net.Conn, g *Get) *Frame {
 	send := func(r Result) { r.Type = "result"; r.Op = g.Op; _ = WriteJSON(conn, r) }
 
-	rec, _, err := s.reg.Begin(g.Op, 0, "", nil, nil)
+	rec, _, err := s.reg.Begin(g.Op, 0, "", nil, nil, string(s.clientOf(conn)))
 	if errors.Is(err, ErrOpConflict) {
 		send(Result{Code: CodeOpConflict, State: StateFailed})
 		return nil
@@ -526,8 +562,14 @@ func (s *Server) handleGet(conn net.Conn, g *Get) *Frame {
 		off += n
 		credits -= n
 	}
+	// Буфер остаётся: он нужен локальной передаче (Ф0.4) — reconciler и repack
+	// читают ленту один раз и пишут на несколько носителей. Сумма, посчитанная
+	// при чтении, пишется в SHA256Out: это единственная сумма, которой можно
+	// сверять такую операцию, потому что SHA256 у get — не сумма данных.
+	_ = s.reg.Update(g.Op, func(r *OpRecord) {
+		r.State, r.Code, r.SHA256Out, r.Size, r.Received = StateDone, CodeOK, sum, size, size
+	})
 	send(Result{Code: CodeOK, State: StateDone, SHA256: sum})
-	_ = s.reg.Drop(g.Op)
 	return nil
 }
 
@@ -561,4 +603,124 @@ func codeFor(err error) Code {
 	default:
 		return CodeIO
 	}
+}
+
+// clientOf — роль клиента по подтверждённому сертификату соединения. Пустая,
+// если соединение не передало проверку (тогда и локальная передача будет
+// отклонена: пустая роль не совпадёт ни с какой записью).
+// clientIDOf — роль клиента из SAN-URI подтверждённого сертификата соединения.
+func clientIDOf(c *tls.Conn) (ClientID, error) {
+	certs := c.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return "", errors.New("mover: сертификат не предъявлен")
+	}
+	uris, err := peerURIs([][]byte{certs[0].Raw}, x509.ExtKeyUsageClientAuth)
+	if err != nil {
+		return "", err
+	}
+	for _, u := range uris {
+		if u.Scheme == "tapegw" {
+			return ClientID(u.Host), nil
+		}
+	}
+	return "", errors.New("mover: в сертификате нет SAN-URI клиента")
+}
+
+func (s *Server) clientOf(conn net.Conn) ClientID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conns[conn]
+}
+
+// handlePutFrom — локальная передача (Ф0.4): новый объект пишется из буфера
+// уже завершённой операции этого же mover'а. Байты по сети не идут, лента
+// не читается повторно.
+//
+// Правила и почему именно они:
+//   - источник только done — буфер в staged ещё не дочитан и не сверен, failed
+//     уже выброшен;
+//   - ожидаемая сумма обязательна и должна совпасть с суммой источника: без
+//     этого op становится указателем на любой буфер, а копия перестаёт быть
+//     копией;
+//   - тот же клиент, что записал источник: иначе одна сторона читает данные
+//     другой;
+//   - буфер источника держится счётчиком ссылок, пока передача не кончится, —
+//     иначе result_ttl выбросит содержимое на середине записи.
+func (s *Server) handlePutFrom(conn net.Conn, p *Put) {
+	send := func(r Result) { r.Type = "result"; r.Op = p.Op; _ = WriteJSON(conn, r) }
+
+	src, ok := s.reg.Get(p.FromOp)
+	switch {
+	case !ok || src.State != StateDone:
+		send(Result{Code: CodeNotFound, State: StateFailed})
+		return
+	case p.SHA256 == "":
+		send(Result{Code: CodeOpConflict, State: StateFailed})
+		return
+	case src.ContentSHA256() == "":
+		// Операция есть и завершена, но сверить её не с чем: суммы нет.
+		send(Result{Code: CodeOpConflict, State: StateFailed})
+		return
+	case src.ContentSHA256() != p.SHA256 || src.Size != p.Size:
+		send(Result{Code: CodeOpConflict, State: StateFailed})
+		return
+	case p.FromOp == p.Op:
+		send(Result{Code: CodeOpConflict, State: StateFailed})
+		return
+	}
+	if src.Client == "" || src.Client != string(s.clientOf(conn)) {
+		send(Result{Code: CodeDenied, State: StateFailed})
+		return
+	}
+
+	rec, created, err := s.reg.Begin(p.Op, p.Size, p.SHA256, p.Attrs, p.Tags, string(s.clientOf(conn)))
+	if err != nil {
+		send(Result{Code: CodeIO, State: StateFailed})
+		return
+	}
+	if !created && rec.State == StateDone {
+		send(Result{Code: CodeOK, State: StateDone, Version: rec.Version, Extents: rec.Extents})
+		return
+	}
+
+	if err := s.reg.Acquire(p.FromOp); err != nil {
+		send(Result{Code: CodeNotFound, State: StateFailed})
+		return
+	}
+	defer func() {
+		if err := s.reg.Release(p.FromOp); err != nil {
+			s.log.Error("mover: снять ссылку с источника", "op", p.FromOp, "err", err)
+		}
+	}()
+
+	// Сверяем файл, а не запись о нём. Запись говорит, что сумма совпала при
+	// приёме; если байты испортились после (сбой диска буфера, ошибка памяти),
+	// вторая копия ушла бы на ленту испорченной и считалась бы проверенной — а
+	// по Р10 старая копия после этого может стать мёртвой. Локальный NVMe против
+	// ленты: проход по файлу дешёвый.
+	got, err := s.reg.SumFile(p.FromOp)
+	if err != nil {
+		// Буфера нет — например, источник записали без hold, и mover освободил
+		// данные после success. Это не «подожди» и не повтор: копировать
+		// нечего, источник надо читать заново.
+		send(Result{Code: CodeNotFound, State: StateFailed})
+		return
+	}
+	if got != p.SHA256 {
+		send(Result{Code: CodeChecksumMismatch, State: StateFailed})
+		return
+	}
+
+	s.touchOp(conn)
+	res := s.writeFrom(p, p.FromOp)
+	s.touch(conn)
+	if res.Code != CodeOK {
+		_ = s.reg.Update(p.Op, func(r *OpRecord) { r.State, r.Code = StateFailed, res.Code })
+		send(Result{Code: res.Code, State: StateFailed})
+		return
+	}
+	_ = s.reg.Update(p.Op, func(r *OpRecord) {
+		r.State, r.Code, r.Version, r.Extents = StateDone, CodeOK, res.Version, res.Extents
+	})
+	send(Result{Code: CodeOK, State: StateDone, Version: res.Version, Extents: res.Extents})
 }

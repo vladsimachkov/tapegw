@@ -116,6 +116,13 @@ type PutIn struct {
 	SHA256 string
 	Attrs  map[string]string
 	Body   io.Reader
+
+	// FromOp — локальная передача (Ф0.4): записать объект из буфера другой
+	// завершённой операции этого же mover'а. Body при этом не нужен.
+	FromOp uuid.UUID
+
+	// Hold — попросить mover оставить буфер после записи: с него пойдут копии.
+	Hold bool
 }
 
 // Put отправляет объект на ленту. Возвращает итог операции; коды не-ok — тоже
@@ -133,7 +140,7 @@ func (c *Client) Put(in PutIn) (*Result, error) {
 	if in.ID != in.Op {
 		return nil, fmt.Errorf("mover: oid объекта — это op, а %s != %s", in.ID, in.Op)
 	}
-	if err := WriteJSON(c.conn, Put{Type: "put", Op: in.Op, Size: in.Size, SHA256: in.SHA256, Attrs: in.Attrs}); err != nil {
+	if err := WriteJSON(c.conn, Put{Type: "put", Op: in.Op, Size: in.Size, SHA256: in.SHA256, Attrs: in.Attrs, FromOp: in.FromOp, Hold: in.Hold}); err != nil {
 		return nil, err
 	}
 
@@ -165,6 +172,19 @@ func (c *Client) Put(in PutIn) (*Result, error) {
 		}
 		if _, err := rs.Seek(ready.Offset, io.SeekStart); err != nil {
 			return nil, fmt.Errorf("mover: продолжить передачу: %w", err)
+		}
+	}
+
+	if in.FromOp != uuid.Nil {
+		// Локальная передача: байты не идут по сети, mover читает свой буфер.
+		for {
+			res, _, err := c.readControl(c.opTimeout)
+			if err != nil {
+				return nil, err
+			}
+			if res != nil {
+				return res, nil
+			}
 		}
 	}
 

@@ -403,9 +403,11 @@ func TestSilentClientClosed(t *testing.T) {
 // ключ или имя объекта — значит явно пройти через ревью.
 func TestMessageFieldsHaveNoKeys(t *testing.T) {
 	allowed := map[string][]string{
-		"Hello":    {"t", "proto", "mover", "phobos", "role", "buffer_free"},
-		"HelloOk":  {"t", "proto"},
-		"Put":      {"t", "op", "size", "sha256", "attrs", "tags", "no_split"},
+		"Hello":   {"t", "proto", "mover", "phobos", "role", "buffer_free"},
+		"HelloOk": {"t", "proto"},
+		// from_op — локальная передача (Ф0.4): писать копию из буфера другой
+		// операции того же mover'а.
+		"Put":      {"t", "op", "size", "sha256", "attrs", "tags", "no_split", "from_op", "hold"},
 		"Get":      {"t", "op", "id", "offset", "length"},
 		"Status":   {"t", "op"},
 		"Ready":    {"t", "op", "offset", "credits"},

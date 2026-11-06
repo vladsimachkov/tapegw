@@ -179,6 +179,22 @@ type fakeStore struct {
 	data     map[[16]byte][]byte
 	calls    map[string]int
 	locateOK bool
+
+	// exists и incomplete — рычаги для кода EEXIST: «объект уже есть» и
+	// «есть, но неполный» (оборванная запись). Без них ветку Stat в mover
+	// нельзя вызвать вообще.
+	exists     map[uuid.UUID]bool
+	incomplete map[uuid.UUID]bool
+}
+
+func (f *fakeStore) forceExists(id uuid.UUID, incomplete bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.exists[id] = true
+	if incomplete {
+		f.incomplete[id] = true
+	}
 }
 
 func (f *fakeStore) init() {
@@ -186,6 +202,8 @@ func (f *fakeStore) init() {
 		f.data = map[[16]byte][]byte{}
 		f.calls = map[string]int{}
 		f.locateOK = true
+		f.exists = map[uuid.UUID]bool{}
+		f.incomplete = map[uuid.UUID]bool{}
 	}
 }
 
@@ -196,6 +214,10 @@ func (f *fakeStore) Put(_ context.Context, batch []store.PutItem, _ store.PutOpt
 	f.calls["put"]++
 	out := make([]store.Result, 0, len(batch))
 	for _, it := range batch {
+		if f.exists[it.ID] {
+			out = append(out, store.Result{ID: it.ID, Err: store.ErrExists})
+			continue
+		}
 		b, err := io.ReadAll(it.Reader)
 		if err != nil {
 			out = append(out, store.Result{ID: it.ID, Err: err})
@@ -235,7 +257,7 @@ func (f *fakeStore) Stat(_ context.Context, id uuid.UUID) (store.Meta, error) {
 	if !ok {
 		return store.Meta{}, store.ErrNotFound
 	}
-	return store.Meta{ID: id, Size: int64(len(b)), Version: 1, Complete: true}, nil
+	return store.Meta{ID: id, Size: int64(len(b)), Version: 1, Complete: !f.incomplete[id]}, nil
 }
 
 func (f *fakeStore) Delete(_ context.Context, ids []uuid.UUID) []store.Result {
@@ -299,11 +321,12 @@ func (f *fakeStore) Calls(what string) int {
 // режима «без шифрования» в пакете нет, поэтому и тест идёт по тому же пути,
 // по которому поедут боевые соединения.
 type env struct {
-	st   *fakeStore
-	reg  *mover.Registry
-	srv  *mover.Server
-	pki  *testPKI
-	addr string
+	staging string
+	st      *fakeStore
+	reg     *mover.Registry
+	srv     *mover.Server
+	pki     *testPKI
+	addr    string
 }
 
 func startEnv(t *testing.T, bufMax int64) *env { return startEnvWith(t, bufMax, mover.ClientScheduler) }
@@ -343,7 +366,7 @@ func startEnvTimed(t *testing.T, bufMax int64, inactivity time.Duration, allowed
 	}
 	go srv.Serve()
 	t.Cleanup(func() { _ = srv.Close() })
-	return &env{st: st, reg: reg, srv: srv, pki: p, addr: srv.Addr()}
+	return &env{staging: staging, st: st, reg: reg, srv: srv, pki: p, addr: srv.Addr()}
 }
 
 // dialWith подключается конкретным сертификатом. Ошибку возвращает, а не
