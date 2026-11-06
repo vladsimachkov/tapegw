@@ -5,7 +5,9 @@ package phobos_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -244,4 +246,142 @@ func TestReplicaCountIsOne(t *testing.T) {
 
 	id2 := put("без параметров layout", nil)
 	check("без параметров layout", id2, 2)
+}
+
+// TestGetRoundTrip — записанное читается байт в байт. Отдельный тест нужен
+// потому, что Phobos пишет в fd с текущей позиции: если хранилище не
+// подготовило файл, на выходе будет мусор вместо объекта.
+func TestGetRoundTrip(t *testing.T) {
+	requirePhobos(t)
+	ctx := context.Background()
+	st, err := phobos.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	body := bytes.Repeat([]byte("tapegw"), 512)
+	src, err := os.CreateTemp(t.TempDir(), "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(src.Name())
+	if _, err := src.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.New()
+	res := st.Put(ctx, []store.PutItem{{ID: id, File: src, Size: int64(len(body))}}, dirOpts())
+	if res[0].Err != nil {
+		t.Fatalf("put: %v", res[0].Err)
+	}
+
+	dst, err := os.CreateTemp(t.TempDir(), "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(dst.Name())
+	// Файл намеренно грязный: чтение обязано оставить только объект.
+	if _, err := dst.Write(bytes.Repeat([]byte{0xFF}, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := st.Get(ctx, []store.GetItem{{ID: id, File: dst}}); got[0].Err != nil {
+		t.Fatalf("get: %v", got[0].Err)
+	}
+	if _, err := dst.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	back, err := io.ReadAll(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(back, body) {
+		t.Errorf("прочитано %d байт, записано %d; совпадает префикс: %v",
+			len(back), len(body), bytes.HasPrefix(back, body))
+	}
+}
+
+// TestDeleteIsIdempotent — повторное удаление не ошибка: воркер повторяет шаг
+// после падения и обязан сходиться к тому же результату.
+func TestDeleteIsIdempotent(t *testing.T) {
+	requirePhobos(t)
+	ctx := context.Background()
+	st, err := phobos.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	body := []byte("delete me")
+	src, err := os.CreateTemp(t.TempDir(), "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(src.Name())
+	if _, err := src.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.New()
+	if res := st.Put(ctx, []store.PutItem{{ID: id, File: src, Size: int64(len(body))}}, dirOpts()); res[0].Err != nil {
+		t.Fatalf("put: %v", res[0].Err)
+	}
+
+	for i := 1; i <= 2; i++ {
+		if got := st.Delete(ctx, []uuid.UUID{id}); got[0].Err != nil {
+			t.Errorf("удаление %d: %v", i, got[0].Err)
+		}
+	}
+	if _, err := st.Stat(ctx, id); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("после удаления stat вернул %v, хотим ErrNotFound", err)
+	}
+}
+
+// TestExtentsReportsMedium — носитель возвращается тем же путём, что и размер:
+// через CLI (ADR-0008). Пустой список означал бы, что mover не сможет заполнить
+// archive_copies.medium.
+func TestExtentsReportsMedium(t *testing.T) {
+	requirePhobos(t)
+	ctx := context.Background()
+	st, err := phobos.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	body := []byte("extents me")
+	src, err := os.CreateTemp(t.TempDir(), "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(src.Name())
+	if _, err := src.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.New()
+	if res := st.Put(ctx, []store.PutItem{{ID: id, File: src, Size: int64(len(body))}}, dirOpts()); res[0].Err != nil {
+		t.Fatalf("put: %v", res[0].Err)
+	}
+
+	ext, err := st.Extents(ctx, []uuid.UUID{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ext[id]) != 1 {
+		t.Fatalf("носителей %d, ждём 1 (repl_count=1)", len(ext[id]))
+	}
+	if !strings.Contains(ext[id][0], "/var/lib/phobos/") {
+		t.Errorf("носитель %q: ждём каталог dir", ext[id][0])
+	}
 }

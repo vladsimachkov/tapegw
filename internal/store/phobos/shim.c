@@ -50,6 +50,44 @@ int tapegw_put(const char *objid, int fd, long size, int family,
     return rc;
 }
 
+int tapegw_get(const char *objid, int fd, int scope, long *tid_out) {
+    *tid_out = tapegw_tid();
+    struct pho_xfer_desc xd;
+    memset(&xd, 0, sizeof(xd));
+    xd.xd_op = PHO_XFER_OP_GET;
+    xd.xd_params.get.scope = (enum dss_obj_scope)scope;
+    xd.xd_ntargets = 1;
+    xd.xd_targets = calloc(1, sizeof(struct pho_xfer_target));
+    if (xd.xd_targets == NULL)
+        return -ENOMEM;
+    xd.xd_targets[0].xt_objid = objid;
+    xd.xd_targets[0].xt_fd = fd;
+
+    int rc = phobos_get(&xd, 1, NULL, NULL);
+    if (rc == 0 && xd.xd_rc != 0)
+        rc = xd.xd_rc;
+    pho_xfer_desc_clean(&xd);
+    return rc;
+}
+
+int tapegw_delete(const char *objid, long *tid_out) {
+    *tid_out = tapegw_tid();
+    struct pho_xfer_desc xd;
+    memset(&xd, 0, sizeof(xd));
+    xd.xd_op = PHO_XFER_OP_DEL;
+    xd.xd_ntargets = 1;
+    xd.xd_targets = calloc(1, sizeof(struct pho_xfer_target));
+    if (xd.xd_targets == NULL)
+        return -ENOMEM;
+    xd.xd_targets[0].xt_objid = objid;
+
+    int rc = phobos_delete(&xd, 1);
+    if (rc == 0 && xd.xd_rc != 0)
+        rc = xd.xd_rc;
+    pho_xfer_desc_clean(&xd);
+    return rc;
+}
+
 int tapegw_getmd(const char *objid, long *size_out, int *version_out,
                  int *found, long *tid_out) {
     *tid_out = tapegw_tid();
