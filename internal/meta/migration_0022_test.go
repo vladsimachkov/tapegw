@@ -18,8 +18,7 @@ import (
 const migration0022 = "migrations/0022_pack_blocked.sql"
 
 func TestMigration0022PackBlocked(t *testing.T) {
-	m := testdb.Connect(t)
-	testdb.Clean(t, m)
+	m := testdb.MigrationScratch(t, testdb.AllVersions)
 	ctx := context.Background()
 
 	if n := columnIn(t, ctx, m, "packs", "blocked_reason"); n != 1 {
