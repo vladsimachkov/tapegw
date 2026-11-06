@@ -26,6 +26,13 @@ func requirePhobos(t *testing.T) {
 	}
 }
 
+// dirOpts — значения, на которых спайк M0-02 писал на dir с этого же стенда:
+// семейство dir, библиотека dirlib, layout raid1 с repl_count=1.
+func dirOpts() store.PutOptions {
+	return store.PutOptions{Family: "dir", Library: "dirlib", Layout: "raid1",
+		LayoutParams: map[string]string{"repl_count": "1"}}
+}
+
 func TestPutThenStat(t *testing.T) {
 	requirePhobos(t)
 	ctx := context.Background()
@@ -48,7 +55,7 @@ func TestPutThenStat(t *testing.T) {
 
 	id := uuid.New()
 	res := st.Put(ctx, []store.PutItem{{ID: id, File: f, Size: int64(len(body)),
-		Attrs: map[string]string{"tapegw.test": "1a-1"}}}, store.PutOptions{Family: "dir"})
+		Attrs: map[string]string{"tapegw.test": "1a-1"}}}, dirOpts())
 	if len(res) != 1 || res[0].Err != nil {
 		t.Fatalf("put: %v", res[0].Err)
 	}
@@ -118,8 +125,10 @@ func TestAllCallsFromOneThread(t *testing.T) {
 	}
 
 	tids := st.TIDs()
-	if len(tids) < 2*n {
-		t.Fatalf("записано %d вызовов, ожидали не меньше %d", len(tids), 2*n)
+	// Требование «не меньше N» по числу put, а не put+stat: tid пишется на входе
+	// в C, поэтому проверка потока не зависит от того, удался ли вызов.
+	if len(tids) < n {
+		t.Fatalf("записано %d вызовов, ожидали не меньше %d", len(tids), n)
 	}
 	seen := map[int64]bool{}
 	for _, tid := range tids {
