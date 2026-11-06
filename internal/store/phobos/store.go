@@ -236,15 +236,18 @@ func (s *Store) Stat(ctx context.Context, id uuid.UUID) (store.Meta, error) {
 	if len(ei.Size) == 0 {
 		return store.Meta{}, fmt.Errorf("phobos: stat %s: экстентов нет", id)
 	}
-	// Число экстентов здесь не проверяем: Stat не знает, сколько реплик
-	// планировалось. «Ровно один при repl_count=1» требует тот, у кого есть
-	// план, — migrator при разборе EEXIST.
-	var total int64
-	for _, n := range ei.Size {
-		total += n
+	// Экстенты отдаём как есть. Sumму не считаем: 94 — это и две реплики по 47,
+	// и один объект на 94, а для разбора EEXIST это противоположные случаи.
+	// Проверяет их тот, у кого есть план (store.CheckExtents).
+	meta.Extents = make([]store.Extent, 0, len(ei.Size))
+	for i, n := range ei.Size {
+		e := store.Extent{Size: n, State: ei.State[i]}
+		if i < len(ei.MediaName) {
+			e.Media = ei.MediaName[i]
+		}
+		meta.Extents = append(meta.Extents, e)
 	}
-	meta.Size = total
-	meta.Complete = len(ei.State) == len(ei.Size) && allSync(ei.State)
+	meta.Complete = allSync(ei.State)
 	return meta, nil
 }
 

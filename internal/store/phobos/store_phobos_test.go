@@ -67,8 +67,9 @@ func TestPutThenStat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if meta.Size != int64(len(body)) {
-		t.Errorf("размер %d, ждали %d", meta.Size, len(body))
+	// Stat размер не интерпретирует — план проверяет тот, у кого он есть.
+	if err := store.CheckExtents(meta.Extents, int64(len(body)), 1); err != nil {
+		t.Errorf("экстенты не сходятся с планом: %v", err)
 	}
 	if !meta.Complete {
 		t.Error("копия помечена неполной сразу после записи")
@@ -209,16 +210,38 @@ func TestReplicaCountIsOne(t *testing.T) {
 		return id
 	}
 
-	id1 := put("с repl_count=1", map[string]string{"repl_count": "1"})
-	if got := count(id1); got != 1 {
-		t.Errorf("с repl_count=1: реплик %d, хотим 1", got)
+	// Без параметров layout raid1 берёт две реплики — устройств на стенде ровно
+	// два, поэтому запись проходит. Доказательство, что параметры доходят: при
+	// их игноре обе проверки дали бы одно и то же.
+	check := func(name string, id uuid.UUID, wantCopies int) {
+		meta, err := st.Stat(ctx, id)
+		if err != nil {
+			t.Fatalf("%s: Stat: %v", name, err)
+		}
+		if got := count(id); got != len(meta.Extents) {
+			t.Errorf("%s: файлов на носителях %d, экстентов %d — считалка разошлась", name, got, len(meta.Extents))
+		}
+		// План всегда один: одна реплика, размер size. Ошибка конфигурации
+		// (две реплики вместо одной) должна быть названа своим именем, а не
+		// «размер не совпадает»: иначе разбирать начнут не с того конца.
+		err = store.CheckExtents(meta.Extents, size, 1)
+		if wantCopies == 1 {
+			if err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+			return
+		}
+		if err == nil {
+			t.Fatalf("%s: проверка прошла, хотя реплик больше плана", name)
+		}
+		if !strings.Contains(err.Error(), "repl_count") {
+			t.Errorf("%s: причина %q, хотим про repl_count", name, err)
+		}
 	}
 
-	// Без параметров layout raid1 берёт две реплики — и устройств на стенде
-	// ровно два, так что запись проходит. Это и есть доказательство, что
-	// параметры доходят до Phobos: при игноре обе проверки дали бы одно.
+	id1 := put("с repl_count=1", map[string]string{"repl_count": "1"})
+	check("с repl_count=1", id1, 1)
+
 	id2 := put("без параметров layout", nil)
-	if got := count(id2); got != 2 {
-		t.Errorf("без параметров layout: реплик %d, хотим 2", got)
-	}
+	check("без параметров layout", id2, 2)
 }
