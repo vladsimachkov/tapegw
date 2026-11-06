@@ -325,7 +325,7 @@ func TestPutExistingCompleteIsOKIncompleteIsNot(t *testing.T) {
 	if err := e.reg.Drop(op); err != nil {
 		t.Fatal(err)
 	}
-	e.st.forceExists(op, false)
+	e.st.ForceExists(op, false)
 	res, err := c.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(body)), SHA256: sum(body), Body: bytes.NewReader(body)})
 	if err != nil {
 		t.Fatal(err)
@@ -336,7 +336,7 @@ func TestPutExistingCompleteIsOKIncompleteIsNot(t *testing.T) {
 
 	op2 := uuid.New()
 	body2 := []byte("broken copy")
-	e.st.forceExists(op2, true)
+	e.st.ForceExists(op2, true)
 	res, err = c.Put(mover.PutIn{Op: op2, ID: op2, Size: int64(len(body2)), SHA256: sum(body2), Body: bytes.NewReader(body2)})
 	if err != nil {
 		t.Fatal(err)
