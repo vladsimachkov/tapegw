@@ -78,8 +78,26 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 		p.holds++
 	}
 	p.lastID, p.lastTags = in.ID, append([]string(nil), in.Tags...)
-	if in.FromOp != uuid.Nil && p.copyCode != "" {
-		return &mover.Result{Op: in.Op, Code: p.copyCode, State: mover.StateFailed}, nil
+	if p.written == nil {
+		p.written = map[uuid.UUID]int{}
+	}
+	// Fake обязан вести себя как настоящий mover там, где настоящее известно,
+	// иначе тест зелёный по пути, которого в продукте нет. Правила — дословно
+	// из handlePutFrom и из «oid объекта = UUID операции».
+	if in.ID != in.Op {
+		return nil, errors.New("fake: oid обязан равняться op")
+	}
+	if in.FromOp != uuid.Nil {
+		if in.FromOp == in.Op {
+			return &mover.Result{Op: in.Op, Code: mover.CodeOpConflict, State: mover.StateFailed}, nil
+		}
+		if p.written[in.FromOp] == 0 {
+			// Буфер принадлежит конкретному mover'у: чужого источника нет.
+			return &mover.Result{Op: in.Op, Code: mover.CodeNotFound, State: mover.StateFailed}, nil
+		}
+		if p.copyCode != "" {
+			return &mover.Result{Op: in.Op, Code: p.copyCode, State: mover.StateFailed}, nil
+		}
 	}
 	// from_op: байтов по сети нет, mover читает свой буфер. Сумму здесь не
 	// сверяют — её сверяет mover с файла; тест фиксирует сам факт передачи.
