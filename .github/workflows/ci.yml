@@ -110,7 +110,10 @@ jobs:
           go test -race -count=1 -json ./... > /tmp/gotest.json 2>&1
           rc=$?
           set -e
-          python3 hack/testsummary.py /tmp/gotest.json
+          # Сводка не должна превращать зелёный прогон в красный и гасить
+          # настоящий код возврата: если она сама упала, говорим об этом
+          # отдельно и выходим по rc go test.
+          python3 hack/testsummary.py /tmp/gotest.json || echo "::warning::сводка не построилась"
           exit $rc
 
       - name: gotest JSON

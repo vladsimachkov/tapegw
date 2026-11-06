@@ -28,11 +28,18 @@ def main(path):
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
-            if not line or not line.startswith("{"):
+            if not line:
+                continue
+            if not line.startswith("{"):
+                # Не-JSON в файле бывает: с 2>&1 туда попадают строки сборки и
+                # предупреждения тулчейна. Печатаем как есть — это и есть
+                # причина, а падать на ней нельзя.
+                print(line)
                 continue
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError:
+                print(line)
                 continue
             pkg = ev.get("Package", "")
             act = ev.get("Action", "")
