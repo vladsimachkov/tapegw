@@ -66,6 +66,17 @@ type OpRecord struct {
 	Refs int `json:"refs,omitempty"`
 }
 
+// ContentSHA256 — сумма содержимого буфера так, как её можно сверять при
+// локальной передаче. У put это заявленная сумма (файл уже сверен с ней при
+// приёме), у get — сумма, посчитанная при чтении с ленты: у операции get поле
+// SHA256 пустое, и сравнивать с ним было бы сравнением не с тем.
+func (r *OpRecord) ContentSHA256() string {
+	if r.SHA256Out != "" {
+		return r.SHA256Out
+	}
+	return r.SHA256
+}
+
 // ErrSrcNotDone — источник локальной передачи не в done. Буфер в staged ещё не
 // дочитан и не сверен, failed уже выброшен.
 var ErrSrcNotDone = errors.New("mover: источник не завершён")
@@ -118,6 +129,11 @@ func (r *Registry) load() error {
 			rec.State = StateFailed
 			rec.Code = CodeExpired
 		}
+		// Ссылки не переживают перезапуск: передача, которая их держала,
+		// оборвалась вместе с процессом, и освободить их больше некому. Без
+		// обнуления буфер с осиротевшей ссылкой не удалил бы никогда —
+		// тихая утечка места в буфере.
+		rec.Refs = 0
 		r.ops[rec.Op] = &rec
 		r.used += rec.Received
 	}
@@ -245,6 +261,15 @@ func (r *Registry) Update(op uuid.UUID, fn func(*OpRecord)) error {
 
 // Free — сколько места в буфере осталось. Нужно и для handshake, и для
 // кредитов: переполнение буфера есть «подожди», а не ошибка записи.
+// SumFile — SHA-256 файла буфера по идентификатору операции. Нужен локальной
+// передаче: сверять надо файл, а не то, что записано о нём в реестре.
+func (r *Registry) SumFile(op uuid.UUID) (string, error) {
+	r.mu.Lock()
+	path := r.dataPath(op)
+	r.mu.Unlock()
+	return SumFile(path)
+}
+
 // Acquire увеличивает число ссылок на буфер источника. Отказывает, если
 // источник не в done: staged ещё не сверен, failed уже без данных.
 func (r *Registry) Acquire(op uuid.UUID) error {

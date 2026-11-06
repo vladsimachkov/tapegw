@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -30,7 +32,8 @@ func TestLocalTransferSendsNoBytes(t *testing.T) {
 
 	body := bytes.Repeat([]byte("copyme"), 500)
 	op1 := uuid.New()
-	if _, err := c.Put(mover.PutIn{Op: op1, ID: op1, Size: int64(len(body)), SHA256: sum(body), Body: bytes.NewReader(body)}); err != nil {
+	// hold: буфер нужен для копии, mover не должен выбрасывать данные после success.
+	if _, err := c.Put(mover.PutIn{Op: op1, ID: op1, Size: int64(len(body)), SHA256: sum(body), Hold: true, Body: bytes.NewReader(body)}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -184,5 +187,160 @@ func TestAcquireRefusesUnfinished(t *testing.T) {
 	}
 	if err := reg.Acquire(uuid.New()); err == nil {
 		t.Fatal("acquire по неизвестной операции прошёл")
+	}
+}
+
+// Ссылки не переживают перезапуск: передача оборвалась вместе с процессом, и
+// освободить их больше некому.
+func TestRefsResetAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := mover.NewRegistry(dir, 1<<20, 64<<10, 10*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := uuid.New()
+	if _, _, err := reg.Begin(op, 5, "aa", nil, nil, "scheduler"); err != nil {
+		t.Fatal(err)
+	}
+	f, err := reg.DataFile(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.Write([]byte("hello"))
+	f.Close()
+	_ = reg.Update(op, func(r *mover.OpRecord) { r.State = mover.StateDone })
+	if err := reg.Acquire(op); err != nil {
+		t.Fatal(err)
+	}
+
+	// «Перезапуск»: тот же каталог, новый реестр.
+	reg2, err := mover.NewRegistry(dir, 1<<20, 64<<10, 10*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	gone, err := reg2.Expire(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gone) == 0 {
+		t.Fatal("буфер с осиротевшей ссылкой не удалён: место в буфере утекает навсегда")
+	}
+}
+
+// Испорченный после приёма буфер не должен уходить на ленту второй копией:
+// сверяется файл, а не запись о нём.
+func TestLocalTransferRefusesCorruptedSource(t *testing.T) {
+	e := startEnv(t, 1<<20)
+	c := e.dial(t)
+
+	body := bytes.Repeat([]byte("intact"), 400)
+	op1 := uuid.New()
+	if _, err := c.Put(mover.PutIn{Op: op1, ID: op1, Size: int64(len(body)), SHA256: sum(body), Hold: true, Body: bytes.NewReader(body)}); err != nil {
+		t.Fatal(err)
+	}
+	// Портим байт в файле буфера, не трогая реестр: запись по-прежнему говорит
+	// «сумма совпала».
+	// Портим файл буфера напрямую: реестр при этом продолжает утверждать,
+	// что сумма при приёме совпала.
+	disk := filepath.Join(e.staging, op1.String()+".bin")
+	b, err := os.ReadFile(disk)
+	if err != nil {
+		t.Fatalf("файл буфера: %v", err)
+	}
+	b[0] ^= 0xff
+	if err := os.WriteFile(disk, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	op2 := uuid.New()
+	res, err := c.Put(mover.PutIn{Op: op2, ID: op2, Size: int64(len(body)), SHA256: sum(body), FromOp: op1, Body: poisonReader{}})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if res.Code != mover.CodeChecksumMismatch {
+		t.Fatalf("код: %s, ждали checksum_mismatch", res.Code)
+	}
+	if e.st.Len() != 1 {
+		t.Fatalf("на ленту ушло %d объектов, ждали 1", e.st.Len())
+	}
+}
+
+// Источник get — главный случай Ф0.4: ленту читают один раз и пишут на
+// несколько носителей. Сверять надо сумму, посчитанную при чтении.
+func TestLocalTransferFromGetSource(t *testing.T) {
+	e := startEnv(t, 1<<20)
+	c := e.dial(t)
+
+	body := bytes.Repeat([]byte("tape-data"), 300)
+	src := uuid.New()
+	if _, err := c.Put(mover.PutIn{Op: src, ID: src, Size: int64(len(body)), SHA256: sum(body), Body: bytes.NewReader(body)}); err != nil {
+		t.Fatal(err)
+	}
+
+	getOp := uuid.New()
+	var got bytes.Buffer
+	if res, err := c.Get(getOp, src, &got); err != nil || res.Code != mover.CodeOK {
+		t.Fatalf("get: %v %+v", err, res)
+	}
+	if !bytes.Equal(got.Bytes(), body) {
+		t.Fatal("прочитано не то")
+	}
+
+	dst := uuid.New()
+	res, err := c.Put(mover.PutIn{Op: dst, ID: dst, Size: int64(len(body)), SHA256: sum(body), FromOp: getOp, Body: poisonReader{}})
+	if err != nil {
+		t.Fatalf("put from get: %v", err)
+	}
+	if res.Code != mover.CodeOK {
+		t.Fatalf("код: %s, ждали ok", res.Code)
+	}
+
+	// Ожидаемая сумма не совпала с посчитанной при чтении — значит чтение с
+	// ленты испорчено: новую копию писать нельзя.
+	bad := uuid.New()
+	res, err = c.Put(mover.PutIn{Op: bad, ID: bad, Size: int64(len(body)), SHA256: sum([]byte("другое")), FromOp: getOp, Body: poisonReader{}})
+	if err != nil {
+		t.Fatalf("put from get (bad): %v", err)
+	}
+	if res.Code != mover.CodeOpConflict {
+		t.Fatalf("код при чужой ожидаемой сумме: %s, ждали op_conflict", res.Code)
+	}
+}
+
+// «Уже есть» разбирается внутри mover: целая копия — успех, неполная —
+// отдельный код, а не «ok».
+func TestPutExistingCompleteIsOKIncompleteIsNot(t *testing.T) {
+	e := startEnv(t, 1<<20)
+	c := e.dial(t)
+
+	body := []byte("already there")
+	op := uuid.New()
+	if _, err := c.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(body)), SHA256: sum(body), Body: bytes.NewReader(body)}); err != nil {
+		t.Fatal(err)
+	}
+	// Забываем операцию в реестре mover'а — как после перезапуска: ответ
+	// должен прийти от хранилища, а не из памяти о прошлой записи.
+	if err := e.reg.Drop(op); err != nil {
+		t.Fatal(err)
+	}
+	e.st.forceExists(op, false)
+	res, err := c.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(body)), SHA256: sum(body), Body: bytes.NewReader(body)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != mover.CodeOK {
+		t.Fatalf("целая существующая копия: %s, ждали ok", res.Code)
+	}
+
+	op2 := uuid.New()
+	body2 := []byte("broken copy")
+	e.st.forceExists(op2, true)
+	res, err = c.Put(mover.PutIn{Op: op2, ID: op2, Size: int64(len(body2)), SHA256: sum(body2), Body: bytes.NewReader(body2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != mover.CodeIncomplete {
+		t.Fatalf("неполная копия: %s, ждали incomplete", res.Code)
 	}
 }

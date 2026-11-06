@@ -386,9 +386,12 @@ func (s *Server) handlePut(conn net.Conn, p *Put) *Frame {
 		_ = s.reg.Update(p.Op, func(r *OpRecord) {
 			r.State, r.Code, r.Version, r.Extents = StateDone, CodeOK, version, extents
 		})
-		// Буфер освобождаем, запись об операции оставляем: по ней повтор
-		// после обрыва ответит «уже записано», а не перепишет объект.
-		_ = s.reg.ReleaseData(p.Op)
+		// Буфер освобождаем, запись об операции оставляем: по ней повтор после
+		// обрыва ответит «уже записано», а не перепишет объект. Кроме hold:
+		// с этого буфера ещё будут писаться копии (Ф0.4).
+		if !p.Hold {
+			_ = s.reg.ReleaseData(p.Op)
+		}
 	} else {
 		_ = s.reg.Update(p.Op, func(r *OpRecord) { r.State, r.Code = StateFailed, code })
 	}
@@ -559,8 +562,14 @@ func (s *Server) handleGet(conn net.Conn, g *Get) *Frame {
 		off += n
 		credits -= n
 	}
+	// Буфер остаётся: он нужен локальной передаче (Ф0.4) — reconciler и repack
+	// читают ленту один раз и пишут на несколько носителей. Сумма, посчитанная
+	// при чтении, пишется в SHA256Out: это единственная сумма, которой можно
+	// сверять такую операцию, потому что SHA256 у get — не сумма данных.
+	_ = s.reg.Update(g.Op, func(r *OpRecord) {
+		r.State, r.Code, r.SHA256Out, r.Size, r.Received = StateDone, CodeOK, sum, size, size
+	})
 	send(Result{Code: CodeOK, State: StateDone, SHA256: sum})
-	_ = s.reg.Drop(g.Op)
 	return nil
 }
 
@@ -648,7 +657,11 @@ func (s *Server) handlePutFrom(conn net.Conn, p *Put) {
 	case p.SHA256 == "":
 		send(Result{Code: CodeOpConflict, State: StateFailed})
 		return
-	case src.SHA256 != p.SHA256 || src.Size != p.Size:
+	case src.ContentSHA256() == "":
+		// Операция есть и завершена, но сверить её не с чем: суммы нет.
+		send(Result{Code: CodeOpConflict, State: StateFailed})
+		return
+	case src.ContentSHA256() != p.SHA256 || src.Size != p.Size:
 		send(Result{Code: CodeOpConflict, State: StateFailed})
 		return
 	case p.FromOp == p.Op:
@@ -679,6 +692,24 @@ func (s *Server) handlePutFrom(conn net.Conn, p *Put) {
 			s.log.Error("mover: снять ссылку с источника", "op", p.FromOp, "err", err)
 		}
 	}()
+
+	// Сверяем файл, а не запись о нём. Запись говорит, что сумма совпала при
+	// приёме; если байты испортились после (сбой диска буфера, ошибка памяти),
+	// вторая копия ушла бы на ленту испорченной и считалась бы проверенной — а
+	// по Р10 старая копия после этого может стать мёртвой. Локальный NVMe против
+	// ленты: проход по файлу дешёвый.
+	got, err := s.reg.SumFile(p.FromOp)
+	if err != nil {
+		// Буфера нет — например, источник записали без hold, и mover освободил
+		// данные после success. Это не «подожди» и не повтор: копировать
+		// нечего, источник надо читать заново.
+		send(Result{Code: CodeNotFound, State: StateFailed})
+		return
+	}
+	if got != p.SHA256 {
+		send(Result{Code: CodeChecksumMismatch, State: StateFailed})
+		return
+	}
 
 	s.touchOp(conn)
 	res := s.writeFrom(p, p.FromOp)

@@ -705,3 +705,38 @@ func TestExistsBlocksPackAndStopsResending(t *testing.T) {
 		t.Errorf("после разблокировки продолжение получила %s, ждали %s", got, packID)
 	}
 }
+
+// Неполная копия на ленте — тот же класс, что и «уже есть»: нельзя принять и
+// нельзя молча повторить. mover теперь различает «целая» (ok) и «неполная»
+// (incomplete) сам, планировщик обязан разобрать второй код.
+func TestIncompleteBlocksPack(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "incomplete", 2)
+	a, pm := archiver(t, m, ids[0])
+	a.ClaimTTL = 100 * time.Millisecond
+	pm.code = mover.CodeIncomplete
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err == nil {
+		t.Fatal("incomplete не должен считаться успехом")
+	}
+	var reason string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT blocked_reason FROM packs ORDER BY created_at DESC LIMIT 1`).Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if reason == "" {
+		t.Error("пачка с неполной копией не заблокирована")
+	}
+	// В pending участники не уехали: на ленте лежит неполный объект, и
+	// пересылка той же пачки под тем же oid даст тот же incomplete.
+	var st string
+	if err := m.Pool.QueryRow(ctx, `SELECT state::text FROM objects WHERE id = $1`, ids[0]).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st != "archiving" {
+		t.Errorf("объект в %s, ждали archiving", st)
+	}
+}
