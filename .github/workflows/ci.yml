@@ -101,7 +101,26 @@ jobs:
       - name: unit + integration
         env:
           TAPEGW_TEST_DSN: postgres://tapegw:tapegw@localhost:${{ job.services.postgres.ports[5432] }}/phobos?search_path=tapegw_test
-        run: go test -race -count=1 ./...
+        # -json, а не голый вывод: при ./... с параллельными пакетами имя
+        # упавшего теста тонет в перемешанном логе, а `exit status N` и блоки
+        # `DATA RACE` и вовсе остаются за кадром. Сводка ниже называет виновника
+        # явно; полный JSON — артефакт прогона.
+        run: |
+          set +e
+          go test -race -count=1 -json ./... > /tmp/gotest.json 2>&1
+          rc=$?
+          set -e
+          python3 hack/testsummary.py /tmp/gotest.json
+          exit $rc
+
+      - name: gotest JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gotest-json
+          path: /tmp/gotest.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # E2E против живого tapegw: критерий готовности M1 — aws s3 mb / ls / rb.
   e2e:
