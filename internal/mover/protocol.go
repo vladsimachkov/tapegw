@@ -223,6 +223,13 @@ type Item struct {
 	Version int       `json:"version,omitempty"`
 }
 
+// ExtentInfo — один экстент: размер, носитель, состояние копии.
+type ExtentInfo struct {
+	Size  int64  `json:"size"`
+	Media string `json:"media,omitempty"`
+	State string `json:"state,omitempty"`
+}
+
 // Result — итог операции. Extents — носители, на которые лёг объект
 // (ADR-0008: носитель узнаётся при архивации).
 type Result struct {
@@ -232,11 +239,14 @@ type Result struct {
 	State   State     `json:"state"`
 	Version int       `json:"version,omitempty"`
 	Extents []string  `json:"extents,omitempty"`
-	// Size — размер объекта в Phobos. Заполняется в ответе на stat: планировщик
-	// сверяет его со своим планом, прежде чем признать пачку записанной.
-	Size   int64  `json:"size,omitempty"`
-	SHA256 string `json:"sha256,omitempty"` // на get — сумма отданных байт
-	Items  []Item `json:"items,omitempty"`
+	// ExtentInfo — экстенты объекта так, как их видел Phobos. Заполняется в
+	// ответе на stat: сверять против плана должен планировщик, у которого план
+	// есть. Sumму тут не считаем: 94 — это и две реплики по 47, и один объект
+	// на 94, а для разбора EEXIST это противоположные случаи.
+	ExtentInfo []ExtentInfo `json:"extent_info,omitempty"`
+	Size       int64        `json:"size,omitempty"`
+	SHA256     string       `json:"sha256,omitempty"` // на get — сумма отданных байт
+	Items      []Item       `json:"items,omitempty"`
 }
 
 // --- Кадры -----------------------------------------------------------------

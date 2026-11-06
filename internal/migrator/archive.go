@@ -13,6 +13,7 @@ import (
 
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/mover"
+	"github.com/vladsimachkov/tapegw/internal/store"
 )
 
 // Putter — то, что migrator просит у mover'а. Интерфейс, а не *mover.Client:
@@ -418,10 +419,15 @@ func (a *Archiver) resolveByStat(ctx context.Context, packID uuid.UUID, plan *Pl
 	}
 	switch st.Code {
 	case mover.CodeOK:
-		// Целый объект с нужным oid — ещё не наша пачка. Сверка размера дешёвая,
-		// а цена её отсутствия — «архивировано» поверх чужих байт.
-		if st.Size != plan.Size {
-			if err := block(fmt.Sprintf("под oid пачки лежит объект на %d байт, план — %d", st.Size, plan.Size)); err != nil {
+		// Целый объект с нужным oid — ещё не наша пачка. Сверяем экстенты с
+		// планом, а не одно число: «две реплики вместо одной» и «объект другого
+		// размера» — разные неисправности, и искать их надо по-разному.
+		ext := make([]store.Extent, 0, len(st.ExtentInfo))
+		for _, e := range st.ExtentInfo {
+			ext = append(ext, store.Extent{Size: e.Size, Media: e.Media, State: e.State})
+		}
+		if err := store.CheckExtents(ext, plan.Size, 1); err != nil {
+			if err := block(fmt.Sprintf("под oid пачки лежит не то, что мы планировали: %v", err)); err != nil {
 				return nil, err
 			}
 			return nil, nil
