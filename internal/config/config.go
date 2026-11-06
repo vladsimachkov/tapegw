@@ -7,11 +7,14 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"reflect"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -154,6 +157,19 @@ type Phobos struct {
 	// MaxInflight — размер пула горутин, имеющих право вызывать libphobos.
 	// До подтверждения потокобезопасности (спайк M0-3) держим 1.
 	MaxInflight int `yaml:"max_inflight"`
+
+	// Movers — mover'ы, к которым подключается планировщик. Именованная
+	// коллекция: ключ — имя драйва, оно же слот воркера (WorkerID =
+	// <node>/<ключ>) и часть SAN-URI сертификата mover'а. Одна идентичность
+	// вместо трёх, которые могут разойтись.
+	Movers map[string]Mover `yaml:"movers"`
+}
+
+// Mover — точка подключения к одному mover'у (ADR-0007, ADR-0021).
+type Mover struct {
+	Addr    string `yaml:"addr"`
+	Node    string `yaml:"node"`
+	Library string `yaml:"library"`
 }
 
 // Worker — настройки одного фоновыего воркера (migrator или recaller).
@@ -400,8 +416,94 @@ func walkEnv(v reflect.Value, prefix string, fn func(path string, v reflect.Valu
 			}
 			continue
 		}
+		if isNamedCollection(fv) {
+			if err := walkEnvMap(fv, path, fn); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := fn(path, fv); err != nil {
 			return fmt.Errorf("%v: %w", path, err)
+		}
+	}
+	return nil
+}
+
+// isNamedCollection — именованная коллекция: map[string]T, где T — структура.
+// Такие коллекции переопределяются по имени ключа (см. ARCHITECTURE.md,
+// уточнение к правилу 9), а не индексом: перестановка элементов в YAML не должна
+// менять то, какую запись правит переменная окружения.
+func isNamedCollection(v reflect.Value) bool {
+	if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String {
+		return false
+	}
+	et := v.Type().Elem()
+	for et.Kind() == reflect.Ptr {
+		et = et.Elem()
+	}
+	return et.Kind() == reflect.Struct
+}
+
+// keyPattern — допустимые ключи именованных коллекций. Ограничение нужно,
+// чтобы преобразование «ключ -> часть имени переменной» было взаимно
+// однозначным: иначе drive-1 и drive_1 дали бы одну переменную.
+var keyPattern = regexp.MustCompile(`^[a-z0-9_]+$`)
+
+func walkEnvMap(fv reflect.Value, path string, fn func(string, reflect.Value) error) error {
+	prefix := "TAPEGW_" + strings.ToUpper(path)
+
+	// Вся коллекция одной переменной (контейнеры, CI).
+	var replaced bool
+	if raw, ok := os.LookupEnv(prefix); ok {
+		// В новую карту, а не в существующую: json дополняет непустую map,
+		// а переменная обязана заменять коллекцию — иначе «задал целиком»
+		// оставило бы половину настроек из YAML.
+		fresh := reflect.New(fv.Type())
+		if err := json.Unmarshal([]byte(raw), fresh.Interface()); err != nil {
+			return fmt.Errorf("%s: %w", prefix, err)
+		}
+		fv.Set(fresh.Elem())
+		replaced = true
+	}
+
+	consulted := map[string]bool{}
+	whole := prefix + "_"
+	if replaced {
+		// Задать целиком и править поле — не угадываем, что главнее.
+		for _, kv := range os.Environ() {
+			name, _, _ := strings.Cut(kv, "=")
+			if strings.HasPrefix(name, whole) {
+				return fmt.Errorf("%s: нельзя задать коллекцию целиком и одновременно переопределить поле %s", prefix, name)
+			}
+		}
+		return nil
+	}
+
+	keys := fv.MapKeys()
+	sort.Slice(keys, func(i, j int) bool { return keys[i].String() < keys[j].String() })
+	for _, k := range keys {
+		if !keyPattern.MatchString(k.String()) {
+			return fmt.Errorf("%s: ключ %q: допускаются строчные латинские буквы, цифры и _", path, k.String())
+		}
+		elem := reflect.New(fv.Type().Elem()).Elem()
+		elem.Set(fv.MapIndex(k))
+		kpath := path + "_" + strings.ToUpper(k.String())
+		if err := walkEnv(elem, kpath, func(p2 string, v2 reflect.Value) error {
+			consulted["TAPEGW_"+strings.ToUpper(p2)] = true
+			return fn(p2, v2)
+		}); err != nil {
+			return err
+		}
+		fv.SetMapIndex(k, elem)
+	}
+
+	// Переменная про несуществующий mover или несуществующее поле — ошибка,
+	// а не молчаливое игнорирование: иначе новый mover через окружение
+	// «добавился», но не добавился.
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(name, whole) && !consulted[name] {
+			return fmt.Errorf("%s: неизвестная переменная %s: коллекция задаётся только в YAML, переменная правит поле существующего ключа", path, name)
 		}
 	}
 	return nil
@@ -623,6 +725,23 @@ func (c *Config) Validate() error {
 	case "tape", "dir":
 	default:
 		add("phobos.family: %q, ожидаются tape или dir", c.Phobos.Family)
+	}
+	for name, mv := range c.Phobos.Movers {
+		// Ключ проверяется и здесь, не только на пути к переменной окружения:
+		// без ограничения два ключа (drive-1 и drive_1) дали бы одну
+		// переменную, и правка ушла бы не в тот mover.
+		if !keyPattern.MatchString(name) {
+			add("phobos.movers: ключ %q: допускаются строчные латинские буквы, цифры и _", name)
+		}
+		if mv.Addr == "" {
+			add("phobos.movers.%s.addr обязателен", name)
+		}
+		if mv.Node == "" {
+			add("phobos.movers.%s.node обязателен: по нему определяется локальная передача (Ф0.4)", name)
+		}
+		if mv.Library == "" {
+			add("phobos.movers.%s.library обязателен: входит в SAN-URI сертификата mover'а", name)
+		}
 	}
 
 	switch strings.ToLower(c.Logging.Format) {
