@@ -1,0 +1,54 @@
+# Стенд ci-dir: Phobos на семействе dir, без лент и TLC.
+#
+# Нужен для 1a-1/1a-2: cgo-слой проверяется на dir, лента для этого не нужна,
+# а разбирать отказ на «наследном» стенде дороже, чем поднять чистый.
+#
+# Слои разбиты по шагам специально: сборка Phobos — самая долгая, и правка
+# любого шага не должна заставлять пересобирать предыдущие.
+FROM almalinux:9
+
+RUN dnf -y install dnf-plugins-core epel-release && dnf config-manager --set-enabled crb && \
+    dnf -y install \
+        gcc make autoconf automake libtool pkgconfig which git \
+        glib2-devel jansson-devel libpq-devel openssl-devel libini_config-devel \
+        sg3_utils-devel libtool-ltdl-devel libuuid-devel libattr-devel libaio-devel \
+        protobuf-c-devel protobuf-c-compiler xxhash-devel \
+        tar gzip \
+        postgresql-server postgresql-contrib \
+        python3 python3-devel python3-tabulate python3-pyyaml \
+        python3-clustershell python3-psycopg2 \
+        e2fsprogs && \
+    dnf clean all
+
+# Go той же версии, что go.mod (правило 1). В EL9 из пакета старее, а до
+# go.dev из сборочного контейнера не дотянуться (проверено: curl падает по
+# таймауту), поэтому тарбол подготавливает hack/ci-dir-up из локального GOROOT
+# в .build/go.tgz. В CI, где сеть есть, тот же шаг — скачать релизный тарбол.
+COPY .build/go.tgz /tmp/go.tgz
+RUN mkdir -p /usr/local/go && tar -C /usr/local/go -xzf /tmp/go.tgz && rm -f /tmp/go.tgz && \
+    ln -s /usr/local/go/bin/go /usr/local/bin/go && \
+    ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+
+# Исходники Phobos — релизный тег, без патчей (правило 3). Отдельный слой,
+# чтобы правки сборки не гоняли клонирование заново.
+ARG PHOBOS_TAG=3.4.1
+RUN git clone --depth 1 --branch "$PHOBOS_TAG" https://github.com/cea-hpc/phobos.git /usr/src/phobos
+
+# Тесты самого Phobos не собираются: cmocka в EL9 нет ни в base, ни в CRB,
+# ни в EPEL (замер — M0-01), а нужна она только им. man-страницы требуют
+# help2man. Поэтому рекурсию ограничиваем каталогом src — это конфигурация
+# сборки сгенерированного Makefile, а не патч исходников: ни один файл Phobos
+# не меняется.
+RUN cd /usr/src/phobos && \
+    ./autogen.sh && \
+    ./configure --prefix=/usr && \
+    python3 -c "import re;s=open('Makefile').read();open('Makefile','w').write(re.sub(r'(?m)^SUBDIRS = .*?(?=\n[A-Za-z_]+ = |\n#)','SUBDIRS = . src\n',s,count=1,flags=re.S))" && \
+    make -j"$(nproc)" && \
+    make install && \
+    ldconfig
+
+COPY deploy/ci-dir/phobos.conf /etc/phobos.conf
+COPY deploy/ci-dir/init.sh /usr/local/libexec/ci-dir-init
+RUN chmod +x /usr/local/libexec/ci-dir-init && mkdir -p /run/phobosd /var/lib/phobos/dir1
+
+CMD ["/usr/local/libexec/ci-dir-init"]
