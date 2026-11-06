@@ -66,15 +66,16 @@ type probeMover struct {
 	holds      int        // сколько put приходили с hold
 
 	// #101: ответы на stat/delete по oid пачки.
-	statCode    mover.Code
-	statVersion int
-	statExtents []string
-	statSize    int64 // 0 = «как в плане»
-	lastSize    int64
-	deleteCode  mover.Code
-	statCalls   int
-	deleteCalls int
-	releases    int
+	statCode       mover.Code
+	statVersion    int
+	statExtents    []string
+	statExtentInfo []mover.ExtentInfo
+	statSize       int64 // 0 = «как в плане»
+	lastSize       int64
+	deleteCode     mover.Code
+	statCalls      int
+	deleteCalls    int
+	releases       int
 }
 
 func (p *probeMover) StatObject(id uuid.UUID) (*mover.Result, error) {
@@ -90,7 +91,14 @@ func (p *probeMover) StatObject(id uuid.UUID) (*mover.Result, error) {
 		// задаётся явно.
 		size = p.lastSize
 	}
-	return &mover.Result{Op: id, Code: code, Version: p.statVersion, Extents: p.statExtents, Size: size}, nil
+	info := p.statExtentInfo
+	if info == nil {
+		// По умолчанию — ровно один экстент в sync: план migrator тоже
+		// «одна реплика». Две реплики задаёт явно тот тест, который их проверяет.
+		info = []mover.ExtentInfo{{Size: size, Media: "TST-MIG", State: "sync"}}
+	}
+	return &mover.Result{Op: id, Code: code, Version: p.statVersion,
+		Extents: p.statExtents, ExtentInfo: info, Size: size}, nil
 }
 
 func (p *probeMover) DeleteObject(id uuid.UUID) (*mover.Result, error) {
@@ -1133,5 +1141,37 @@ func TestStatIncompleteUndeletableBlocksPack(t *testing.T) {
 	}
 	if reason := packBlockedReason(t, m, ctx); reason == "" {
 		t.Error("пачка не заблокирована")
+	}
+}
+
+// TestStatTwoReplicasBlocksReplCount — «объект записан двумя репликами» должен
+// быть назван своим именем. Сверка по одному числу дала бы «размер не тот»:
+// безопасно, но разбирать стали бы не с того конца.
+//
+// Пачка при этом остаётся заблокированной, а ArchivePack возвращает ошибку:
+// «разобрали и заблокировали» — не успех, и цикл обязан это увидеть.
+func TestStatTwoReplicasBlocksReplCount(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "tworep", 2)
+	a, pm := archiver(t, m, ids[0])
+	pm.code = mover.CodeExists
+	pm.statCode = mover.CodeOK
+	pm.statExtentInfo = []mover.ExtentInfo{
+		{Size: 1024, Media: "TST-MIG", State: "sync"},
+		{Size: 1024, Media: "TST-MIG-2", State: "sync"},
+	}
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err == nil {
+		t.Error("пачка с чужим числом реплик не должна считаться заархивированной")
+	}
+	reason := packBlockedReason(t, m, ctx)
+	if reason == "" {
+		t.Fatal("пачка не заблокирована: две реплики вместо одной — это не наш объект")
+	}
+	if !strings.Contains(reason, "repl_count") {
+		t.Errorf("причина %q: хотим указание на repl_count, а не «размер не тот»", reason)
 	}
 }
