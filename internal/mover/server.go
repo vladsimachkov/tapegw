@@ -556,7 +556,8 @@ func codeFor(err error) Code {
 	case errors.Is(err, store.ErrAttrTooLarge):
 		return CodeAttrTooLarge
 	case errors.Is(err, store.ErrExists):
-		return CodeOK
+		// Не CodeOK: «уже есть» не значит «целая копия». См. CodeExists.
+		return CodeExists
 	default:
 		return CodeIO
 	}

@@ -53,6 +53,7 @@ type probeMover struct {
 	lastID      uuid.UUID     // oid, с которым mover реально вызвали
 	failPut     error         // если задан — put падает ДО записи (м mover лёг)
 	block       chan struct{} // если задан — put ждёт в него перед записи
+	code        mover.Code    // если задан — put вернёт этот код вместо ok
 }
 
 func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
@@ -91,6 +92,9 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 	}
 	if p.block != nil {
 		<-p.block
+	}
+	if p.code != "" && p.code != mover.CodeOK {
+		return &mover.Result{Op: in.Op, Code: p.code}, nil
 	}
 	p.accept = true
 	if p.written == nil {
@@ -614,5 +618,53 @@ func TestSecondWorkerOfSameProcessDoesNotSteal(t *testing.T) {
 	close(pm.block)
 	if err := <-done; err != nil {
 		t.Fatalf("ArchivePack: %v", err)
+	}
+}
+
+// EEXIST — не успех и не отказ: пачка помечается застрявшей и не повторяется.
+//
+// Дубля нет (oid пачки не меняется), но из exists не следует, что копия цела:
+// incomplete после обрыва посреди записи выглядит так же. До stat по oid такой
+// исход обязан поднимать сигнал, а не крутиться: повтор даёт тот же EEXIST,
+// объекты висят в 'archiving' и держат landing молча.
+func TestExistsMarksPackStuck(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "exists", 2)
+	a, pm := archiver(t, m, ids[0])
+	pm.code = mover.CodeExists
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err == nil {
+		t.Fatal("exists не должен считаться успехом")
+	}
+
+	var state string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT state::text FROM packs ORDER BY created_at DESC LIMIT 1`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "sealed" {
+		t.Errorf("пачка в %s, ждали sealed: её нельзя ни отменять, ни считать архивированной", state)
+	}
+
+	// Участники не уехали в pending: пачка не отменена, а не разобрана.
+	var st string
+	if err := m.Pool.QueryRow(ctx, `SELECT state::text FROM objects WHERE id = $1`, ids[0]).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st != "archiving" {
+		t.Errorf("объект в %s, ждали archiving", st)
+	}
+
+	// Продолжение не обязано брать чужую запечатанную пачку до истечения ttl:
+	// иначе цикл крутится, каждый раз получая тот же exists.
+	got, err := m.ClaimSealedPack(ctx, "host-a/mover-9", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != uuid.Nil {
+		t.Errorf("продолжение взяло пачку %s, которую никто не разобрал", got)
 	}
 }

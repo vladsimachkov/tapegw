@@ -256,6 +256,20 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 			return nil, err
 		}
 	}
+	if res.Code == mover.CodeExists {
+		// EEXIST — не отказ и не успех. Дубля нет (oid пачки не меняется), но из
+		// EEXIST не следует, что копия цела: incomplete после обрыва выглядит
+		// так же. До stat по oid (#101, полная часть) такой исход — сигнал
+		// человеку, а не повод повторять: повтор даёт тот же EEXIST, объекты
+		// висят в 'archiving' и держат landing молча.
+		// Состояние «застряла и ждёт человека» для такого исхода пока не
+		// заводится: см. задачу #101. Пока — громкий сигнал и отказ, пачка
+		// остаётся запечатанной с захватом, и продолжение придёт не раньше, чем
+		// истечёт ttl.
+		a.logger().Error("пачка существует в Phobos, итог требует проверки",
+			"pack", packID.String(), "oid", packID.String(), "spec", a.Spec)
+		return nil, fmt.Errorf("mover: пачка %s уже существует в Phobos — итог надо разобрать (stat по oid), повтор её не решит", packID)
+	}
 	if res.Code != mover.CodeOK {
 		if definiteRefusals[res.Code] {
 			// Известно, что на ленту ничего не легло, — выбрасывать можно.
