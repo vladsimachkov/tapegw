@@ -411,7 +411,32 @@ SELECT c.copy_name, c.version, c.copy_status, e.medium_id, e.state
 остановить ручной процесс и проверить, что не осталось локов. Иначе через месяц
 получаете «все поля зелёные, а `put` отвечает `ENODEV`».
 
-### `put` на `dir` отвечает `ENODEV`, хотя носитель выглядит готовым
+### `phobos dir list` показывает носитель, а не устройство
+
+У Phobos у `dir` два разных объекта: **носитель** и **устройство**, и состояние у
+них раздельное. `phobos dir list -o all` печатает строку **носителя**:
+`fs.status`, `phys_spc_free`, `put_access` и `adm_status` в этом выводе — его
+поля. Отказ устройства в этом списке **не виден**.
+
+Симптом: `dir list -o all` показывает `adm_status=unlocked`, `put_access=True`,
+`fs.status=empty`, место есть — а `put` отвечает `No such device`, и в журнале
+только `No compatible device found for write alloc`.
+
+Проверка (только чтение):
+
+```bash
+psql "$(sed -n 's/^ *connect_string *= *//p' /etc/phobos.conf | head -1)" \
+  -c "SELECT family, id, adm_status FROM device"
+```
+
+Там `adm_status` может быть `failed` при полностью «зелёном» носителе. Снимается
+штатно: `phobos dir unlock -L <library> <res>` (для драйвов — `phobos drive
+unlock`), после чего состояние `unlocked` переживает рестарт phobosd.
+
+Замечено: LRS переводит устройство в `failed` сам, когда его поток завершается с
+ошибкой (например `No locks available (37)` после убийства phobosd вручную).
+Проверка `adm_status = failed` входов в `hack/stand-status` — иначе «устройство
+отказало час назад» снова будет выглядеть как загадка.
 
 Симптом: `phobos put -f dir -L dirlib -l raid1 ...` → `No such device`, при этом
 `phobos dir list -o all` показывает `adm_status=unlocked`, `put_access=True`,

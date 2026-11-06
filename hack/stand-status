@@ -52,7 +52,27 @@ else
     fail "TLC не слушает порт $port — phobosd не сможет работать с библиотекой"
 fi
 
-# --- 4. локи с мёртвыми владельцами -----------------------------------------
+# --- 4. устройства в состоянии failed ---------------------------------------
+# Устройства и носители — разные объекты. `phobos dir list -o all` показывает
+# строку НОСИТЕЛЯ: её adm_status может быть unlocked, а устройство тем временем
+# в failed — LRS такое устройство при распределении записи не рассматривает, и
+# снаружи это выглядит как «всё зелёное, но ENODEV». Состояние устройства видно
+# только в DSS. Только чтение, ничего не меняем.
+dsn=$(sed -n 's/^[[:space:]]*connect_string[[:space:]]*=[[:space:]]*\(.*\)/\1/p' /etc/phobos.conf | head -1)
+if [ -n "$dsn" ]; then
+    bad=$(psql "$dsn" -At -c "SELECT family || ' ' || id FROM device WHERE adm_status = 'failed'" 2>/dev/null)
+    if [ -n "$bad" ]; then
+        while IFS= read -r d; do
+            fail "устройство в failed: $d — LRS его не рассматривает; снять: phobos <family> unlock (или drive unlock) + рестарт"
+        done <<< "$bad"
+    else
+        ok "ни одного устройства в failed"
+    fi
+else
+    fail "не удалось прочитать dss.connect_string из /etc/phobos.conf — состояние устройств не проверено"
+fi
+
+# --- 5. локи с мёртвыми владельцами -----------------------------------------
 # Локи живут в DSS, а не в памяти процесса: убить phobosd недостаточно.
 for kind in dir drive; do
     out=$(phobos "$kind" list -o all 2>/dev/null)
