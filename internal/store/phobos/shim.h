@@ -24,8 +24,8 @@ static inline void tapegw_fini(void) { phobos_fini(); }
 /* Записать объект из открытого файла. Данные читаются от текущей позиции,
  * поэтому позицию обязана выставить вызывающая сторона (store.Rewind). */
 int tapegw_put(const char *objid, int fd, long size, int family,
-               const char *library, const char *layout_name, char **keys,
-               char **vals, int nattrs, long *tid_out);
+               const char *layout_name, char **keys, char **vals, int nattrs,
+               long *tid_out);
 
 /* Метаданные объекта: размер и версия. *found = 0, если объекта нет. */
 int tapegw_getmd(const char *objid, long *size_out, int *version_out,
