@@ -231,6 +231,24 @@ func (c *Client) Put(in PutIn) (*Result, error) {
 // сама сверяет SHA-256: байты с неверным хвостом сегмента GCM иначе всплывают
 // только при чтении клиентом, а mover обязан отказать до того, как байты
 // попадут в кэш.
+// Release освобождает буфер, удержанный по hold: все копии записаны.
+func (c *Client) Release(op uuid.UUID) (*Result, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := WriteJSON(c.conn, Release{Type: "release", Op: op}); err != nil {
+		return nil, err
+	}
+	for {
+		res, _, err := c.readControl(c.opTimeout)
+		if err != nil {
+			return nil, err
+		}
+		if res != nil {
+			return res, nil
+		}
+	}
+}
+
 func (c *Client) Get(op, id uuid.UUID, w io.Writer) (*Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

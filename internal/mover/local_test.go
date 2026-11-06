@@ -344,3 +344,38 @@ func TestPutExistingCompleteIsOKIncompleteIsNot(t *testing.T) {
 		t.Fatalf("неполная копия: %s, ждали incomplete", res.Code)
 	}
 }
+
+// Свойство «держать буфер ровно сколько нужно» двустороннее, и проверять надо
+// обе половины: пока копии пишутся — буфер жив; после release — буфера нет.
+// Тест только первой половины пропустил бы мутацию «никогда не освобождать».
+func TestHeldBufferReleasedByCommand(t *testing.T) {
+	e := startEnv(t, 1<<20)
+	c := e.dial(t)
+
+	body := bytes.Repeat([]byte("held"), 600)
+	src := uuid.New()
+	if _, err := c.Put(mover.PutIn{Op: src, ID: src, Size: int64(len(body)), SHA256: sum(body), Hold: true, Body: bytes.NewReader(body)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// «Не раньше»: копии пишутся — буфер жив.
+	mid := uuid.New()
+	res, err := c.Put(mover.PutIn{Op: mid, ID: mid, Size: int64(len(body)), SHA256: sum(body), FromOp: src, Body: poisonReader{}})
+	if err != nil || res.Code != mover.CodeOK {
+		t.Fatalf("копия при живом буфере: %v %+v", err, res)
+	}
+
+	// «Не позже»: все копии записаны, буфер освобождён — копировать больше
+	// нечего, и mover обязан сказать об этом, а не писать из остатков.
+	if r, err := c.Release(src); err != nil || r.Code != mover.CodeOK {
+		t.Fatalf("release: %v %+v", err, r)
+	}
+	last := uuid.New()
+	res, err = c.Put(mover.PutIn{Op: last, ID: last, Size: int64(len(body)), SHA256: sum(body), FromOp: src, Body: poisonReader{}})
+	if err != nil {
+		t.Fatalf("put после release: %v", err)
+	}
+	if res.Code != mover.CodeNotFound {
+		t.Fatalf("копия после release прошла (%s): буфер не освобождён", res.Code)
+	}
+}

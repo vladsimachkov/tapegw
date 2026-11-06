@@ -423,3 +423,119 @@ WHERE id = $1 AND state = 'writing'`, copyID, mediaID)
 	}
 	return nil
 }
+
+// --- С5/С6: несколько копий пачки из одного буфера --------------------------
+//
+// Пачка становится 'archived' только когда записаны ВСЕ копии политики (С5).
+// Сбой одной копии не откатывает остальные (С6): записанная копия остаётся
+// 'done', недостающая догоняется отдельно.
+
+// RecordPackCopy записывает одну готовую копию пачки. Отдельно от перевода
+// объектов в 'archived' именно потому, что копий может быть несколько: каждая
+// готова в свой момент, а 'archived' — событие про все сразу.
+func (m *Meta) RecordPackCopy(ctx context.Context, packID uuid.UUID, spec, phobosOID string, version, format int, sha256 []byte, mediumID int64) (uuid.UUID, error) {
+	if len(sha256) != 32 {
+		return uuid.Nil, fmt.Errorf("meta: сумма копии %d байт, ждали 32", len(sha256))
+	}
+	if spec == "" {
+		return uuid.Nil, fmt.Errorf("meta: копия без spec")
+	}
+	var id uuid.UUID
+	err := m.Pool.QueryRow(ctx, `
+INSERT INTO archive_copies (pack_id, spec, phobos_oid, phobos_version, format, state, sha256, medium_id, done_at)
+VALUES ($1, $2, $3, $4, $5, 'done', $6, NULLIF($7, 0), now())
+RETURNING id`, packID, spec, phobosOID, version, format, sha256, mediumID).Scan(&id)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("meta: записать копию пачки: %w", err)
+	}
+	return id, nil
+}
+
+// FailPackCopy помечает копию мёртвой, не трогая остальные (С6). Записанное до
+// сбоя остаётся записанным: откатывать копию, которая лежит на ленте, — значит
+// потерять данные ради формы.
+func (m *Meta) FailPackCopy(ctx context.Context, packID uuid.UUID, spec, reason string) error {
+	tag, err := m.Pool.Exec(ctx, `
+UPDATE archive_copies SET state = 'dead', attrs = coalesce(attrs,'{}') || jsonb_build_object('reason', $3)
+WHERE pack_id = $1 AND spec = $2 AND state IN ('pending','writing')`, packID, spec, reason)
+	if err != nil {
+		return fmt.Errorf("meta: пометить копию мёртвой: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("meta: живой копии %s у пачки %s нет", spec, packID)
+	}
+	return nil
+}
+
+// MissingCopySpecs — спецификации, которых пачке не хватает. Мёртвая копия
+// считается недостающей: её догоняют отдельно, и точечно, а не всей пачкой.
+func (m *Meta) MissingCopySpecs(ctx context.Context, packID uuid.UUID, specs []string) ([]string, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	rows, err := m.Pool.Query(ctx, `
+SELECT spec FROM unnest($2::text[]) AS want(spec)
+WHERE NOT EXISTS (
+	SELECT 1 FROM archive_copies c
+	WHERE c.pack_id = $1 AND c.spec = want.spec AND c.state = 'done')`, packID, specs)
+	if err != nil {
+		return nil, fmt.Errorf("meta: недостающие копии: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ArchivePackWhenCopiesDone переводит пачку и участников в 'archived', только
+// когда все нужные копии записаны. Возвращает false, если копий не хватает:
+// это не ошибка, а «ещё не готово» — остальное догонит следующий проход.
+func (m *Meta) ArchivePackWhenCopiesDone(ctx context.Context, packID uuid.UUID, placements []Placement, specs []string, workerID string) (bool, error) {
+	if workerID == "" {
+		return false, fmt.Errorf("meta: завершение пачки без workerID")
+	}
+	missing, err := m.MissingCopySpecs(ctx, packID, specs)
+	if err != nil {
+		return false, err
+	}
+	if len(missing) > 0 {
+		return false, nil
+	}
+	tx, err := m.Pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("meta: начать итог пачки: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	for _, pl := range placements {
+		tag, err := tx.Exec(ctx, `
+UPDATE objects SET state = 'archived', archived_at = now()
+WHERE id = $3 AND pack_id = $1 AND pack_offset = $2 AND state = 'archiving'`,
+			packID, pl.Offset, pl.Version)
+		if err != nil {
+			return false, fmt.Errorf("meta: перевести в archived: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return false, fmt.Errorf("meta: участник %s не из этой пачки или не запечатан", pl.Version)
+		}
+	}
+	tag, err := tx.Exec(ctx, `
+UPDATE packs SET state = 'archived', archived_at = now(), claimed_by = NULL, claim_expires_at = NULL
+WHERE id = $1 AND state = 'sealed' AND claimed_by = $2`, packID, workerID)
+	if err != nil {
+		return false, fmt.Errorf("meta: закрыть пачку: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return false, fmt.Errorf("meta: пачка %s не запечатана или захвачена не им", packID)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("meta: записать итог пачки: %w", err)
+	}
+	return true, nil
+}

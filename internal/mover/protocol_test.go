@@ -409,6 +409,7 @@ func TestMessageFieldsHaveNoKeys(t *testing.T) {
 		// операции того же mover'а.
 		"Put":      {"t", "op", "size", "sha256", "attrs", "tags", "no_split", "from_op", "hold"},
 		"Get":      {"t", "op", "id", "offset", "length"},
+		"Release":  {"t", "op"},
 		"Status":   {"t", "op"},
 		"Ready":    {"t", "op", "offset", "credits"},
 		"Credit":   {"t", "op", "credits"},
@@ -451,6 +452,8 @@ func lookupMessage(name string) (reflect.Type, bool) {
 		return reflect.TypeOf(mover.HelloOk{}), true
 	case "Put":
 		return reflect.TypeOf(mover.Put{}), true
+	case "Release":
+		return reflect.TypeOf(mover.Release{}), true
 	case "Get":
 		return reflect.TypeOf(mover.Get{}), true
 	case "Status":

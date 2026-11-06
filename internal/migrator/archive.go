@@ -24,6 +24,10 @@ type Putter interface {
 	// Status нужен не для отчётов, а для разбора неизвестного итога: после
 	// обрыва соединения tapegw не знает, записалась пачка или нет.
 	Status(op uuid.UUID) (*mover.Result, error)
+
+	// Release говорит mover'у, что удержанный буфер больше не нужен: все
+	// копии записаны. Без него буфер висел бы до result_ttl.
+	Release(op uuid.UUID) (*mover.Result, error)
 }
 
 // definiteRefusals — коды, по которым известно: на ленту ничего не попало.
@@ -45,6 +49,14 @@ type Archiver struct {
 	// различаться (ADR-0022), и по format читатель выбирает декодер.
 	Spec   string
 	Format int
+
+	// Specs — все спецификации копий политики; Spec — первая, она пишется
+	// обычным put и держит буфер (hold) для остальных. Пусто — копия одна.
+	Specs []string
+
+	// MoverFor выбирает mover по спецификации: копии лежат на разных носителях,
+	// значит пишутся разными драйвами. Если не задан, все копии пишет Put.
+	MoverFor func(spec string) (Putter, error)
 
 	// Log — куда писать про ленту вне реестра. По умолчанию slog.Default().
 	Log *slog.Logger
@@ -77,7 +89,10 @@ func (a *Archiver) sendPack(ctx context.Context, packID uuid.UUID, plan *Plan, a
 		Size:   plan.Size,
 		SHA256: plan.SHA256,
 		Attrs:  attrs,
-		Body:   bytes.NewReader(body),
+		// Буфер держим, только если с него пойдут копии: иначе mover освободит
+		// данные сразу, и второй копии нечего читать и не с чем сверять.
+		Hold: len(a.copySpecs()) > 1,
+		Body: bytes.NewReader(body),
 	})
 }
 
@@ -314,10 +329,102 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 				"label", res.Extents[0], "pack", packID.String(), "spec", a.Spec)
 		}
 	}
-	if err := a.Meta.FinishPackArchive(ctx, packID, metaPlacements(placements), a.Spec, packID.String(), res.Version, a.Format, raw, mediumID, a.WorkerID); err != nil {
+	// С5: первая копия записана. Пачка ещё НЕ archived — «архивирован» значит
+	// «записаны все копии политики», а не «одна легла».
+	if _, err := a.Meta.RecordPackCopy(ctx, packID, a.Spec, packID.String(), res.Version, a.Format, raw, mediumID); err != nil {
 		return nil, err
 	}
+	if err := a.writeExtraCopies(ctx, packID, plan, attrs); err != nil {
+		return nil, err
+	}
+	done, err := a.Meta.ArchivePackWhenCopiesDone(ctx, packID, metaPlacements(placements), a.copySpecs(), a.WorkerID)
+	if err != nil {
+		return nil, err
+	}
+	if !done {
+		// С6: часть копий не дошла. Записанные остаются записанными, объекты
+		// ждут в 'archiving', недостающие догоняет отдельный проход.
+		a.logger().Warn("пачка записана не полностью — ждёт догонки копий",
+			"pack", packID.String())
+		return plan, nil
+	}
+	// Буфер держали ради копий (hold); копии готовы — освобождаем. Оставлять до
+	// result_ttl нельзя: буфер считается из «двух батчей на драйв», и при двух
+	// копиях он заполнится висящими пачками.
+	if len(a.copySpecs()) > 1 {
+		if _, err := a.Put.Release(packID); err != nil {
+			a.logger().Error("освободить буфер не вышло — снимет result_ttl",
+				"pack", packID.String(), "err", err.Error())
+		}
+	}
 	return plan, nil
+}
+
+// copySpecs — спецификации копий политики. Если задан только Spec, копия одна.
+func (a *Archiver) copySpecs() []string {
+	if len(a.Specs) > 0 {
+		return a.Specs
+	}
+	return []string{a.Spec}
+}
+
+// writeExtraCopies пишет остальные копии из буфера первой (Ф0.4): ленту и
+// буфер читают один раз, байты по сети не идут.
+//
+// Сбой копии не откатывает остальные (С6): записанное на ленту остаётся,
+// недостающая копия помечается и догоняется отдельно. Пачка при этом не
+// 'archived' — это и есть сигнал «чего-то не хватает».
+func (a *Archiver) writeExtraCopies(ctx context.Context, packID uuid.UUID, plan *Plan, attrs map[string]string) error {
+	specs := a.copySpecs()
+	if len(specs) <= 1 {
+		return nil
+	}
+	raw, err := hex.DecodeString(plan.SHA256)
+	if err != nil {
+		return fmt.Errorf("migrator: сумма плана не hex: %w", err)
+	}
+	for _, spec := range specs[1:] {
+		mv := a.Put
+		if a.MoverFor != nil {
+			var err error
+			if mv, err = a.MoverFor(spec); err != nil {
+				a.logger().Error("копия не написана: нет mover'а",
+					"pack", packID.String(), "spec", spec, "err", err.Error())
+				continue
+			}
+		}
+		res, err := mv.Put(mover.PutIn{
+			Op: packID, ID: packID, Size: plan.Size, SHA256: plan.SHA256,
+			Attrs: attrs, FromOp: packID,
+		})
+		if err != nil || res == nil || res.Code != mover.CodeOK {
+			code := "transport"
+			if res != nil {
+				code = string(res.Code)
+			}
+			a.logger().Error("копия не записана, будет догнана",
+				"pack", packID.String(), "spec", spec, "code", code, "err", errString(err))
+			continue
+		}
+		var mediumID int64
+		if len(res.Extents) > 0 {
+			mediumID, err = a.Meta.MediaIDByLabel(ctx, res.Extents[0])
+			if err != nil {
+				return err
+			}
+		}
+		if _, err := a.Meta.RecordPackCopy(ctx, packID, spec, packID.String(), res.Version, a.Format, raw, mediumID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // LoadItems поднимает участников по id: файлы на landing, обёрнутые DEK,
