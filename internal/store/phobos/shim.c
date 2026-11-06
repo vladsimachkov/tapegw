@@ -7,7 +7,8 @@
 
 int tapegw_put(const char *objid, int fd, long size, int family,
                const char *library, const char *layout_name, char **keys,
-               char **vals, int nattrs, long *tid_out) {
+               char **vals, int nattrs, char **lyt_keys, char **lyt_vals,
+               int nlyt, long *tid_out) {
     *tid_out = tapegw_tid();
 
     struct pho_xfer_desc xd;
@@ -21,6 +22,9 @@ int tapegw_put(const char *objid, int fd, long size, int family,
     xd.xd_params.put.family = (enum rsc_family)family;
     xd.xd_params.put.library = library;
     xd.xd_params.put.layout_name = layout_name;
+    for (int i = 0; i < nlyt; i++)
+        pho_attr_set(&xd.xd_params.put.lyt_params, lyt_keys[i], lyt_vals[i]);
+
     xd.xd_ntargets = 1;
     xd.xd_targets = calloc(1, sizeof(struct pho_xfer_target));
     if (xd.xd_targets == NULL)

@@ -23,9 +23,13 @@ static inline void tapegw_fini(void) { phobos_fini(); }
 
 /* Записать объект из открытого файла. Данные читаются от текущей позиции,
  * поэтому позицию обязана выставить вызывающая сторона (store.Rewind). */
+/* lyt_keys/lyt_vals — параметры layout (например repl_count). Phobos берёт их
+   из xd_params.put.lyt_params, и без них layout получает значение по умолчанию:
+   raid1 без repl_count требует два устройства и на одном даёт ENODEV. */
 int tapegw_put(const char *objid, int fd, long size, int family,
                const char *library, const char *layout_name, char **keys,
-               char **vals, int nattrs, long *tid_out);
+               char **vals, int nattrs, char **lyt_keys, char **lyt_vals,
+               int nlyt, long *tid_out);
 
 /* Метаданные объекта: размер и версия. *found = 0, если объекта нет. */
 int tapegw_getmd(const char *objid, long *size_out, int *version_out,

@@ -181,6 +181,12 @@ func (s *Store) putOne(it store.PutItem, opt store.PutOptions) error {
 	keys, vals, freeAttrs := cAttrs(it.Attrs)
 	defer freeAttrs()
 
+	// Параметры layout передаются явно: без них Phobos берёт значение по
+	// умолчанию, а raid1 без repl_count требует два устройства и на одном
+	// даёт ENODEV без какой-либо ошибки в журнале phobosd.
+	lkeys, lvals, freeLyt := cAttrs(opt.LayoutParams)
+	defer freeLyt()
+
 	runtime.KeepAlive(it.File)
 	var tid C.long
 	cl := cstr(opt.Layout)
@@ -190,7 +196,7 @@ func (s *Store) putOne(it store.PutItem, opt store.PutOptions) error {
 
 	rc := C.tapegw_put(id, C.int(it.File.Fd()), C.long(it.Size),
 		C.int(familyOf(opt.Family)), clib, cl, keys, vals,
-		C.int(len(it.Attrs)), &tid)
+		C.int(len(it.Attrs)), lkeys, lvals, C.int(len(opt.LayoutParams)), &tid)
 	s.noteTID(tid)
 	switch {
 	case rc == 0:
