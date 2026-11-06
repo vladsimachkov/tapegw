@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 
 	"github.com/google/uuid"
 )
@@ -42,19 +43,26 @@ func AttrSize(attrs map[string]string) int {
 	return len(b)
 }
 
-// PutItem — один объект в батче записи. Reader читается до конца самим
-// хранилищем; закрывать его не нужно.
+// PutItem — один объект в батче записи. File — открытый файл с данными,
+// читаемый с самого начала; закрывает его вызывающий.
+//
+// Файл, а не io.Reader, потому что Phobos принимает данные дескриптором
+// (xt_fd) и требует размер заранее. К моменту вызова store.Put данные уже лежат
+// в файле буфера mover'а (#81, putReader), так что второй проход по диску не
+// нужен. Pipe не подходит: не проверено, что phobos_put умеет в
+// неперематываемый дескриптор, а размер всё равно надо знать заранее.
 type PutItem struct {
-	ID     uuid.UUID
-	Reader io.Reader
-	Size   int64
-	Attrs  map[string]string
+	ID    uuid.UUID
+	File  *os.File
+	Size  int64
+	Attrs map[string]string
 }
 
-// GetItem — один объект в батче чтения. Writer — куда писать прочитанное.
+// GetItem — один объект в батче чтения. File — открытый файл, куда хранилище
+// запишет данные (тоже файл буфера mover'а).
 type GetItem struct {
-	ID     uuid.UUID
-	Writer io.Writer
+	ID   uuid.UUID
+	File *os.File
 }
 
 // Result — итог по одному объекту батча. Батч может частично удалиться,

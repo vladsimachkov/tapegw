@@ -1,9 +1,10 @@
 package fake_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -13,6 +14,48 @@ import (
 	"github.com/vladsimachkov/tapegw/internal/store/fake"
 )
 
+// putFile — файл с данными для PutItem. Хранилище принимает открытые файлы,
+// поэтому и тест готовит файл, а не bytes.Reader: иначе fake и настоящая
+// реализация принимали бы разное.
+func putFile(t *testing.T, body string) *os.File {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "put")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// getFile — файл для GetItem, из которого потом читают результат.
+func getFile(t *testing.T) *os.File {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "get")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+func readBack(t *testing.T, f *os.File) string {
+	t.Helper()
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
 // Смысл этих тестов не в том, что fake что-то хранит, а в том, что он
 // предсказуемо отказывает **как настоящий Phobos**. Тесты migrator на fake не
 // должны проходить там, где на ленте всё упало, поэтому здесь прямо закреплены
@@ -20,23 +63,23 @@ import (
 // неполная копия после обрыва (M0-02), ENOSPC без побочных эффектов и EEXIST
 // на повторную запись.
 
-func put(s *fake.Store, id uuid.UUID, body string, attrs map[string]string) store.Result {
+func put(t *testing.T, s *fake.Store, id uuid.UUID, body string, attrs map[string]string) store.Result {
 	return s.Put(context.Background(),
-		[]store.PutItem{{ID: id, Reader: strings.NewReader(body), Size: int64(len(body)), Attrs: attrs}},
+		[]store.PutItem{{ID: id, File: putFile(t, body), Size: int64(len(body)), Attrs: attrs}},
 		store.PutOptions{Family: "dir"})[0]
 }
 
-func get(s *fake.Store, id uuid.UUID) ([]byte, error) {
-	var buf bytes.Buffer
-	r := s.Get(context.Background(), []store.GetItem{{ID: id, Writer: &buf}})[0]
-	return buf.Bytes(), r.Err
+func get(t *testing.T, s *fake.Store, id uuid.UUID) ([]byte, error) {
+	dst := getFile(t)
+	r := s.Get(context.Background(), []store.GetItem{{ID: id, File: dst}})[0]
+	return []byte(readBack(t, dst)), r.Err
 }
 
 func TestPutGetRoundTrip(t *testing.T) {
 	s := fake.New()
 	id := uuid.New()
 
-	res := put(s, id, "hello tape", map[string]string{"key": "a.txt"})
+	res := put(t, s, id, "hello tape", map[string]string{"key": "a.txt"})
 	if res.Err != nil {
 		t.Fatalf("Put: %v", res.Err)
 	}
@@ -55,7 +98,7 @@ func TestPutGetRoundTrip(t *testing.T) {
 		t.Errorf("успешная запись обязана быть Complete")
 	}
 
-	data, err := get(s, id)
+	data, err := get(t, s, id)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -79,7 +122,7 @@ func TestFaultFiresOnNthCall(t *testing.T) {
 	s.InjectFault("put", &fake.Fault{FailOn: 2, Err: boom})
 
 	call := func() error {
-		return put(s, uuid.New(), "x", nil).Err
+		return put(t, s, uuid.New(), "x", nil).Err
 	}
 
 	if err := call(); err != nil {
@@ -107,7 +150,7 @@ func TestBatchIsAtomicOnError(t *testing.T) {
 	ids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
 	items := make([]store.PutItem, 0, len(ids))
 	for _, id := range ids {
-		items = append(items, store.PutItem{ID: id, Reader: strings.NewReader("payload"), Size: 7})
+		items = append(items, store.PutItem{ID: id, File: putFile(t, "payload"), Size: 7})
 	}
 	for i, r := range s.Put(context.Background(), items, store.PutOptions{}) {
 		if !errors.Is(r.Err, boom) {
@@ -131,7 +174,7 @@ func TestCrashLeavesIncompleteCopy(t *testing.T) {
 	id := uuid.New()
 
 	s.InjectFault("put", &fake.Fault{FailOn: 1})
-	if r := put(s, id, "data", nil); !errors.Is(r.Err, store.ErrIncomplete) {
+	if r := put(t, s, id, "data", nil); !errors.Is(r.Err, store.ErrIncomplete) {
 		t.Errorf("ожидали ErrIncomplete, получили %v", r.Err)
 	}
 	if s.Len() != 1 {
@@ -145,7 +188,7 @@ func TestCrashLeavesIncompleteCopy(t *testing.T) {
 	if meta.Complete {
 		t.Errorf("Stat врал бы: getmd возвращает объект и при неполной копии")
 	}
-	if _, err := get(s, id); !errors.Is(err, store.ErrIncomplete) {
+	if _, err := get(t, s, id); !errors.Is(err, store.ErrIncomplete) {
 		t.Errorf("Get неполной копии: ожидали ErrIncomplete, получили %v", err)
 	}
 
@@ -156,7 +199,7 @@ func TestCrashLeavesIncompleteCopy(t *testing.T) {
 	if !s.Complete(id) {
 		t.Fatalf("после MarkComplete объект обязан стать полным")
 	}
-	data, err := get(s, id)
+	data, err := get(t, s, id)
 	if err != nil || string(data) != "data" {
 		t.Errorf("Get после дописки: %q, %v", data, err)
 	}
@@ -170,9 +213,9 @@ func TestNoSpaceHasNoSideEffects(t *testing.T) {
 	s.SetCapacity(10)
 
 	items := []store.PutItem{
-		{ID: uuid.New(), Reader: strings.NewReader("12345"), Size: 5},
-		{ID: uuid.New(), Reader: strings.NewReader("67890"), Size: 5},
-		{ID: uuid.New(), Reader: strings.NewReader("abcde"), Size: 5},
+		{ID: uuid.New(), File: putFile(t, "12345"), Size: 5},
+		{ID: uuid.New(), File: putFile(t, "67890"), Size: 5},
+		{ID: uuid.New(), File: putFile(t, "abcde"), Size: 5},
 	}
 	res := s.Put(context.Background(), items, store.PutOptions{})
 	for i, r := range res {
@@ -185,7 +228,7 @@ func TestNoSpaceHasNoSideEffects(t *testing.T) {
 	}
 
 	// Тот же батч по частям проходит — значит дело в объёме, а не в данных.
-	if r := put(s, uuid.New(), "12345", nil); r.Err != nil {
+	if r := put(t, s, uuid.New(), "12345", nil); r.Err != nil {
 		t.Fatalf("первый объект должен влезть: %v", r.Err)
 	}
 }
@@ -196,15 +239,15 @@ func TestNoSpaceHasNoSideEffects(t *testing.T) {
 func TestRewriteSameIDIsEEXIST(t *testing.T) {
 	s := fake.New()
 	id := uuid.New()
-	if r := put(s, id, "original", nil); r.Err != nil {
+	if r := put(t, s, id, "original", nil); r.Err != nil {
 		t.Fatalf("первый Put: %v", r.Err)
 	}
 
 	// Второй батч: один oid новый, второй — повтор. Отказывает весь батч.
 	a, b := uuid.New(), id
 	items := []store.PutItem{
-		{ID: a, Reader: strings.NewReader("new"), Size: 3},
-		{ID: b, Reader: strings.NewReader("clobber"), Size: 7},
+		{ID: a, File: putFile(t, "new"), Size: 3},
+		{ID: b, File: putFile(t, "clobber"), Size: 7},
 	}
 	for i, r := range s.Put(context.Background(), items, store.PutOptions{}) {
 		if !errors.Is(r.Err, store.ErrExists) {
@@ -214,7 +257,7 @@ func TestRewriteSameIDIsEEXIST(t *testing.T) {
 	if s.Len() != 1 {
 		t.Errorf("EEXIST отсекает весь батч, ожидали 1 объект, получили %d", s.Len())
 	}
-	data, err := get(s, id)
+	data, err := get(t, s, id)
 	if err != nil || string(data) != "original" {
 		t.Errorf("данные существующего объекта не должны измениться: %q, %v", data, err)
 	}
@@ -227,7 +270,7 @@ func TestAttrsOverBudgetRejectedBeforeWrite(t *testing.T) {
 	id := uuid.New()
 	big := map[string]string{"tapegw.dek": strings.Repeat("A", store.AttrBudgetBytes)}
 
-	if r := put(s, id, "data", big); !errors.Is(r.Err, store.ErrAttrTooLarge) {
+	if r := put(t, s, id, "data", big); !errors.Is(r.Err, store.ErrAttrTooLarge) {
 		t.Errorf("ожидали ErrAttrTooLarge, получили %v", r.Err)
 	}
 	if s.Len() != 0 {
@@ -242,7 +285,7 @@ func TestAttrsOverBudgetRejectedBeforeWrite(t *testing.T) {
 	if store.AttrSize(ok) > store.AttrBudgetBytes {
 		t.Skipf("границу не удалось подобрать: %d", store.AttrSize(ok))
 	}
-	if r := put(s, uuid.New(), "data", ok); r.Err != nil {
+	if r := put(t, s, uuid.New(), "data", ok); r.Err != nil {
 		t.Errorf("атрибуты ровно в лимит обязаны проходить: %v", r.Err)
 	}
 }
@@ -272,7 +315,7 @@ func TestLocateDefaultsToUnsupported(t *testing.T) {
 func TestExtentsReportsMedia(t *testing.T) {
 	s := fake.New()
 	id := uuid.New()
-	if r := put(s, id, "data", nil); r.Err != nil {
+	if r := put(t, s, id, "data", nil); r.Err != nil {
 		t.Fatalf("Put: %v", r.Err)
 	}
 	ext, err := s.Extents(context.Background(), []uuid.UUID{id})
