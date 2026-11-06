@@ -227,6 +227,17 @@ func (s *Server) handle(conn net.Conn) {
 				return
 			}
 			carry = s.handlePut(tconn, &p)
+		case "release":
+			var r Release
+			if err := Decode(f, &r); err != nil || r.Op == uuid.Nil {
+				return
+			}
+			// Освобождение идемпотентно: повтор после обрыва не ошибка.
+			code := CodeOK
+			if err := s.reg.ReleaseData(r.Op); err != nil {
+				code = CodeIO
+			}
+			_ = WriteJSON(tconn, Result{Type: "result", Op: r.Op, Code: code, State: StateDone})
 		case "get":
 			var g Get
 			if err := Decode(f, &g); err != nil {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,9 +56,61 @@ type probeMover struct {
 	block       chan struct{} // если задан — put ждёт в него перед записи
 	code        mover.Code    // если задан — put вернёт этот код вместо ok
 	puts        int           // сколько раз put реально вызывали
+
+	// С5/С6: держал ли mover буфер для копий, и из какого буфера писалась
+	// копия; сколько раз буфер освобождали.
+	lastHold   bool
+	lastFromOp uuid.UUID
+	lastTags   []string
+	copyCode   mover.Code // если задан — put с from_op вернёт этот код
+	holds      int        // сколько put приходили с hold
+	releases   int
+}
+
+func (p *probeMover) Release(op uuid.UUID) (*mover.Result, error) {
+	p.releases++
+	return &mover.Result{Op: op, Code: mover.CodeOK}, nil
 }
 
 func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
+	p.lastHold, p.lastFromOp = in.Hold, in.FromOp
+	if in.Hold {
+		p.holds++
+	}
+	p.lastID, p.lastTags = in.ID, append([]string(nil), in.Tags...)
+	if p.written == nil {
+		p.written = map[uuid.UUID]int{}
+	}
+	// Fake обязан вести себя как настоящий mover там, где настоящее известно,
+	// иначе тест зелёный по пути, которого в продукте нет. Правила — дословно
+	// из handlePutFrom и из «oid объекта = UUID операции».
+	if in.ID != in.Op {
+		return nil, errors.New("fake: oid обязан равняться op")
+	}
+	if in.FromOp != uuid.Nil {
+		if in.FromOp == in.Op {
+			return &mover.Result{Op: in.Op, Code: mover.CodeOpConflict, State: mover.StateFailed}, nil
+		}
+		if p.written[in.FromOp] == 0 {
+			// Буфер принадлежит конкретному mover'у: чужого источника нет.
+			return &mover.Result{Op: in.Op, Code: mover.CodeNotFound, State: mover.StateFailed}, nil
+		}
+		if p.copyCode != "" {
+			return &mover.Result{Op: in.Op, Code: p.copyCode, State: mover.StateFailed}, nil
+		}
+	}
+	// from_op: байтов по сети нет, mover читает свой буфер. Сумму здесь не
+	// сверяют — её сверяет mover с файла; тест фиксирует сам факт передачи.
+	if in.Body == nil {
+		if in.FromOp == uuid.Nil {
+			return nil, errors.New("put без тела и без from_op")
+		}
+		if p.written == nil {
+			p.written = map[uuid.UUID]int{}
+		}
+		p.written[in.Op]++
+		return &mover.Result{Op: in.Op, Code: mover.CodeOK, Version: 1, Extents: []string{p.medium}}, nil
+	}
 	body, err := io.ReadAll(in.Body)
 	if err != nil {
 		return nil, err
@@ -739,4 +792,151 @@ func TestIncompleteBlocksPack(t *testing.T) {
 	if st != "archiving" {
 		t.Errorf("объект в %s, ждали archiving", st)
 	}
+}
+
+// --- С5/С6: несколько копий из одного буфера ---------------------------------
+
+func objectState(t *testing.T, m *meta.Meta, ctx context.Context, id uuid.UUID) string {
+	t.Helper()
+	var st string
+	if err := m.Pool.QueryRow(ctx, `SELECT state::text FROM objects WHERE id = $1`, id).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+func copySpecsDone(t *testing.T, m *meta.Meta, ctx context.Context, packID uuid.UUID) []string {
+	t.Helper()
+	rows, err := m.Pool.Query(ctx,
+		`SELECT spec FROM archive_copies WHERE pack_id = $1 AND state = 'done' ORDER BY spec`, packID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func copyOids(t *testing.T, m *meta.Meta, ctx context.Context, packID uuid.UUID) []string {
+	t.Helper()
+	rows, err := m.Pool.Query(ctx,
+		`SELECT phobos_oid FROM archive_copies WHERE pack_id = $1 AND state = 'done' ORDER BY spec`, packID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func packIDOf(t *testing.T, m *meta.Meta, ctx context.Context) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := m.Pool.QueryRow(ctx, `SELECT id FROM packs ORDER BY created_at DESC LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// С5: пачка 'archived' только когда записаны все копии. Первый put держит буфер,
+// вторая копия пишется из него же (from_op), буфер освобождается после всех.
+func TestPackArchivedOnlyAfterAllCopies(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "copies", 2)
+	a, pm := archiver(t, m, ids[0])
+	a.Spec = "side:left"
+	a.Specs = []string{"side:left", "side:right"}
+	a.SpecTags = map[string][]string{"side:left": {"side:left"}, "side:right": {"side:right"}}
+
+	plan, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil)
+	if err != nil {
+		t.Fatalf("архивация: %v", err)
+	}
+	_ = plan
+	if pm.holds != 1 {
+		t.Errorf("put с hold: %d, ждали 1 — первый put обязан держать буфер", pm.holds)
+	}
+	packID := packIDOf(t, m, ctx)
+	if got := copySpecsDone(t, m, ctx, packID); len(got) != 2 {
+		t.Errorf("готовых копий: %v, ждали две", got)
+	}
+	// У каждой копии свой объект Phobos. Общий oid на обе — тихая потеря:
+	// вторая запись на тот же oid дала бы EEXIST, mover разобрал бы его как
+	// «целая копия», и в БД появилась бы «готовая» копия без записи на ленту.
+	oids := copyOids(t, m, ctx, packID)
+	if len(oids) != 2 || oids[0] == oids[1] {
+		t.Errorf("oid копий: %v — ждали два разных", oids)
+	}
+	if oids[1] == packID.String() {
+		t.Error("копия записана под oid пачки")
+	}
+	if pm.lastFromOp != packID {
+		t.Errorf("копия писалась не из буфера пачки: from_op=%s", pm.lastFromOp)
+	}
+	if strings.Join(pm.lastTags, ",") != "side:right" {
+		t.Errorf("теги копии: %v — копии не разведены тегами", pm.lastTags)
+	}
+	for _, id := range ids {
+		if st := objectState(t, m, ctx, id); st != "archived" {
+			t.Errorf("объект в %s, ждали archived", st)
+		}
+	}
+	if pm.releases != 1 {
+		t.Errorf("буфер освобождён %d раз, ждали 1 — иначе он висит до result_ttl", pm.releases)
+	}
+}
+
+// С6: сбой второй копии не откатывает первую и не роняет пачку. Объекты ждут в
+// 'archiving', недостающая копия видна как недостающая — её догоняют точечно.
+func TestSecondCopyFailureKeepsFirst(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "partial", 2)
+	a, pm := archiver(t, m, ids[0])
+	a.Spec = "side:left"
+	a.Specs = []string{"side:left", "side:right"}
+	pm.copyCode = mover.CodeNoSpace
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err != nil {
+		t.Fatalf("сбой копии не должен считаться отказом пачки: %v", err)
+	}
+	packID := packIDOf(t, m, ctx)
+	if got := copySpecsDone(t, m, ctx, packID); len(got) != 1 || got[0] != "side:left" {
+		t.Errorf("готовые копии: %v, ждали [side:left]", got)
+	}
+	for _, id := range ids {
+		if st := objectState(t, m, ctx, id); st != "archiving" {
+			t.Errorf("объект в %s: при неполном наборе копий архивировать нельзя", st)
+		}
+	}
+	missing, err := m.MissingCopySpecs(ctx, packID, []string{"side:left", "side:right"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 1 || missing[0] != "side:right" {
+		t.Errorf("недостающие копии: %v, ждали [side:right]", missing)
+	}
+	if pm.releases != 0 {
+		t.Error("буфер освобождён при незаписанных копиях — догонять будет нечего")
+	}
+
 }

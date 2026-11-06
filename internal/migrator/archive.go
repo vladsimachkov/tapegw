@@ -24,6 +24,10 @@ type Putter interface {
 	// Status нужен не для отчётов, а для разбора неизвестного итога: после
 	// обрыва соединения tapegw не знает, записалась пачка или нет.
 	Status(op uuid.UUID) (*mover.Result, error)
+
+	// Release говорит mover'у, что удержанный буфер больше не нужен: все
+	// копии записаны. Без него буфер висел бы до result_ttl.
+	Release(op uuid.UUID) (*mover.Result, error)
 }
 
 // definiteRefusals — коды, по которым известно: на ленту ничего не попало.
@@ -45,6 +49,22 @@ type Archiver struct {
 	// различаться (ADR-0022), и по format читатель выбирает декодер.
 	Spec   string
 	Format int
+
+	// Specs — все спецификации копий политики; Spec — первая, она пишется
+	// обычным put и держит буфер (hold) для остальных. Пусто — копия одна.
+	Specs []string
+
+	// SpecTags — теги Phobos по спецификации: копии разводят по носителям
+	// именно тегами (ADR-0013, ADR-0022). Без них «копия left» и «копия right»
+	// лягут туда, куда решит Phobos по умолчанию, в том числе на одну сторону,
+	// а вся цель разведения пропадёт.
+	SpecTags map[string][]string
+
+	// Копии пишет тот же mover, что держит буфер: реестр операций и буфер
+	// принадлежат конкретному mover'у, и другой на from_op ответит not_found.
+	// Параллельная запись копий разными драйвами требует общего буфера и
+	// реестра на сервер библиотеки — это записано в ADR-0021 как целевая форма,
+	// а не как то, что здесь забыли подключить.
 
 	// Log — куда писать про ленту вне реестра. По умолчанию slog.Default().
 	Log *slog.Logger
@@ -76,9 +96,41 @@ func (a *Archiver) sendPack(ctx context.Context, packID uuid.UUID, plan *Plan, a
 		ID:     packID, // oid Phobos = UUID пачки: повтор бьёт в тот же объект
 		Size:   plan.Size,
 		SHA256: plan.SHA256,
-		Attrs:  attrs,
-		Body:   bytes.NewReader(body),
+		Attrs:  a.attrsFor(attrs, a.Spec),
+		Tags:   a.SpecTags[a.Spec],
+		// Буфер держим, только если с него пойдут копии: иначе mover освободит
+		// данные сразу, и второй копии нечего читать и не с чем сверять.
+		Hold: len(a.copySpecs()) > 1,
+		Body: bytes.NewReader(body),
 	})
+}
+
+// copyOp — операция (и oid Phobos) одной копии. Детерминированная: UUIDv5 от
+// пачки и имени копии, чтобы повтор после обрыва бился в тот же объект Phobos,
+// а не плодил второй.
+//
+// У копии обязан быть свой oid: по ADR-0022 каждая копия — отдельный объект
+// Phobos. Общего oid на все копии быть не может: вторая запись на тот же oid
+// дала бы EEXIST, mover разобрал бы его как «целая копия» и вернул ok — то есть
+// копия считается записанной, а на ленте ничего не легло.
+//
+// Имя вида «<uuid>.left» здесь не используется: протокол связывает oid объекта с
+// UUID операции (иначе «продолжить передачу» и «записать заново» неразличимы),
+// поэтому уникальность даёт сам UUID. См. ADR-0022, поправка.
+func copyOp(packID uuid.UUID, spec string) uuid.UUID {
+	return uuid.NewSHA1(packID, []byte(spec))
+}
+
+// attrsFor — атрибуты конкретной копии: к общим добавляется tapegw.copy, он
+// пишется и когда копия одна (иначе rebuild-meta находит несколько
+// неразличимых записей об одном ключе).
+func (a *Archiver) attrsFor(base map[string]string, spec string) map[string]string {
+	out := make(map[string]string, len(base)+1)
+	for k, v := range base {
+		out[k] = v
+	}
+	out["tapegw.copy"] = spec
+	return out
 }
 
 // resolveUnknown разбирает итог операции, по которой оборвалась связь.
@@ -314,10 +366,98 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 				"label", res.Extents[0], "pack", packID.String(), "spec", a.Spec)
 		}
 	}
-	if err := a.Meta.FinishPackArchive(ctx, packID, metaPlacements(placements), a.Spec, packID.String(), res.Version, a.Format, raw, mediumID, a.WorkerID); err != nil {
+	// С5: первая копия записана. Пачка ещё НЕ archived — «архивирован» значит
+	// «записаны все копии политики», а не «одна легла».
+	if _, err := a.Meta.RecordPackCopy(ctx, packID, a.Spec, packID.String(), res.Version, a.Format, raw, mediumID); err != nil {
 		return nil, err
 	}
+	if err := a.writeExtraCopies(ctx, packID, plan, attrs); err != nil {
+		return nil, err
+	}
+	done, err := a.Meta.ArchivePackWhenCopiesDone(ctx, packID, metaPlacements(placements), a.copySpecs(), a.WorkerID)
+	if err != nil {
+		return nil, err
+	}
+	if !done {
+		// С6: часть копий не дошла. Записанные остаются записанными, объекты
+		// ждут в 'archiving', недостающие догоняет отдельный проход.
+		a.logger().Warn("пачка записана не полностью — ждёт догонки копий",
+			"pack", packID.String())
+		return plan, nil
+	}
+	// Буфер держали ради копий (hold); копии готовы — освобождаем. Оставлять до
+	// result_ttl нельзя: буфер считается из «двух батчей на драйв», и при двух
+	// копиях он заполнится висящими пачками.
+	if len(a.copySpecs()) > 1 {
+		if _, err := a.Put.Release(packID); err != nil {
+			a.logger().Error("освободить буфер не вышло — снимет result_ttl",
+				"pack", packID.String(), "err", err.Error())
+		}
+	}
 	return plan, nil
+}
+
+// copySpecs — спецификации копий политики. Если задан только Spec, копия одна.
+func (a *Archiver) copySpecs() []string {
+	if len(a.Specs) > 0 {
+		return a.Specs
+	}
+	return []string{a.Spec}
+}
+
+// writeExtraCopies пишет остальные копии из буфера первой (Ф0.4): ленту и
+// буфер читают один раз, байты по сети не идут.
+//
+// Сбой копии не откатывает остальные (С6): записанное на ленту остаётся,
+// недостающая копия помечается и догоняется отдельно. Пачка при этом не
+// 'archived' — это и есть сигнал «чего-то не хватает».
+func (a *Archiver) writeExtraCopies(ctx context.Context, packID uuid.UUID, plan *Plan, attrs map[string]string) error {
+	specs := a.copySpecs()
+	if len(specs) <= 1 {
+		return nil
+	}
+	raw, err := hex.DecodeString(plan.SHA256)
+	if err != nil {
+		return fmt.Errorf("migrator: сумма плана не hex: %w", err)
+	}
+	for _, spec := range specs[1:] {
+		mv := a.Put
+		op := copyOp(packID, spec)
+		res, err := mv.Put(mover.PutIn{
+			Op: op, ID: op, Size: plan.Size, SHA256: plan.SHA256,
+			Attrs:  a.attrsFor(attrs, spec),
+			Tags:   a.SpecTags[spec],
+			FromOp: packID,
+		})
+		if err != nil || res == nil || res.Code != mover.CodeOK {
+			code := "transport"
+			if res != nil {
+				code = string(res.Code)
+			}
+			a.logger().Error("копия не записана, будет догнана",
+				"pack", packID.String(), "spec", spec, "code", code, "err", errString(err))
+			continue
+		}
+		var mediumID int64
+		if len(res.Extents) > 0 {
+			mediumID, err = a.Meta.MediaIDByLabel(ctx, res.Extents[0])
+			if err != nil {
+				return err
+			}
+		}
+		// oid копии — её собственный объект Phobos, не oid пачки.
+		if _, err := a.Meta.RecordPackCopy(ctx, packID, spec, op.String(), res.Version, a.Format, raw, mediumID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // LoadItems поднимает участников по id: файлы на landing, обёрнутые DEK,

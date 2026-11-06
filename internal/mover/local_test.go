@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -342,5 +343,92 @@ func TestPutExistingCompleteIsOKIncompleteIsNot(t *testing.T) {
 	}
 	if res.Code != mover.CodeIncomplete {
 		t.Fatalf("неполная копия: %s, ждали incomplete", res.Code)
+	}
+}
+
+// Свойство «держать буфер ровно сколько нужно» двустороннее, и проверять надо
+// обе половины: пока копии пишутся — буфер жив; после release — буфера нет.
+// Тест только первой половины пропустил бы мутацию «никогда не освобождать».
+func TestHeldBufferReleasedByCommand(t *testing.T) {
+	e := startEnv(t, 1<<20)
+	c := e.dial(t)
+
+	body := bytes.Repeat([]byte("held"), 600)
+	src := uuid.New()
+	if _, err := c.Put(mover.PutIn{Op: src, ID: src, Size: int64(len(body)), SHA256: sum(body), Hold: true, Body: bytes.NewReader(body)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// «Не раньше»: копии пишутся — буфер жив.
+	mid := uuid.New()
+	res, err := c.Put(mover.PutIn{Op: mid, ID: mid, Size: int64(len(body)), SHA256: sum(body), FromOp: src, Body: poisonReader{}})
+	if err != nil || res.Code != mover.CodeOK {
+		t.Fatalf("копия при живом буфере: %v %+v", err, res)
+	}
+
+	// «Не позже»: все копии записаны, буфер освобождён — копировать больше
+	// нечего, и mover обязан сказать об этом, а не писать из остатков.
+	if r, err := c.Release(src); err != nil || r.Code != mover.CodeOK {
+		t.Fatalf("release: %v %+v", err, r)
+	}
+	last := uuid.New()
+	res, err = c.Put(mover.PutIn{Op: last, ID: last, Size: int64(len(body)), SHA256: sum(body), FromOp: src, Body: poisonReader{}})
+	if err != nil {
+		t.Fatalf("put после release: %v", err)
+	}
+	if res.Code != mover.CodeNotFound {
+		t.Fatalf("копия после release прошла (%s): буфер не освобождён", res.Code)
+	}
+}
+
+// Копии — разные объекты Phobos с разными тегами. Проверяется через настоящий
+// mover по настоящему протоколу, а не через подделку: fake, который принимает
+// то, что настоящий mover отвергает, делает тест зелёным по пути, которого в
+// продукте нет.
+func TestTwoCopiesAreDistinctObjects(t *testing.T) {
+	e := startEnv(t, 1<<20)
+	c := e.dial(t)
+
+	body := bytes.Repeat([]byte("pack"), 700)
+	src := uuid.New()
+	if _, err := c.Put(mover.PutIn{Op: src, ID: src, Size: int64(len(body)), SHA256: sum(body),
+		Attrs: map[string]string{"tapegw.copy": "left"}, Tags: []string{"side:left"},
+		Hold: true, Body: bytes.NewReader(body)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Копия: своя операция (и свой oid), тот же буфер, другие теги.
+	cp := uuid.NewSHA1(src, []byte("right"))
+	res, err := c.Put(mover.PutIn{Op: cp, ID: cp, Size: int64(len(body)), SHA256: sum(body),
+		Attrs: map[string]string{"tapegw.copy": "right"}, Tags: []string{"side:right"},
+		FromOp: src, Body: poisonReader{}})
+	if err != nil {
+		t.Fatalf("копия: %v", err)
+	}
+	if res.Code != mover.CodeOK {
+		t.Fatalf("копия: %s", res.Code)
+	}
+	if e.st.Len() != 2 {
+		t.Fatalf("объектов на ленте: %d, ждали 2", e.st.Len())
+	}
+	if got := strings.Join(e.st.Tags(src), ","); got != "side:left" {
+		t.Errorf("теги источника: %q", got)
+	}
+	if got := strings.Join(e.st.Tags(cp), ","); got != "side:right" {
+		t.Errorf("теги копии: %q — копии не разведены тегами", got)
+	}
+	if e.st.Attrs(cp)["tapegw.copy"] != "right" {
+		t.Errorf("атрибут копии: %v", e.st.Attrs(cp))
+	}
+
+	// Копия «из самой себя» отвергается: op == from_op.
+	same := uuid.New()
+	_ = same
+	res, err = c.Put(mover.PutIn{Op: src, ID: src, Size: int64(len(body)), SHA256: sum(body), FromOp: src, Body: poisonReader{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != mover.CodeOpConflict {
+		t.Errorf("op == from_op: %s, ждали op_conflict", res.Code)
 	}
 }

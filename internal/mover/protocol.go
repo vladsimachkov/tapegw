@@ -151,6 +151,15 @@ type Put struct {
 	Hold bool `json:"hold,omitempty"`
 }
 
+// Release говорит mover'у, что буфер, удержанный по hold, больше не нужен:
+// все копии политики записаны. Без команды буфер каждой пачки висел бы до
+// result_ttl — а он обязан быть длинным, чтобы tapegw успел забрать итог после
+// обрыва. result_ttl остаётся страховкой на случай, когда tapegw не вернулся.
+type Release struct {
+	Type string    `json:"t"`
+	Op   uuid.UUID `json:"op"`
+}
+
 // Get объявляет операцию чтения.
 type Get struct {
 	Type   string    `json:"t"`
