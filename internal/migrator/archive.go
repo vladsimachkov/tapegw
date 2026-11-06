@@ -262,13 +262,17 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 		// так же. До stat по oid (#101, полная часть) такой исход — сигнал
 		// человеку, а не повод повторять: повтор даёт тот же EEXIST, объекты
 		// висят в 'archiving' и держат landing молча.
-		// Состояние «застряла и ждёт человека» для такого исхода пока не
-		// заводится: см. задачу #101. Пока — громкий сигнал и отказ, пачка
-		// остаётся запечатанной с захватом, и продолжение придёт не раньше, чем
-		// истечёт ttl.
+		// Блокируем пачку, а не просто жалуемся: без блокировки продолжение
+		// через срок захвата переслало бы её целиком (гигабайты по сети),
+		// получило бы тот же exists — и по кругу. Раз в несколько минут,
+		// бесконечно.
 		a.logger().Error("пачка существует в Phobos, итог требует проверки",
 			"pack", packID.String(), "oid", packID.String(), "spec", a.Spec)
-		return nil, fmt.Errorf("mover: пачка %s уже существует в Phobos — итог надо разобрать (stat по oid), повтор её не решит", packID)
+		reason := fmt.Sprintf("phobos exists (oid=%s): нужен разбор stat по oid", packID)
+		if err := a.Meta.BlockPack(ctx, packID, reason); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("mover: пачка %s уже существует в Phobos — заблокирована, повтор её не решит", packID)
 	}
 	if res.Code != mover.CodeOK {
 		if definiteRefusals[res.Code] {

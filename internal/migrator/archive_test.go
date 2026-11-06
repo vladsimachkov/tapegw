@@ -54,6 +54,7 @@ type probeMover struct {
 	failPut     error         // если задан — put падает ДО записи (м mover лёг)
 	block       chan struct{} // если задан — put ждёт в него перед записи
 	code        mover.Code    // если задан — put вернёт этот код вместо ok
+	puts        int           // сколько раз put реально вызывали
 }
 
 func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
@@ -85,6 +86,7 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 			p.SQLState, p.Detail)
 	}
 
+	p.puts++
 	p.lastOp = in.Op
 	p.lastID = in.ID
 	if p.failPut != nil {
@@ -621,32 +623,36 @@ func TestSecondWorkerOfSameProcessDoesNotSteal(t *testing.T) {
 	}
 }
 
-// EEXIST — не успех и не отказ: пачка помечается застрявшей и не повторяется.
+// EEXIST — не успех и не отказ: пачка блокируется, и её больше не пересылают.
 //
 // Дубля нет (oid пачки не меняется), но из exists не следует, что копия цела:
-// incomplete после обрыва посреди записи выглядит так же. До stat по oid такой
-// исход обязан поднимать сигнал, а не крутиться: повтор даёт тот же EEXIST,
-// объекты висят в 'archiving' и держат landing молча.
-func TestExistsMarksPackStuck(t *testing.T) {
+// incomplete после обрыва посреди записи выглядит так же. Без блокировки
+// продолжение через срок захвата переслало бы пачку целиком (гигабайты по сети),
+// получило бы тот же exists — и по кругу, бесконечно.
+func TestExistsBlocksPackAndStopsResending(t *testing.T) {
 	m := testdb.Connect(t)
 	ctx := context.Background()
 	testdb.Clean(t, m)
 
 	ids := seedObjects(t, m, "exists", 2)
 	a, pm := archiver(t, m, ids[0])
+	a.ClaimTTL = 100 * time.Millisecond
 	pm.code = mover.CodeExists
 
 	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err == nil {
 		t.Fatal("exists не должен считаться успехом")
 	}
+	if pm.puts != 1 {
+		t.Errorf("put вызван %d раз за первую попытку, ждали 1", pm.puts)
+	}
 
-	var state string
+	var reason string
 	if err := m.Pool.QueryRow(ctx,
-		`SELECT state::text FROM packs ORDER BY created_at DESC LIMIT 1`).Scan(&state); err != nil {
+		`SELECT blocked_reason FROM packs ORDER BY created_at DESC LIMIT 1`).Scan(&reason); err != nil {
 		t.Fatal(err)
 	}
-	if state != "sealed" {
-		t.Errorf("пачка в %s, ждали sealed: её нельзя ни отменять, ни считать архивированной", state)
+	if reason == "" {
+		t.Error("пачка не заблокирована — продолжение перешлёт её по кругу")
 	}
 
 	// Участники не уехали в pending: пачка не отменена, а не разобрана.
@@ -658,13 +664,44 @@ func TestExistsMarksPackStuck(t *testing.T) {
 		t.Errorf("объект в %s, ждали archiving", st)
 	}
 
-	// Продолжение не обязано брать чужую запечатанную пачку до истечения ttl:
-	// иначе цикл крутится, каждый раз получая тот же exists.
+	// Срок захвата заведомо короткий: проверяем не «прямо сейчас», а «после его
+	// истечения» — именно тогда продолжение попробовало бы снова, и именно это
+	// отличает «остановили» от «замедлили пересылкой гигабайтов». Без блокировки
+	// пачка стала бы доступной чужим ровно здесь.
+	time.Sleep(2 * a.ClaimTTL)
+
+	// Поиск продолжения не берёт заблокированную — и mover не получает второй
+	// put.
 	got, err := m.ClaimSealedPack(ctx, "host-a/mover-9", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != uuid.Nil {
-		t.Errorf("продолжение взяло пачку %s, которую никто не разобрал", got)
+		t.Errorf("продолжение взяло заблокированную пачку %s", got)
+	}
+	a2, pm2 := archiver(t, m, ids[0])
+	a2.WorkerID = "host-a/mover-9"
+	if _, err := a2.ResumePacks(ctx, a2.WorkerID, time.Minute,
+		func(context.Context, []uuid.UUID) ([]Item, error) { return itemsFor(ids), nil }, nil); err != nil {
+		t.Logf("ResumePacks: %v", err)
+	}
+	if pm2.puts != 0 {
+		t.Errorf("заблокированная пачка ушла в mover %d раз — блокировка не работает", pm2.puts)
+	}
+
+	// Разблокировка возвращает пачку в оборот (её ведёт разбор: stat или человек).
+	var packID uuid.UUID
+	if err := m.Pool.QueryRow(ctx, `SELECT id FROM packs ORDER BY created_at DESC LIMIT 1`).Scan(&packID); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UnblockPack(ctx, packID); err != nil {
+		t.Fatalf("разблокировать: %v", err)
+	}
+	got, err = m.ClaimSealedPack(ctx, "host-a/mover-9", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != packID {
+		t.Errorf("после разблокировки продолжение получила %s, ждали %s", got, packID)
 	}
 }

@@ -231,6 +231,9 @@ UPDATE packs SET claimed_by = $1, claim_expires_at = now() + $2::interval
 WHERE id = (
     SELECT id FROM packs
      WHERE state = 'sealed'
+       -- Заблокированную не берём: пересылка даст тот же исход, а стоить будет
+       -- всю пачку по сети.
+       AND blocked_reason IS NULL
        -- Свой захват воркер забирает и до истечения срока: после рестарта тот
        -- же слот возвращается через секунду, а ttl — минуты. Идентичность
        -- обязана быть на воркера, а не на процесс: воркеров в процессе несколько
@@ -248,6 +251,44 @@ RETURNING id`, workerID, interval(ttl)).Scan(&packID)
 		return uuid.Nil, fmt.Errorf("meta: захват запечатанной пачки: %w", err)
 	}
 	return packID, nil
+}
+
+// BlockPack ставит пачку на блокировку: её нельзя ни считать архивированной,
+// ни пересылать, пока человек (позже — stat по oid) не разберётся.
+//
+// Снимает захват: пачка ничья, и продолжение её не возьмёт — оно ищет пачки без
+// blocked_reason. Объекты остаются в 'archiving' с pack_id: пачка не отменена,
+// а не разобрана, и инвариант 2 здесь соблюдён.
+func (m *Meta) BlockPack(ctx context.Context, packID uuid.UUID, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("meta: блокировка пачки без причины")
+	}
+	tag, err := m.Pool.Exec(ctx, `
+UPDATE packs SET blocked_reason = $2, blocked_at = now(),
+       claimed_by = NULL, claim_expires_at = NULL
+WHERE id = $1 AND state = 'sealed' AND blocked_reason IS NULL`, packID, reason)
+	if err != nil {
+		return fmt.Errorf("meta: заблокировать пачку: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("meta: пачка %s не запечатана или уже заблокирована", packID)
+	}
+	return nil
+}
+
+// UnblockPack снимает блокировку после разбора — вручную (tapegw admin) или
+// путём продолжения, когда stat по oid даст ответ.
+func (m *Meta) UnblockPack(ctx context.Context, packID uuid.UUID) error {
+	tag, err := m.Pool.Exec(ctx, `
+UPDATE packs SET blocked_reason = NULL, blocked_at = NULL
+WHERE id = $1 AND blocked_reason IS NOT NULL`, packID)
+	if err != nil {
+		return fmt.Errorf("meta: разблокировать пачку: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("meta: пачка %s не заблокирована", packID)
+	}
+	return nil
 }
 
 // RenewPackClaim продлевает захват. Возвращает false, если захват уже потерян
