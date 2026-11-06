@@ -69,6 +69,8 @@ type probeMover struct {
 	statCode    mover.Code
 	statVersion int
 	statExtents []string
+	statSize    int64 // 0 = «как в плане»
+	lastSize    int64
 	deleteCode  mover.Code
 	statCalls   int
 	deleteCalls int
@@ -81,7 +83,14 @@ func (p *probeMover) StatObject(id uuid.UUID) (*mover.Result, error) {
 	if code == "" {
 		code = mover.CodeNotFound
 	}
-	return &mover.Result{Op: id, Code: code, Version: p.statVersion, Extents: p.statExtents}, nil
+	size := p.statSize
+	if size == 0 {
+		// По умолчанию размер под «уже есть» совпадает с планом: иначе каждый
+		// тест на приём целой копии падал бы по несверке. Неправильный размер
+		// задаётся явно.
+		size = p.lastSize
+	}
+	return &mover.Result{Op: id, Code: code, Version: p.statVersion, Extents: p.statExtents, Size: size}, nil
 }
 
 func (p *probeMover) DeleteObject(id uuid.UUID) (*mover.Result, error) {
@@ -99,6 +108,7 @@ func (p *probeMover) Release(op uuid.UUID) (*mover.Result, error) {
 }
 
 func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
+	p.lastSize = in.Size
 	p.puts++
 	// Отказ одноразовый: он описывает состояние, которое разбор как раз и
 	// устраняет (неполную копию удалили, объекта нет). Вечный отказ изображает
@@ -976,6 +986,31 @@ func TestSecondCopyFailureKeepsFirst(t *testing.T) {
 		t.Error("буфер освобождён при незаписанных копиях — догонять будет нечего")
 	}
 
+}
+
+// Под oid пачки лежит целый объект другого размера. «Есть объект с нашим oid»
+// — ещё не «записана наша пачка»: без сверки размера мигратор объявил бы
+// archived поверх чужих байт.
+func TestStatSizeMismatchBlocksPack(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "statsize", 2)
+	a, pm := archiver(t, m, ids[0])
+	pm.code = mover.CodeExists
+	pm.statCode = mover.CodeOK
+	pm.statSize = 1 // заведомо не размер пачки
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err == nil {
+		t.Fatal("несовпадение размера не должно считаться успехом")
+	}
+	if reason := packBlockedReason(t, m, ctx); reason == "" {
+		t.Error("пачка не заблокирована при чужом размере объекта")
+	}
+	if pm.deleteCalls != 0 {
+		t.Errorf("delete вызван %d раз: чужой объект удалять нельзя", pm.deleteCalls)
+	}
 }
 
 // --- #101: разбор «уже есть» по stat ----------------------------------------

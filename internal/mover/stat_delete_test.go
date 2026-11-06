@@ -36,6 +36,9 @@ func TestStatObjectAnswers(t *testing.T) {
 	if res.Code != mover.CodeOK {
 		t.Errorf("целая копия: %s, ждали ok", res.Code)
 	}
+	if res.Size != int64(len(body)) {
+		t.Errorf("stat вернул размер %d, объект на %d", res.Size, len(body))
+	}
 	if len(res.Extents) == 0 {
 		t.Error("stat целой копии не вернул носитель — копию не с чем сверять")
 	}
@@ -67,8 +70,8 @@ func TestDeleteRefusesCompleteObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Code != mover.CodeOpConflict {
-		t.Errorf("удаление целой копии: %s, ждали op_conflict", res.Code)
+	if res.Code != mover.CodeDenied {
+		t.Errorf("удаление целой копии: %s, ждали denied", res.Code)
 	}
 	if !e.st.Has(op) {
 		t.Error("целая копия всё равно удалена")

@@ -247,7 +247,7 @@ func (s *Server) handle(conn net.Conn) {
 				if ext, err := s.st.Extents(context.Background(), []uuid.UUID{q.ID}); err == nil {
 					extents = ext[q.ID]
 				}
-				_ = WriteJSON(tconn, Result{Type: "result", Op: q.ID, Code: CodeOK, Version: st.Version, Extents: extents})
+				_ = WriteJSON(tconn, Result{Type: "result", Op: q.ID, Code: CodeOK, Version: st.Version, Extents: extents, Size: st.Size})
 			}
 		case "delete":
 			var d Delete
@@ -259,7 +259,7 @@ func (s *Server) handle(conn net.Conn) {
 			// обрыв: соединение нужно клиенту и дальше.
 			code := CodeOK
 			if st, err := s.st.Stat(context.Background(), d.ID); err == nil && st.Complete {
-				code = CodeOpConflict
+				code = CodeDenied
 			} else if res := s.st.Delete(context.Background(), []uuid.UUID{d.ID}); len(res) == 1 && res[0].Err != nil && !errors.Is(res[0].Err, store.ErrNotFound) {
 				code = CodeIO
 			}

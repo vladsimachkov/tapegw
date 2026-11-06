@@ -418,6 +418,14 @@ func (a *Archiver) resolveByStat(ctx context.Context, packID uuid.UUID, plan *Pl
 	}
 	switch st.Code {
 	case mover.CodeOK:
+		// Целый объект с нужным oid — ещё не наша пачка. Сверка размера дешёвая,
+		// а цена её отсутствия — «архивировано» поверх чужих байт.
+		if st.Size != plan.Size {
+			if err := block(fmt.Sprintf("под oid пачки лежит объект на %d байт, план — %d", st.Size, plan.Size)); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
 		return &mover.Result{Code: mover.CodeOK, Version: st.Version, Extents: st.Extents}, nil
 	case mover.CodeIncomplete:
 		del, err := a.Put.DeleteObject(packID)
