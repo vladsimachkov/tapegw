@@ -64,7 +64,33 @@ type probeMover struct {
 	lastTags   []string
 	copyCode   mover.Code // если задан — put с from_op вернёт этот код
 	holds      int        // сколько put приходили с hold
-	releases   int
+
+	// #101: ответы на stat/delete по oid пачки.
+	statCode    mover.Code
+	statVersion int
+	statExtents []string
+	deleteCode  mover.Code
+	statCalls   int
+	deleteCalls int
+	releases    int
+}
+
+func (p *probeMover) StatObject(id uuid.UUID) (*mover.Result, error) {
+	p.statCalls++
+	code := p.statCode
+	if code == "" {
+		code = mover.CodeNotFound
+	}
+	return &mover.Result{Op: id, Code: code, Version: p.statVersion, Extents: p.statExtents}, nil
+}
+
+func (p *probeMover) DeleteObject(id uuid.UUID) (*mover.Result, error) {
+	p.deleteCalls++
+	code := p.deleteCode
+	if code == "" {
+		code = mover.CodeOK
+	}
+	return &mover.Result{Op: id, Code: code}, nil
 }
 
 func (p *probeMover) Release(op uuid.UUID) (*mover.Result, error) {
@@ -73,6 +99,15 @@ func (p *probeMover) Release(op uuid.UUID) (*mover.Result, error) {
 }
 
 func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
+	p.puts++
+	// Отказ одноразовый: он описывает состояние, которое разбор как раз и
+	// устраняет (неполную копию удалили, объекта нет). Вечный отказ изображает
+	// другой сценарий — тот, где повтор бесполезен, и он проверяется отдельно.
+	if p.code != "" {
+		code := p.code
+		p.code = ""
+		return &mover.Result{Op: in.Op, Code: code, State: mover.StateFailed}, nil
+	}
 	p.lastHold, p.lastFromOp = in.Hold, in.FromOp
 	if in.Hold {
 		p.holds++
@@ -139,7 +174,6 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 			p.SQLState, p.Detail)
 	}
 
-	p.puts++
 	p.lastOp = in.Op
 	p.lastID = in.ID
 	if p.failPut != nil {
@@ -691,6 +725,8 @@ func TestExistsBlocksPackAndStopsResending(t *testing.T) {
 	a, pm := archiver(t, m, ids[0])
 	a.ClaimTTL = 100 * time.Millisecond
 	pm.code = mover.CodeExists
+	// stat не отвечает — разобрать итог нельзя, пачка блокируется
+	pm.statCode = mover.CodeIO
 
 	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err == nil {
 		t.Fatal("exists не должен считаться успехом")
@@ -771,6 +807,7 @@ func TestIncompleteBlocksPack(t *testing.T) {
 	a, pm := archiver(t, m, ids[0])
 	a.ClaimTTL = 100 * time.Millisecond
 	pm.code = mover.CodeIncomplete
+	pm.statCode = mover.CodeIO // разобрать нельзя: блокировка
 
 	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err == nil {
 		t.Fatal("incomplete не должен считаться успехом")
@@ -939,4 +976,127 @@ func TestSecondCopyFailureKeepsFirst(t *testing.T) {
 		t.Error("буфер освобождён при незаписанных копиях — догонять будет нечего")
 	}
 
+}
+
+// --- #101: разбор «уже есть» по stat ----------------------------------------
+
+func packBlockedReason(t *testing.T, m *meta.Meta, ctx context.Context) string {
+	t.Helper()
+	var reason *string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT blocked_reason FROM packs ORDER BY created_at DESC LIMIT 1`).Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if reason == nil {
+		return ""
+	}
+	return *reason
+}
+
+// Целая копия на ленте — успех без пересылки: гнать гигабайты ради той же
+// картинки незачем.
+func TestStatCompleteIsAcceptedWithoutResend(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "statok", 2)
+	a, pm := archiver(t, m, ids[0])
+	pm.code = mover.CodeExists
+	pm.statCode = mover.CodeOK
+	pm.statVersion = 7
+	pm.statExtents = []string{"TST-MIG"}
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err != nil {
+		t.Fatalf("целая копия должна приниматься: %v", err)
+	}
+	if pm.puts != 1 {
+		t.Errorf("put вызван %d раз: целую копию не надо пересылать", pm.puts)
+	}
+	if pm.deleteCalls != 0 {
+		t.Errorf("delete вызван %d раз: целое не удаляют", pm.deleteCalls)
+	}
+	if reason := packBlockedReason(t, m, ctx); reason != "" {
+		t.Errorf("пачка заблокирована: %s", reason)
+	}
+	var st string
+	if err := m.Pool.QueryRow(ctx, `SELECT state::text FROM objects WHERE id = $1`, ids[0]).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st != "archived" {
+		t.Errorf("объект в %s, ждали archived", st)
+	}
+}
+
+// Неполную копию надо убрать и отправить один раз.
+func TestStatIncompleteDeletesAndResends(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "statinc", 2)
+	a, pm := archiver(t, m, ids[0])
+	pm.code = mover.CodeIncomplete
+	pm.statCode = mover.CodeIO // разобрать нельзя: блокировка
+	pm.statCode = mover.CodeIncomplete
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err != nil {
+		t.Fatalf("после удаления и повтора пачка должна пройти: %v", err)
+	}
+	if pm.deleteCalls != 1 {
+		t.Errorf("delete вызван %d раз, ждали 1", pm.deleteCalls)
+	}
+	if pm.puts != 2 {
+		t.Errorf("put вызван %d раз, ждали 2 (исходный и повтор)", pm.puts)
+	}
+	if reason := packBlockedReason(t, m, ctx); reason != "" {
+		t.Errorf("пачка заблокирована после удачного повтора: %s", reason)
+	}
+}
+
+// Объекта нет — просто отправляем, удалять нечего.
+func TestStatNotFoundResendsWithoutDelete(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "statnf", 2)
+	a, pm := archiver(t, m, ids[0])
+	pm.code = mover.CodeExists
+	pm.statCode = mover.CodeNotFound
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err != nil {
+		t.Fatalf("повтор должен пройти: %v", err)
+	}
+	if pm.deleteCalls != 0 {
+		t.Errorf("delete вызван %d раз при not_found", pm.deleteCalls)
+	}
+	if pm.puts != 2 {
+		t.Errorf("put вызван %d раз, ждали 2", pm.puts)
+	}
+}
+
+// Если неполную копию не удалить, пачка блокируется: пересылка поверх неё дала
+// бы тот же incomplete, и цикл был бы бесконечным.
+func TestStatIncompleteUndeletableBlocksPack(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "statlock", 2)
+	a, pm := archiver(t, m, ids[0])
+	pm.code = mover.CodeIncomplete
+	pm.statCode = mover.CodeIO // разобрать нельзя: блокировка
+	pm.statCode = mover.CodeIncomplete
+	pm.deleteCode = mover.CodeBusy
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err == nil {
+		t.Fatal("не удалённая неполная копия не должна считаться успехом")
+	}
+	if pm.puts != 1 {
+		t.Errorf("put вызван %d раз: поверх неполной копии слать нельзя", pm.puts)
+	}
+	if reason := packBlockedReason(t, m, ctx); reason == "" {
+		t.Error("пачка не заблокирована")
+	}
 }

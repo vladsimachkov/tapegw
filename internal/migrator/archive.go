@@ -28,6 +28,11 @@ type Putter interface {
 	// Release говорит mover'у, что удержанный буфер больше не нужен: все
 	// копии записаны. Без него буфер висел бы до result_ttl.
 	Release(op uuid.UUID) (*mover.Result, error)
+
+	// StatObject и DeleteObject нужны #101: «объект есть» не значит «копия
+	// цела», а решать «принять / убрать и переслать» без ответа Phobos нельзя.
+	StatObject(id uuid.UUID) (*mover.Result, error)
+	DeleteObject(id uuid.UUID) (*mover.Result, error)
 }
 
 // definiteRefusals — коды, по которым известно: на ленту ничего не попало.
@@ -309,25 +314,18 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 		}
 	}
 	if res.Code == mover.CodeExists || res.Code == mover.CodeIncomplete {
-		// «Уже есть» mover разбирает сам: целая копия — это ok, неполная —
-		// incomplete. До mover'а доходил один EEXIST, и по нему нельзя было
-		// сказать, цела ли копия; теперь неполная приходит отдельным кодом.
-		// И тот, и другой для планировщика значат одно: на ленте лежит то, что
-		// нельзя ни принять, ни молча повторить (повтор даёт тот же ответ,
-		// объекты висят в 'archiving' и держат landing). Удалить неполную и
-		// отправить заново — можно только умея надёжно узнать состояние
-		// копии (#101, stat по oid), поэтому пока блокируем пачку.
-		// через срок захвата переслало бы её целиком (гигабайты по сети),
-		// получило бы тот же exists — и по кругу. Раз в несколько минут,
-		// бесконечно.
-		a.logger().Error("пачка существует в Phobos, итог требует проверки",
-			"pack", packID.String(), "oid", packID.String(), "spec", a.Spec)
-		reason := fmt.Sprintf("phobos exists (oid=%s): нужен разбор stat по oid", packID)
-		if err := a.Meta.BlockPack(ctx, packID, reason); err != nil {
+		// «Уже есть» и «неполная» — не приговор и не успех: надо спросить
+		// Phobos. Разбор ниже; если разобрать нельзя, пачка блокируется.
+		r2, err := a.resolveByStat(ctx, packID, plan, attrs, buf.Bytes())
+		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("mover: пачка %s уже существует в Phobos — заблокирована, повтор её не решит", packID)
+		if r2 == nil {
+			return nil, fmt.Errorf("mover: пачка %s в состоянии, которое нельзя разобрать по stat", packID)
+		}
+		res = r2
 	}
+
 	if res.Code != mover.CodeOK {
 		if definiteRefusals[res.Code] {
 			// Известно, что на ленту ничего не легло, — выбрасывать можно.
@@ -395,6 +393,62 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 		}
 	}
 	return plan, nil
+}
+
+// resolveByStat — #101: что делать, когда Phobos отвечает «уже есть» или
+// «неполно». Три исхода и почему именно они:
+//
+//   - complete — принимаем как успех. Данные на ленте и они целые; переписывать
+//     их значит гонять гигабайты ради той же картинки;
+//   - incomplete — удалить и отправить один раз. Неполный объект нельзя ни
+//     принять, ни переслать поверх (EEXIST вернётся снова);
+//   - not_found — отправить: реестр mover'а мог потеряться, а объекта там и нет.
+//
+// Повтор ровно один. Второй тот же исход — блокировка: бесконечный цикл
+// «переслали, снова exists» жрёт сеть и ленту и ничего не чинит.
+func (a *Archiver) resolveByStat(ctx context.Context, packID uuid.UUID, plan *Plan, attrs map[string]string, body []byte) (*mover.Result, error) {
+	block := func(why string) error {
+		a.logger().Error("итог по пачке нельзя разобрать", "pack", packID.String(), "why", why)
+		return a.Meta.BlockPack(ctx, packID, "stat: "+why)
+	}
+
+	st, err := a.Put.StatObject(packID)
+	if err != nil {
+		return nil, fmt.Errorf("migrator: stat по пачке %s: %w", packID, err)
+	}
+	switch st.Code {
+	case mover.CodeOK:
+		return &mover.Result{Code: mover.CodeOK, Version: st.Version, Extents: st.Extents}, nil
+	case mover.CodeIncomplete:
+		del, err := a.Put.DeleteObject(packID)
+		if err != nil {
+			return nil, fmt.Errorf("migrator: удалить неполную пачку %s: %w", packID, err)
+		}
+		if del.Code != mover.CodeOK {
+			if err := block("неполная копия не удаляется: " + string(del.Code)); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+	case mover.CodeNotFound:
+	default:
+		if err := block("stat вернул " + string(st.Code)); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	res, err := a.sendPack(ctx, packID, plan, attrs, body)
+	if err != nil {
+		return nil, err
+	}
+	if res.Code != mover.CodeOK {
+		if err := block("повтор после stat дал " + string(res.Code)); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	return res, nil
 }
 
 // copySpecs — спецификации копий политики. Если задан только Spec, копия одна.

@@ -326,6 +326,33 @@ func (c *Client) Get(op, id uuid.UUID, w io.Writer) (*Result, error) {
 }
 
 // Status спрашивает состояние операции после обрыва.
+// StatObject спрашивает состояние объекта в Phobos.
+func (c *Client) StatObject(id uuid.UUID) (*Result, error) {
+	return c.ask(Stat{Type: "stat", ID: id})
+}
+
+// DeleteObject удаляет неполный объект. Целый mover не отдаст: см. handleDelete.
+func (c *Client) DeleteObject(id uuid.UUID) (*Result, error) {
+	return c.ask(Delete{Type: "delete", ID: id})
+}
+
+func (c *Client) ask(msg interface{}) (*Result, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := WriteJSON(c.conn, msg); err != nil {
+		return nil, err
+	}
+	for {
+		res, _, err := c.readControl(c.opTimeout)
+		if err != nil {
+			return nil, err
+		}
+		if res != nil {
+			return res, nil
+		}
+	}
+}
+
 func (c *Client) Status(op uuid.UUID) (*Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

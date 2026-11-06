@@ -99,6 +99,9 @@ func (f *Store) ForceExists(id uuid.UUID, incomplete bool) {
 	f.exists[id] = true
 	if incomplete {
 		f.incomplete[id] = true
+		// Неполная копия — это объект, который есть, но неполон. Без записи в
+		// data Stat ответил бы not_found, и тест проверял бы не то.
+		f.data[id] = []byte("truncated")
 	}
 }
 
