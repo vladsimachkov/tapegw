@@ -167,11 +167,27 @@ func TestReplicaCountIsOne(t *testing.T) {
 	}
 	defer st.Close()
 
-	// Размер выбираем некруглый и уникальный для теста: считаем файлом ровно
-	// то, что записали, и не должны поймать чужой объект того же размера.
-	size := int64(16391)
+	// Реплика — файл <oid с / -> _>.<uuid> в каталоге носителя (замер —
+	// docs/ops/tape-library.md). Считаем по oid, а не по размеру: по размеру
+	// в зачёт идут файлы других объектов и прошлых прогонов.
+	count := func(id uuid.UUID) int {
+		n := 0
+		for _, m := range media {
+			filepath.WalkDir(m, func(p string, d fs.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return err
+				}
+				if strings.HasPrefix(d.Name(), id.String()+".") {
+					n++
+				}
+				return nil
+			})
+		}
+		return n
+	}
 
-	put := func(name string, params map[string]string) {
+	size := int64(4096)
+	put := func(name string, params map[string]string) uuid.UUID {
 		f, err := os.CreateTemp(t.TempDir(), "obj")
 		if err != nil {
 			t.Fatal(err)
@@ -183,46 +199,26 @@ func TestReplicaCountIsOne(t *testing.T) {
 		if err := f.Sync(); err != nil {
 			t.Fatal(err)
 		}
-		res := st.Put(ctx, []store.PutItem{{ID: uuid.New(), File: f, Size: size}},
+		id := uuid.New()
+		res := st.Put(ctx, []store.PutItem{{ID: id, File: f, Size: size}},
 			store.PutOptions{Family: "dir", Library: "dirlib", Layout: "raid1",
 				LayoutParams: params})
-		if len(res) != 1 {
-			t.Fatalf("%s: результатов %d, ждём 1", name, len(res))
+		if len(res) != 1 || res[0].Err != nil {
+			t.Fatalf("%s: %v", name, res)
 		}
-		if res[0].Err != nil {
-			t.Fatalf("%s: %v", name, res[0].Err)
-		}
+		return id
 	}
 
-	put("с repl_count=1", map[string]string{"repl_count": "1"})
-	got := 0
-	for _, m := range media {
-		got += countFilesOfSize(m, size)
-	}
-	if got != 1 {
+	id1 := put("с repl_count=1", map[string]string{"repl_count": "1"})
+	if got := count(id1); got != 1 {
 		t.Errorf("с repl_count=1: реплик %d, хотим 1", got)
 	}
 
-	put("без параметров layout", nil)
-	got = 0
-	for _, m := range media {
-		got += countFilesOfSize(m, size)
+	// Без параметров layout raid1 берёт две реплики — и устройств на стенде
+	// ровно два, так что запись проходит. Это и есть доказательство, что
+	// параметры доходят до Phobos: при игноре обе проверки дали бы одно.
+	id2 := put("без параметров layout", nil)
+	if got := count(id2); got != 2 {
+		t.Errorf("без параметров layout: реплик %d, хотим 2", got)
 	}
-	if got != 3 { // одна из первого put плюс две новые
-		t.Errorf("без параметров: файлов %d, хотим 3 (1 + 2 реплики)", got)
-	}
-}
-
-func countFilesOfSize(root string, size int64) int {
-	n := 0
-	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		if info, err := d.Info(); err == nil && info.Size() == size {
-			n++
-		}
-		return nil
-	})
-	return n
 }
