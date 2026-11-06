@@ -65,7 +65,10 @@ const (
 	//
 	// Раньше этот случай маппился в CodeOK, то есть «записали» там, где ничего
 	// не проверяли.
-	CodeExists  Code = "exists"
+	CodeExists Code = "exists"
+	// CodeDenied — отказ по политике доступа, а не по ошибке: например
+	// локальная передача из буфера другого клиента (Ф0.4).
+	CodeDenied  Code = "denied"
 	CodeExpired Code = "expired"
 	CodeIO      Code = "io"
 	CodeUnknown Code = "unknown"
@@ -134,6 +137,12 @@ type Put struct {
 	Attrs   map[string]string `json:"attrs,omitempty"`
 	Tags    []string          `json:"tags,omitempty"`
 	NoSplit bool              `json:"no_split,omitempty"`
+
+	// FromOp — локальная передача (Ф0.4): записать новый объект из буфера
+	// уже завершённой операции этого же mover'а, без байтов по сети. Ноль —
+	// обычная передача. Смысл в том, что копии пачки пишутся с одного содержимого:
+	// второй драйв не читает ленту и не тянет гигабайты через S3-сервер.
+	FromOp uuid.UUID `json:"from_op,omitempty"`
 }
 
 // Get объявляет операцию чтения.

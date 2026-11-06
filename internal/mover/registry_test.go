@@ -22,7 +22,7 @@ func TestRegistrySurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, created, err := r1.Begin(op, 4000, "deadbeef", map[string]string{"tapegw.version": op.String()}, nil)
+	_, created, err := r1.Begin(op, 4000, "deadbeef", map[string]string{"tapegw.version": op.String()}, nil, "scheduler")
 	if err != nil || !created {
 		t.Fatalf("Begin: %v created=%v", err, created)
 	}
@@ -63,17 +63,17 @@ func TestRegistryRejectsDifferentContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	op := uuid.New()
-	if _, _, err := r.Begin(op, 100, "aaaa", nil, nil); err != nil {
+	if _, _, err := r.Begin(op, 100, "aaaa", nil, nil, "scheduler"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := r.Begin(op, 200, "aaaa", nil, nil); err != mover.ErrOpConflict {
+	if _, _, err := r.Begin(op, 200, "aaaa", nil, nil, "scheduler"); err != mover.ErrOpConflict {
 		t.Errorf("другой размер при том же op: ожидали ErrOpConflict, получили %v", err)
 	}
-	if _, _, err := r.Begin(op, 100, "bbbb", nil, nil); err != mover.ErrOpConflict {
+	if _, _, err := r.Begin(op, 100, "bbbb", nil, nil, "scheduler"); err != mover.ErrOpConflict {
 		t.Errorf("другая сумма при том же op: ожидали ErrOpConflict, получили %v", err)
 	}
 	// Тот же op и та же пара — обычное продолжение, без конфликта.
-	if _, created, err := r.Begin(op, 100, "aaaa", nil, nil); err != nil || created {
+	if _, created, err := r.Begin(op, 100, "aaaa", nil, nil, "scheduler"); err != nil || created {
 		t.Errorf("повтор с той же парой обязан быть продолжением: created=%v err=%v", created, err)
 	}
 }

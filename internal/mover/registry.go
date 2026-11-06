@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -52,7 +53,22 @@ type OpRecord struct {
 	// который mover переносит как непрозрачные данные (ADR-0007).
 	Attrs map[string]string `json:"attrs,omitempty"`
 	Tags  []string          `json:"tags,omitempty"`
+
+	// Client — кто записал операцию (роль из SAN-URI сертификата). Нужен
+	// локальной передаче (Ф0.4): брать содержимое из чужого буфера нельзя,
+	// иначе одна сторона получает доступ к данным другой.
+	Client string `json:"client,omitempty"`
+
+	// Refs — сколько локальных передач держат этот буфер. Пока Refs > 0,
+	// данные не выбрасываются и по result_ttl: ссылающаяся копия уже
+	// согласована с этим содержимым, а выбросить его на середине записи —
+	// значит сорвать её с неполным объектом на ленте.
+	Refs int `json:"refs,omitempty"`
 }
+
+// ErrSrcNotDone — источник локальной передачи не в done. Буфер в staged ещё не
+// дочитан и не сверен, failed уже выброшен.
+var ErrSrcNotDone = errors.New("mover: источник не завершён")
 
 // NewRegistry открывает каталог буфера и поднимает из него незавершённые
 // операции. Файлы без записи считаются мусором и удаляются: запись — источник
@@ -175,7 +191,7 @@ func syncDir(dir string) error {
 // Возвращает (rec, newlyCreated, error). Если операция известна с другой парой
 // (size, sha256) — ErrOpConflict: повтор с другими значениями есть ошибка
 // вызывающей стороны, а не «новое содержимое этой же операции».
-func (r *Registry) Begin(op uuid.UUID, size int64, sum string, attrs map[string]string, tags []string) (*OpRecord, bool, error) {
+func (r *Registry) Begin(op uuid.UUID, size int64, sum string, attrs map[string]string, tags []string, client string) (*OpRecord, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -196,6 +212,7 @@ func (r *Registry) Begin(op uuid.UUID, size int64, sum string, attrs map[string]
 		CreatedAt: time.Now(),
 		Attrs:     attrs,
 		Tags:      tags,
+		Client:    client,
 	}
 	if err := r.persist(rec); err != nil {
 		return nil, false, err
@@ -228,6 +245,37 @@ func (r *Registry) Update(op uuid.UUID, fn func(*OpRecord)) error {
 
 // Free — сколько места в буфере осталось. Нужно и для handshake, и для
 // кредитов: переполнение буфера есть «подожди», а не ошибка записи.
+// Acquire увеличивает число ссылок на буфер источника. Отказывает, если
+// источник не в done: staged ещё не сверен, failed уже без данных.
+func (r *Registry) Acquire(op uuid.UUID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.ops[op]
+	if !ok {
+		return ErrSrcNotDone
+	}
+	if rec.State != StateDone {
+		return ErrSrcNotDone
+	}
+	rec.Refs++
+	return r.persist(rec)
+}
+
+// Release снимает ссылку. Счётчик не уходит в минус: освобождение по таймеру
+// (клиент умер, не дослав копию) и явное освобождение могут встретиться.
+func (r *Registry) Release(op uuid.UUID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.ops[op]
+	if !ok {
+		return nil
+	}
+	if rec.Refs > 0 {
+		rec.Refs--
+	}
+	return r.persist(rec)
+}
+
 func (r *Registry) Free() int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -294,6 +342,11 @@ func (r *Registry) Expire(now time.Time) ([]uuid.UUID, error) {
 		age := now.Sub(rec.UpdatedAt)
 		switch {
 		case rec.State == StateDone || rec.State == StateFailed:
+			// Буфер, на который ссылается незавершённая локальная передача,
+			// не выбрасываем: копия уже согласована с этим содержимым.
+			if rec.Refs > 0 {
+				continue
+			}
 			if r.resTTL > 0 && age > r.resTTL {
 				victims = append(victims, victim{op, CodeExpired})
 			}
