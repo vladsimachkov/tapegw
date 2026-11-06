@@ -245,7 +245,11 @@ func (s *Store) Stat(ctx context.Context, id uuid.UUID) (store.Meta, error) {
 		return store.Meta{}, err
 	}
 	if len(ei.Size) == 0 {
-		return store.Meta{}, fmt.Errorf("phobos: stat %s: экстентов нет", id)
+		// Объект есть (getmd нашёл), экстентов нет — незавершённая запись после
+		// обрыва. Это не ошибка Stat: именно так migrator должен отличить
+		// «долить» от «уже лежит целое».
+		meta.Complete = false
+		return meta, nil
 	}
 	// Экстенты отдаём как есть. Sumму не считаем: 94 — это и две реплики по 47,
 	// и один объект на 94, а для разбора EEXIST это противоположные случаи.
@@ -314,8 +318,15 @@ func extentList(ctx context.Context, id uuid.UUID, cfgPath string) (extentInfo, 
 		return extentInfo{}, fmt.Errorf("phobos extent list %s: %w: %s",
 			id, err, strings.TrimSpace(errb.String()))
 	}
+	trimmed := bytes.TrimSpace(out.Bytes())
+	if len(trimmed) == 0 {
+		// Пустой вывод — не ошибка разбора, а «экстентов нет». Именно так
+		// выглядит объект, записанный с обрывом: он уже в таблице объектов
+		// (повторный put даёт EEXIST), но ни одного экстента у него нет.
+		return extentInfo{}, nil
+	}
 	var rows []extentInfo
-	if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+	if err := json.Unmarshal(trimmed, &rows); err != nil {
 		return extentInfo{}, fmt.Errorf("phobos extent list %s: разбор вывода: %w", id, err)
 	}
 	if len(rows) != 1 {
