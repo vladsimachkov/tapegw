@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Полный перезапуск стенда Phobos в правильном порядке.
+#
+# Порядок важен и взят из docs/ops/tape-library.md:
+#   1. остановить всё, включая запущенное вручную (systemd ручные процессы не
+#      остановит — из-за них и ломается «активный юнит + мёртвые локи»);
+#   2. чистить локи, только когда не работает НИ ОДИН демон: --force при
+#      работающем phobosd — гонка, демон может держать лок в момент чистки;
+#   3. поднимать TLC раньше phobosd (M0-07: phobosd, запущенный раньше TLC,
+#      библиотеку не увидит и не повторит попытку);
+#   4. проверить себя тем же stand-status, которым пользуется каждый прогон.
+set -uo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+
+echo "== 1. останавливаем демоны"
+systemctl stop phobosd 2>/dev/null
+systemctl stop phobos_tlc 2>/dev/null
+for pid in $(pgrep -x phobosd; pgrep -x phobos_tlc); do
+    echo "   останавливаем pid $pid (запущен вручную)"
+    kill "$pid"
+done
+sleep 3
+left=$(pgrep -x phobosd; pgrep -x phobos_tlc)
+if [ -n "$left" ]; then
+    echo "FAIL: процессы остались: $left — убивать по PID, не pkill -f по SSH" >&2
+    exit 1
+fi
+rm -f /run/phobosd/phobosd.lock
+
+echo "== 2. чистим локи при остановленных демонах"
+for t in device media; do
+    phobos lock clean -t "$t" --force 2>&1 | sed 's/^/   /'
+done
+
+echo "== 3. поднимаем TLC, ждём порт, затем phobosd"
+systemctl start phobos_tlc
+port=$(sed -n 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' /etc/phobos.conf | head -1)
+port=${port:-20123}
+for _ in $(seq 1 30); do
+    ss -ltn "sport = :$port" 2>/dev/null | grep -q ":$port" && break
+    sleep 1
+done
+systemctl start phobosd
+for _ in $(seq 1 30); do
+    ss -xlp 2>/dev/null | grep -q socklrs && break
+    sleep 1
+done
+
+echo "== 4. проверка"
+exec "$here/stand-status"

@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Проверка стенда Phobos: смотрит и ничего не меняет.
+#
+# Нужен потому, что стенд три захода подряд подводил одним и тем же: процесс
+# запущен вручную, systemd про него не знает, и «активный юнит» соседствует с
+# мёртвыми локами в DRS/DSS. Проверка должна быть командой, а не памятью
+# человека.
+#
+# Выходит с ненулевым кодом на любое расхождение и печатает, что именно не так.
+set -uo pipefail
+
+rc=0
+fail() { echo "FAIL: $*"; rc=1; }
+ok()   { echo "ok:   $*"; }
+
+# --- 1. процессы Phobos и их принадлежность systemd -------------------------
+found_proc=0
+for pid in $(pgrep -x phobosd; pgrep -x phobos_tlc); do
+    found_proc=1
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+    cg=$(cut -d: -f3 "/proc/$pid/cgroup" 2>/dev/null)
+    case "$cg" in
+        */phobosd.service|*/phobos_tlc.service)
+            ok "pid $pid под systemd ($cg)" ;;
+        *)
+            fail "pid $pid запущен вручную (cgroup: ${cg:-нет}): $cmd — systemd его не остановит" ;;
+    esac
+done
+[ "$found_proc" = 1 ] || fail "ни одного процесса Phobos не запущено"
+
+# --- 2. юниты ---------------------------------------------------------------
+for u in phobos_tlc phobosd; do
+    if systemctl is-active --quiet "$u"; then
+        ok "юнит $u активен"
+    else
+        fail "юнит $u не активен ($(systemctl is-active "$u" 2>&1))"
+    fi
+done
+
+# --- 3. сокет LRS и порт TLC ------------------------------------------------
+if ss -xlp 2>/dev/null | grep -q 'socklrs'; then
+    ok "сокет LRS слушается"
+else
+    fail "сокет LRS не слушается: put даст 'Transport endpoint is not connected'"
+fi
+
+port=$(sed -n 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' /etc/phobos.conf | head -1)
+port=${port:-20123}
+if ss -ltn "sport = :$port" 2>/dev/null | grep -q ":$port"; then
+    ok "TLC слушает порт $port"
+else
+    fail "TLC не слушает порт $port — phobosd не сможет работать с библиотекой"
+fi
+
+# --- 4. локи с мёртвыми владельцами -----------------------------------------
+# Локи живут в DSS, а не в памяти процесса: убить phobosd недостаточно.
+for kind in dir drive; do
+    out=$(phobos "$kind" list -o all 2>/dev/null)
+    [ -n "$out" ] || continue
+    for owner in $(printf '%s\n' "$out" | tr '|' '\n' | grep -E '^[[:space:]]*[0-9]{3,}[[:space:]]*$' | tr -d ' '); do
+        if [ ! -d "/proc/$owner" ]; then
+            fail "$kind: лок принадлежит pid $owner, которого больше нет — нужен phobos lock clean при остановленных демонах"
+        fi
+    done
+done
+
+if [ "$rc" = 0 ]; then
+    echo "стенд в порядке"
+else
+    echo "стенд не в порядке: см. FAIL выше; полный перезапуск — hack/stand-up"
+fi
+exit "$rc"
