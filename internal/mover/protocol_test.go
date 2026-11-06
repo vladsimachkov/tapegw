@@ -414,7 +414,7 @@ func TestMessageFieldsHaveNoKeys(t *testing.T) {
 		"Ready":    {"t", "op", "offset", "credits"},
 		"Credit":   {"t", "op", "credits"},
 		"StateMsg": {"t", "op", "state"},
-		"Result":   {"t", "op", "code", "state", "version", "extents", "sha256", "items"},
+		"Result":   {"t", "op", "code", "state", "version", "extents", "size", "sha256", "items"},
 		"Item":     {"id", "code", "version"},
 	}
 	forbidden := []string{"key", "dek", "tek", "kek", "secret", "password", "bucket",

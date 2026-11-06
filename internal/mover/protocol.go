@@ -68,6 +68,7 @@ const (
 	CodeExists Code = "exists"
 	// CodeDenied — отказ по политике доступа, а не по ошибке: например
 	// локальная передача из буфера другого клиента (Ф0.4).
+	// в частности mover отказывается удалять целый архивный объект.
 	CodeDenied  Code = "denied"
 	CodeExpired Code = "expired"
 	CodeIO      Code = "io"
@@ -169,6 +170,21 @@ type Get struct {
 	Length int64     `json:"length,omitempty"` // 0 — до конца
 }
 
+// Stat спрашивает состояние объекта в Phobos — не операции в реестре mover'а.
+// Нужен после потери реестра или при EEXIST: «объект есть» не значит «копия
+// цела», а без ответа нельзя ни принять её, ни безопасно переслать.
+type Stat struct {
+	Type string    `json:"t"`
+	ID   uuid.UUID `json:"id"`
+}
+
+// Delete удаляет объект из Phobos. Разрешён только для неполных копий:
+// удалить целую — значит потерять данные ради удобства повтора.
+type Delete struct {
+	Type string    `json:"t"`
+	ID   uuid.UUID `json:"id"`
+}
+
 // Status спрашивает состояние операции. Нужен после переподключения: обрыв
 // соединения запись не отменяет.
 type Status struct {
@@ -216,8 +232,11 @@ type Result struct {
 	State   State     `json:"state"`
 	Version int       `json:"version,omitempty"`
 	Extents []string  `json:"extents,omitempty"`
-	SHA256  string    `json:"sha256,omitempty"` // на get — сумма отданных байт
-	Items   []Item    `json:"items,omitempty"`
+	// Size — размер объекта в Phobos. Заполняется в ответе на stat: планировщик
+	// сверяет его со своим планом, прежде чем признать пачку записанной.
+	Size   int64  `json:"size,omitempty"`
+	SHA256 string `json:"sha256,omitempty"` // на get — сумма отданных байт
+	Items  []Item `json:"items,omitempty"`
 }
 
 // --- Кадры -----------------------------------------------------------------

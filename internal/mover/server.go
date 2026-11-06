@@ -227,6 +227,55 @@ func (s *Server) handle(conn net.Conn) {
 				return
 			}
 			carry = s.handlePut(tconn, &p)
+		case "stat":
+			var q Stat
+			if err := Decode(f, &q); err != nil || q.ID == uuid.Nil {
+				return
+			}
+			st, err := s.st.Stat(context.Background(), q.ID)
+			switch {
+			case errors.Is(err, store.ErrNotFound):
+				_ = WriteJSON(tconn, Result{Type: "result", Op: q.ID, Code: CodeNotFound})
+			case err != nil:
+				_ = WriteJSON(tconn, Result{Type: "result", Op: q.ID, Code: CodeIO})
+			case !st.Complete:
+				// Неполная копия — это не success и не not_found: на ленте
+				// лежит мусор, который надо убрать перед повтором.
+				_ = WriteJSON(tconn, Result{Type: "result", Op: q.ID, Code: CodeIncomplete, Version: st.Version})
+			default:
+				var extents []string
+				if ext, err := s.st.Extents(context.Background(), []uuid.UUID{q.ID}); err == nil {
+					extents = ext[q.ID]
+				}
+				_ = WriteJSON(tconn, Result{Type: "result", Op: q.ID, Code: CodeOK, Version: st.Version, Extents: extents, Size: st.Size})
+			}
+		case "delete":
+			var d Delete
+			if err := Decode(f, &d); err != nil || d.ID == uuid.Nil {
+				return
+			}
+			// Удаляем только то, что сами объявили неполным: целая копия
+			// удаляться «чтобы повторить» не должна. Отказ — это ответ, а не
+			// обрыв: соединение нужно клиенту и дальше.
+			// Проверка закрыта в опасную сторону: если Stat не ответил, мы НЕ
+			// знаем, целый ли объект, — и не удаляем ничего. Разрешать
+			// разрушительное действие при сбое проверки — значит потерять
+			// архивный объект из-за временной недоступности LRS.
+			code := CodeOK
+			st, err := s.st.Stat(context.Background(), d.ID)
+			switch {
+			case errors.Is(err, store.ErrNotFound):
+				// Удалять нечего: для delete это успех, повтор тоже ok.
+			case err != nil:
+				code = CodeIO
+			case st.Complete:
+				code = CodeDenied
+			default:
+				if res := s.st.Delete(context.Background(), []uuid.UUID{d.ID}); len(res) == 1 && res[0].Err != nil {
+					code = CodeIO
+				}
+			}
+			_ = WriteJSON(tconn, Result{Type: "result", Op: d.ID, Code: code, State: StateDone})
 		case "release":
 			var r Release
 			if err := Decode(f, &r); err != nil || r.Op == uuid.Nil {

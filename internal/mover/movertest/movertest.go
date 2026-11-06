@@ -68,6 +68,7 @@ type Store struct {
 	calls      map[string]int
 	exists     map[uuid.UUID]bool
 	incomplete map[uuid.UUID]bool
+	statErr    error
 	extents    []string
 }
 
@@ -93,12 +94,23 @@ func (f *Store) SetExtents(labels ...string) {
 
 // ForceExists изображает «объект уже есть»: incomplete=true — «есть, но
 // неполный» (оборванная запись). Без этого ветку Stat в mover не вызвать.
+// FailStat делает Stat ошибочным: так проверяют, что при неизвестном состоянии
+// объекта разрушительная операция не выполняется.
+func (f *Store) FailStat(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statErr = err
+}
+
 func (f *Store) ForceExists(id uuid.UUID, incomplete bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.exists[id] = true
 	if incomplete {
 		f.incomplete[id] = true
+		// Неполная копия — это объект, который есть, но неполон. Без записи в
+		// data Stat ответил бы not_found, и тест проверял бы не то.
+		f.data[id] = []byte("truncated")
 	}
 }
 
@@ -178,6 +190,9 @@ func (f *Store) Get(_ context.Context, items []store.GetItem) []store.Result {
 func (f *Store) Stat(_ context.Context, id uuid.UUID) (store.Meta, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.statErr != nil {
+		return store.Meta{}, f.statErr
+	}
 	b, ok := f.data[id]
 	if !ok {
 		return store.Meta{}, store.ErrNotFound
