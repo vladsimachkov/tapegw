@@ -37,6 +37,8 @@ type Cache struct {
 	ttl time.Duration
 	max int
 	dsn string
+	// dialFn — подменённое подключение слушателя (см. CacheOptions.Dial).
+	dialFn func(ctx context.Context) (*pgx.Conn, error)
 
 	// mu закрывает entries и gen. Читают рабочие горутины шлюза, пишет
 	// листенер и тот, кто кладёт свежее значение.
@@ -110,6 +112,11 @@ type CacheOptions struct {
 	// DSN — подключение для LISTEN. Отдельное, а не из пула: соединение
 	// листенера занято постоянно и в пуле оно держало бы слот из max_conns.
 	DSN string
+
+	// Dial подменяет подключение слушателя. Только для тестов: чтобы
+	// детерминированно задержать переподключение после обрыва. В бою не
+	// задаётся, и публичного «поставить кэш на паузу» в кэше нет.
+	Dial func(ctx context.Context) (*pgx.Conn, error)
 }
 
 // NewCache оборачивает сервис кэшем. svc обязателен: кэш без источника — это
@@ -118,6 +125,8 @@ func NewCache(svc *Service, opts CacheOptions) (*Cache, error) {
 	if svc == nil {
 		return nil, errors.New("iam: сервис учёток обязателен для кэша")
 	}
+	// DSN обязателен и когда подключению подменён dial: в бою путь именно DSN,
+	// а тест не должен проходить валидацию «наполовину настроенным».
 	if opts.DSN == "" {
 		return nil, errors.New("iam: dsn для подписки на изменения обязателен")
 	}
@@ -133,6 +142,7 @@ func NewCache(svc *Service, opts CacheOptions) (*Cache, error) {
 		ttl:     opts.TTL,
 		max:     opts.Max,
 		dsn:     opts.DSN,
+		dialFn:  opts.Dial,
 		entries: make(map[string]entry),
 	}, nil
 }
@@ -315,8 +325,19 @@ func (c *Cache) store(access string, e entry, gen uint64) {
 // любое изменение долетит уведомлением, а всё, что случилось до LISTEN, уже
 // видно в БД и будет перечитано после сброса. Окна, в котором изменение
 // теряется, не остаётся.
+// dial — подключение слушателя уведомлений. По умолчанию обычное подключение по
+// DSN; в тесте подменяется, чтобы детерминированно задержать переподключение и
+// гарантировать окно «слушателя нет». Это зависимость, а не публичный API:
+// в бою никто не должен получить «поставь кэш на паузу».
+func (c *Cache) dial(ctx context.Context) (*pgx.Conn, error) {
+	if c.dialFn != nil {
+		return c.dialFn(ctx)
+	}
+	return pgx.Connect(ctx, c.dsn)
+}
+
 func (c *Cache) subscribe(ctx context.Context) (*pgx.Conn, error) {
-	conn, err := pgx.Connect(ctx, c.dsn)
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("iam: подключение для уведомлений: %w", err)
 	}

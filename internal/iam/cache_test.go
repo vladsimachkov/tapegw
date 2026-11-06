@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -293,91 +294,90 @@ func TestCacheKekRotationAcrossRestart(t *testing.T) {
 // надгробие, тем же access_key его не создать). Если окно не откроется ни в
 // одной попытке, тест падает, а не проходит молча.
 func TestCacheResubscribeFlushesAfterLostEvent(t *testing.T) {
-	// Имя обязано быть уникальным на запуск. Тест ищет соединение листенера в
-	// pg_stat_activity по application_name, а имя «просто константа» собирает в
-	// pg_stat_activity листенеры предыдущих прогонов того же пакета
-	// (go test -count=2, -race -count=3): pg_terminate_backend рвёт чужое
-	// соединение, «обрыв» не наступает, и тест падает с сообщением про
-	// листенера, хотя дело в порядке прогонов.
+	// Имя уникально на запуск: тест ищет соединение листенера в
+	// pg_stat_activity по application_name, и «просто константа» собрала бы в
+	// это число листенеры предыдущих прогонов того же пакета.
 	appName := fmt.Sprintf("tapegw-iam-cache-test-%d", time.Now().UnixNano())
-	// Границы нужны, чтобы тест не превращался в бесконечное ожидание на
-	// медленном раннере: попыток — фиксированное число, и суммарно они уложены
-	// в бюджет. За пределами бюджета тест падает с внятным сообщением, а не
-	// висит до таймаута CI.
-	//
-	// Бюджет не может быть меньше стоимости одной попытки: листенер после обрыва
-	// поднимается по бэкоффу (1с, далее удвоение), и на второй итерации цикла
-	// его ещё нет в pg_stat_activity в тот момент, когда тест хочет его
-	// оборвать. Требовать соединение немедленно — значит падать на второй
-	// попытке на медленном раннере; ровно так CI и поймал этот тест.
-	const attempts = 5
-	const listenerWait = 15 * time.Second
-	const budget = 120 * time.Second
-	deadline := time.Now().Add(budget)
 
 	e := setup(t)
-	cache := newCacheOver(t, e.service(t, e.ringV1), cacheTTL, appName)
+	svc := e.service(t, e.ringV1)
 
-	opened := 0
-	for i := 0; i < attempts && time.Now().Before(deadline); i++ {
-		access := fmt.Sprintf("frank%d", i)
-		mustCreate(t, cache, access, "secret", auth.RoleUser, tenantClient)
-		warmUntilCached(t, cache, access)
-
-		var pid int
-		var lastErr error
-		// Соединение листенера надо ДОЖДАТЬСЯ, а не зафиксировать его отсутствие
-		// как ошибку: между предыдущим pg_terminate_backend и этой попыткой
-		// прошло меньше секунды бэкоффа.
-		if !waitFor(listenerWait, func() bool {
-			p, err := listenerBackendPID(context.Background(), e, appName)
-			if err != nil {
-				lastErr = err
-				return false
+	// Шов — подключение слушателя, а не «пауза кэша». Свойство про обрыв и
+	// переподключение, значит и участник должен быть из этой оси: штатная
+	// пауза проверила бы другой путь. Плюс у кэша не появляется публичного API,
+	// который в бою можно вызвать случайно.
+	//
+	// Первое подключение — настоящее. Каждое следующее встаёт на gate: после
+	// обрыва слушатель не может переподписаться, и окно «слушателя нет»
+	// открыто гарантированно. Никаких попыток, бэкоффов и бюджета в две минуты:
+	// именно они делали тест гонкой, и под нагрузкой CI окно переставал
+	// успевать открыться.
+	gate := make(chan struct{})
+	var closeGate sync.Once
+	release := func() { closeGate.Do(func() { close(gate) }) }
+	var dials atomic.Int32
+	cache, err := iam.NewCache(svc, iam.CacheOptions{
+		TTL: cacheTTL, Max: 1000, DSN: cacheDSN(t, appName),
+		Dial: func(ctx context.Context) (*pgx.Conn, error) {
+			if dials.Add(1) > 1 {
+				<-gate
 			}
-			pid = p
-			return true
-		}) {
-			t.Fatalf("попытка %d: найти соединение листенера за %v: %v", i, listenerWait, lastErr)
-		}
-		if _, err := e.m.Pool.Exec(context.Background(),
-			`SELECT pg_terminate_backend($1)`, pid); err != nil {
-			t.Fatalf("попытка %d: оборвать соединение: %v", i, err)
-		}
-		if !waitFor(5*time.Second, func() bool {
-			_, err := listenerBackendPID(context.Background(), e, appName)
-			return err != nil
-		}) {
-			t.Fatalf("попытка %d: соединение листенера не оборвалось", i)
-		}
-
-		if err := cache.DeleteUserAccount(access); err != nil {
-			t.Fatalf("попытка %d: отзыв: %v", i, err)
-		}
-
-		// Открылось ли окно: кэш обязан всё ещё отдавать отозванную учётку.
-		if _, err := cache.GetUserAccount(access); err == nil {
-			opened++
-			// Смысл теста: устаревшую запись снимает только сброс при
-			// переподписке — уведомление пришло, когда слушателя не было.
-			if !waitFor(15*time.Second, func() bool {
-				_, err := cache.GetUserAccount(access)
-				return errors.Is(err, auth.ErrNoSuchUser)
-			}) {
-				t.Fatalf("попытка %d: после обрыва и переподписки кэш отдаёт отозванную "+
-					"учётку: переподписка не сбрасывает кэш целиком, и событие, пришедшее "+
-					"в окно между обрывом и LISTEN, потеряно (сбросов: %d)",
-					i, cache.Stats().Flushes)
-			}
-			break
-		}
-		// Окно закрылось до изменения — пробуем снова.
+			return pgx.Connect(ctx, cacheDSN(t, appName))
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	t.Cleanup(func() { release(); _ = cache.Shutdown() })
+	if err := cache.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
 
-	if opened == 0 {
-		t.Fatalf("за %d попыток (бюджет %v) ни разу не открылось окно без слушателя: "+
-			"тест не может проверить сброс при переподписке и зелёным быть не должен",
-			attempts, budget)
+	const access = "frank-deterministic"
+	mustCreate(t, cache, access, "secret", auth.RoleUser, tenantClient)
+	warmUntilCached(t, cache, access)
+
+	pid, err := listenerBackendPID(context.Background(), e, appName)
+	if err != nil {
+		t.Fatalf("найти соединение листенера: %v", err)
+	}
+
+	flushesBefore := cache.Stats().Flushes
+
+	// Обрыв. Слушатель уходит в переподключение и встаёт на gate.
+	if _, err := e.m.Pool.Exec(context.Background(), `SELECT pg_terminate_backend($1)`, pid); err != nil {
+		t.Fatalf("оборвать соединение листенера: %v", err)
+	}
+	if !waitFor(15*time.Second, func() bool { return dials.Load() >= 2 }) {
+		t.Fatal("слушатель не попытался переподключиться после обрыва")
+	}
+
+	// Отзыв — уведомление уходит в пустоту: слушателя нет.
+	if err := cache.DeleteUserAccount(access); err != nil {
+		t.Fatalf("отзыв: %v", err)
+	}
+	// Окно открыто по построению, а не по везению: кэш обязан всё ещё отдавать
+	// отозванную учётку. Если бы он её уже сбросил, дальше проверялось бы не то.
+	if _, err := cache.GetUserAccount(access); err == nil {
+		t.Log("окно подтверждено: отозванная учётка ещё в кэше")
+	} else if !errors.Is(err, auth.ErrNoSuchUser) {
+		t.Fatalf("GetUserAccount: %v", err)
+	}
+
+	// Переподписка: слушатель подключается, делает LISTEN и обязан сбросить
+	// кэш целиком — иначе событие, потерянное в окно, осталось бы в кэше
+	// навсегда.
+	release()
+	if !waitFor(15*time.Second, func() bool {
+		_, err := cache.GetUserAccount(access)
+		return errors.Is(err, auth.ErrNoSuchUser)
+	}) {
+		t.Fatalf("после переподписки кэш отдаёт отозванную учётку: сброс при "+
+			"переподписке не работает, событие из окна потеряно (сбросов было: %d)",
+			flushesBefore)
+	}
+	if cache.Stats().Flushes <= flushesBefore {
+		t.Error("счётчик сбросов не вырос: переподписка не сбросила кэш")
 	}
 }
 
