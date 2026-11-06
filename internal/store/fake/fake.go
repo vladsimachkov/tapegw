@@ -153,6 +153,10 @@ func (s *Store) Put(ctx context.Context, items []store.PutItem, opt store.PutOpt
 			out = append(out, Result{ID: it.ID, Err: store.ErrAttrTooLarge})
 			continue
 		}
+		if err := store.Rewind(it.File); err != nil {
+			out = append(out, Result{ID: it.ID, Err: err})
+			continue
+		}
 		data, err := readAll(it.File)
 		if err != nil {
 			out = append(out, Result{ID: it.ID, Err: err})
@@ -248,6 +252,10 @@ func (s *Store) Get(ctx context.Context, items []store.GetItem) []Result {
 		if !b.complete {
 			// Неполную копию читать нельзя: вернём ошибку, а не мусор.
 			out = append(out, Result{ID: it.ID, Err: store.ErrIncomplete})
+			continue
+		}
+		if err := store.PrepareForWrite(it.File); err != nil {
+			out = append(out, Result{ID: it.ID, Err: err})
 			continue
 		}
 		if _, err := it.File.Write(b.data); err != nil {

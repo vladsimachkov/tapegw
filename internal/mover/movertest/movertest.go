@@ -155,6 +155,10 @@ func (f *Store) Put(_ context.Context, batch []store.PutItem, opt store.PutOptio
 			out = append(out, store.Result{ID: it.ID, Err: store.ErrExists})
 			continue
 		}
+		if err := store.Rewind(it.File); err != nil {
+			out = append(out, store.Result{ID: it.ID, Err: err})
+			continue
+		}
 		b, err := io.ReadAll(it.File)
 		if err != nil {
 			out = append(out, store.Result{ID: it.ID, Err: err})
@@ -180,6 +184,7 @@ func (f *Store) Get(_ context.Context, items []store.GetItem) []store.Result {
 			continue
 		}
 		if it.File != nil {
+			_ = store.PrepareForWrite(it.File)
 			_, _ = it.File.Write(b)
 		}
 		out = append(out, store.Result{ID: it.ID, Version: 1})
