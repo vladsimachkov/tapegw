@@ -10,6 +10,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
 	"strings"
 	"time"
 
@@ -80,6 +81,62 @@ func (m *Meta) Close() { m.Pool.Close() }
 // Схема из search_path создаётся автоматически: миграции пишут таблицы без
 // квалификатора, и без схемы первый запуск на чистой базе упал бы с
 // "schema tapegw does not exist".
+// LatestVersion — максимальный номер миграции в наборе. Тестам нужно «применить
+// всё», а goose up-to с номером больше максимального ничего лишнего не делает,
+// поэтому «всё» надо посчитать, а не выдумать большое число.
+func LatestVersion() (int, error) {
+	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	if err != nil {
+		return 0, fmt.Errorf("читать каталог миграций: %w", err)
+	}
+	max := 0
+	for _, e := range entries {
+		var v int
+		if _, err := fmt.Sscanf(e.Name(), "%04d_", &v); err != nil {
+			continue
+		}
+		if v > max {
+			max = v
+		}
+	}
+	if max == 0 {
+		return 0, fmt.Errorf("в наборе миграций нет ни одной")
+	}
+	return max, nil
+}
+
+// MigrateUpTo применяет миграции не все до конца, а до версии включительно.
+// Нужен тестам миграций: чтобы проверить Up номер N, схема должна быть в
+// состоянии N-1, и делать это надо тем же goose, что и в бою, — ручной
+// пересказ SQL проверяет память автора теста, а не файл (правило 11).
+func MigrateUpTo(ctx context.Context, dsn string, upTo int) error {
+	schema, err := schemaFromDSN(dsn)
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return fmt.Errorf("open for migrations: %w", err)
+	}
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("ping for migrations: %w", err)
+	}
+	if schema != "" {
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", pgx.Identifier{schema}.Sanitize())); err != nil {
+			return fmt.Errorf("create schema %q: %w", schema, err)
+		}
+	}
+	goose.SetBaseFS(migrationsFS)
+	if err := goose.SetDialect("postgres"); err != nil {
+		return fmt.Errorf("goose dialect: %w", err)
+	}
+	if err := goose.RunContext(ctx, "up-to", db, "migrations", fmt.Sprint(upTo)); err != nil {
+		return fmt.Errorf("migrate up to %d: %w", upTo, err)
+	}
+	return nil
+}
+
 func Migrate(ctx context.Context, dsn string) error {
 	schema, err := schemaFromDSN(dsn)
 	if err != nil {

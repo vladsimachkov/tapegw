@@ -18,8 +18,7 @@ import (
 const migration0019 = "migrations/0019_copy_sha256.sql"
 
 func TestMigration0019CopySha256(t *testing.T) {
-	m := testdb.Connect(t)
-	testdb.Clean(t, m)
+	m := testdb.MigrationScratch(t, testdb.AllVersions)
 	ctx := context.Background()
 
 	if n := columnIn(t, ctx, m, "archive_copies", "sha256"); n != 1 {
