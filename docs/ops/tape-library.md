@@ -403,3 +403,78 @@ SELECT c.copy_name, c.version, c.copy_status, e.medium_id, e.state
   `phobos_tlc` на своём порту) — на стенде есть вторая библиотека mhVTL, но в
   Phobos она не зарегистрирована; сценарий переезда ленты между библиотеками
   (вопрос M0-11 №1) поэтому не проверен.
+
+## phobosd: запуск, локи, сокет
+
+**Правило: phobosd на стенде запускается только через systemd.** Ручной запуск
+допустим только после `systemctl stop phobosd`, и после ручной работы обязательно
+остановить ручной процесс и проверить, что не осталось локов. Иначе через месяц
+получаете «все поля зелёные, а `put` отвечает `ENODEV`».
+
+### `put` на `dir` отвечает `ENODEV`, хотя носитель выглядит готовым
+
+Симптом: `phobos put -f dir -L dirlib -l raid1 ...` → `No such device`, при этом
+`phobos dir list -o all` показывает `adm_status=unlocked`, `put_access=True`,
+`fs.status=empty`, `stats.phys_spc_free` с запасом.
+
+Причина: устройство занято — в DSS записаны `lock_hostname` и `lock_owner`
+(например `localhost` / `180349`). `ENODEV` от LRS означает «нет устройства,
+которое может обслужить носитель», а не «нет носителя». Локи живут в базе, а не в
+памяти процесса: убить phobosd недостаточно.
+
+Что делать: `phobos lock clean` (выводит `N lock(s) cleaned`), затем убедиться,
+что `lock_owner` стал `0`. В DSS руками не лезть.
+
+### `systemctl restart phobosd` падает с `File exists (17)` и кодом 239
+
+Симптом: `Unable to create lock file '/run/phobosd/phobosd.lock': File exists`,
+`status=239/CACHE_DIRECTORY`.
+
+Причина: живёт phobosd, запущенный вручную (`/usr/sbin/phobosd -i`). Systemd его
+не порождал, поэтому `restart` его не останавливает, а новый демон не может
+создать файл лока.
+
+Что делать: найти PID (`pgrep -a phobosd`) и остановить по PID. **Не `pkill -f`
+через SSH** — совпадёт командная строка собственного удалённого шелла и убьёт
+сессию (см. выше). Затем `systemctl start phobosd` и проверить `pgrep -a phobosd`
+— процесс обязан быть ровно один.
+
+### `Transport endpoint is not connected` при активном юните
+
+Симптом: `systemctl is-active phobosd` = `active`, а CLI отвечает
+`Cannot contact 'phobosd': Transport endpoint is not connected`. Конфиг задаёт
+`server_socket = /tmp/socklrs`, файла в `/tmp` нет.
+
+Причина: **не найдена**. Гипотеза `PrivateTmp=yes` проверена и **отвергнута**:
+`systemctl show phobosd -p PrivateTmp` → `PrivateTmp=no`, `RuntimeDirectory=phobosd`
+уже задан, и в `/proc/<pid>/root/tmp` сокета тоже нет. То есть демон активен, но
+сокет по пути из конфига не создаёт — куда он его создаёт (или почему не создаёт),
+не установлено.
+
+Что делать: разбираться, а не обходить. Проверить, какой конфиг читает демон
+(`PHOBOS_CFG_FILE` в юните), и нет ли второго phobosd.
+
+### Сокет LRS стоит держать вне `/tmp`
+
+Не потому, что подтверждён `PrivateTmp` (он отвергнут), а потому, что клиентом
+сокета будет не только CLI, но и `tapegw-mover` под systemd: если у его юнита
+`PrivateTmp=yes` (частая настройка по умолчанию), он получит свой `/tmp` и снова
+«Transport endpoint is not connected» — уже в бою. Путь вне `/tmp` закрывает это
+для всех клиентов сразу, потому что `PrivateTmp` на `/run` не влияет.
+
+План: `server_socket = /run/phobosd/socklrs`; `RuntimeDirectory=phobosd` уже
+задан — systemd создаёт каталог при старте и удаляет при остановке, что заодно
+снимает проблему устаревшего `phobosd.lock`. **Права на сокет** — отдельное
+требование к деплою (M9): phobosd работает от root, mover от своего
+пользователя, нужна общая группа (`RuntimeDirectoryMode` либо группа на каталоге),
+иначе mover получит отказ в доступе.
+
+### `phobos dir list -o <поля>` для `dir`
+
+Симптом: `phobos dir list -o fs_status,phys_spc_free` → `bad output attributes`.
+
+Причина: для семейства `dir` эти имена в `-o` не принимаются (в отличие от
+`tape`).
+
+Что делать: `phobos dir list -o all` и смотреть `fs.status`,
+`stats.phys_spc_free`, `lock_owner`, `adm_status`.
