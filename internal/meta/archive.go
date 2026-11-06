@@ -108,36 +108,132 @@ VALUES ($1, $2, $3, $4, $5, '%s', $6, NULLIF($7, 0), %s)`, state, doneAt),
 		return fmt.Errorf("meta: записать копию пачки: %w", err)
 	}
 
+	// Адреса участников уже стоят (SealPack, до отправки). Здесь только переход
+	// в 'archived': данные на ленте и копия учтена.
 	for _, pl := range placements {
-		if pl.Length == 0 {
-			tx.Rollback(ctx)
-			return fmt.Errorf("meta: участник %s нулевой длины — CHECK objects_pack_member не примет такую ссылку", pl.Version)
-		}
 		tag, err := tx.Exec(ctx, `
-UPDATE objects SET state = 'archived', archived_at = now(),
-       pack_id = $1, pack_offset = $2, pack_length = $3
-WHERE id = $4 AND state = 'archiving'`,
-			packID, pl.Offset, pl.Length, pl.Version)
+UPDATE objects SET state = 'archived', archived_at = now()
+WHERE id = $3 AND pack_id = $1 AND pack_offset = $2 AND state = 'archiving'`,
+			packID, pl.Offset, pl.Version)
 		if err != nil {
 			return fmt.Errorf("meta: перевести в archived: %w", err)
 		}
 		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("meta: участник %s не из этой пачки", pl.Version)
+			return fmt.Errorf("meta: участник %s не из этой пачки или не запечатан", pl.Version)
 		}
 	}
-	if _, err := tx.Exec(ctx, `
--- live_bytes приравнивается total_bytes прямо здесь: пачка только что
-    -- записана, мёртвых байт в ней быть не может, а планировщик ёмкости читает
-    -- именно live_bytes.
-UPDATE packs SET state = 'sealed',
-       total_bytes = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
-       live_bytes  = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
-       members_total = (SELECT count(*) FROM objects WHERE pack_id = $1),
-       members_live  = (SELECT count(*) FROM objects WHERE pack_id = $1)
-WHERE id = $1`, packID); err != nil {
+	tag, err := tx.Exec(ctx, `
+UPDATE packs SET state = 'archived', archived_at = now()
+WHERE id = $1 AND state = 'sealed'`, packID)
+	if err != nil {
 		return fmt.Errorf("meta: закрыть пачку: %w", err)
 	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("meta: пачка %s не запечатана — архивировать нечего", packID)
+	}
 	return tx.Commit(ctx)
+}
+
+// SealPack — шаг 3 цикла: пачка запечатана, адреса участников известны, отправки
+// ещё не было.
+//
+// Смысл ровно тот же, что у CHECK objects_pack_member: ссылка без адреса ничего
+// не стоит. Поэтому смещения берутся из первого прохода (сборка детерминирована,
+// ADR-0020) и ставятся ДО mover'а. После этого сбой на любом шаге оставляет
+// объекты в 'archiving' с pack_id, и повтор продолжает ТУ ЖЕ пачку — тот же
+// UUID, тот же oid Phobos, те же участники в том же порядке.
+func (m *Meta) SealPack(ctx context.Context, packID uuid.UUID, placements []Placement) error {
+	if len(placements) == 0 {
+		return fmt.Errorf("meta: нечего запечатывать")
+	}
+	tx, err := m.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("meta: начать запечатывание: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // после commit нечего откатывать
+
+	for _, pl := range placements {
+		if pl.Length == 0 {
+			return fmt.Errorf("meta: участник %s нулевой длины — CHECK objects_pack_member не примет такую ссылку", pl.Version)
+		}
+		tag, err := tx.Exec(ctx, `
+UPDATE objects SET pack_id = $1, pack_offset = $2, pack_length = $3
+WHERE id = $4 AND state = 'archiving' AND pack_id IS NULL`,
+			packID, pl.Offset, pl.Length, pl.Version)
+		if err != nil {
+			return fmt.Errorf("meta: проставить размещение: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("meta: участник %s не из этой пачки или уже запечатан", pl.Version)
+		}
+	}
+	// Итоги пачки считаются здесь же: они зависят только от смещений, а они
+	// известны. Планировщик ёмкости читает live_bytes и не должен видеть
+	// запечатанную пачку с нулём.
+	tag, err := tx.Exec(ctx, `
+UPDATE packs SET state = 'sealed',
+       total_bytes   = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
+       live_bytes    = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
+       members_total = (SELECT count(*) FROM objects WHERE pack_id = $1),
+       members_live  = (SELECT count(*) FROM objects WHERE pack_id = $1)
+WHERE id = $1 AND state = 'open'`, packID)
+	if err != nil {
+		return fmt.Errorf("meta: запечатать пачку: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("meta: пачка %s не в open — повторное запечатывание", packID)
+	}
+	return tx.Commit(ctx)
+}
+
+// PackOfArchiving возвращает пачку, в которую эти объекты уже запечатаны.
+// Нужна для продолжения после сбоя: без неё следующий цикл завёл бы новую пачку
+// с новым oid, и первая запись осталась на ленте никем не учтённой.
+//
+// Возвращает uuid.Nil, если единой пачки нет: объекты без pack_id или из
+// разных пачек. Смешанную компанию продолжат отдельными пачками — перемешивать
+// участников между пачками нельзя, это меняет байты.
+func (m *Meta) PackOfArchiving(ctx context.Context, ids []uuid.UUID) (uuid.UUID, error) {
+	var missing, distinct int
+	var packID *uuid.UUID
+	err := m.Pool.QueryRow(ctx, `
+SELECT count(*) FILTER (WHERE pack_id IS NULL),
+       count(DISTINCT pack_id),
+       -- min(uuid) в Postgres нет, а нужен «любой из, раз они все равны»:
+       -- равенство проверяет distinct = 1 выше.
+       (array_agg(pack_id) FILTER (WHERE pack_id IS NOT NULL))[1]
+FROM objects WHERE id = ANY($1::uuid[])`, ids).Scan(&missing, &distinct, &packID)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("meta: найти пачку объектов: %w", err)
+	}
+	// Единая пачка — это когда у ВСЕХ объектов она есть и она одна. Иначе
+	// продолжения нет: часть без адреса, или компания разбросана по пачкам, а
+	// перемешивать участников нельзя (байты и сумма другие).
+	if missing > 0 || distinct != 1 || packID == nil {
+		return uuid.Nil, nil
+	}
+	return *packID, nil
+}
+
+// SealedMembers возвращает участников запечатанной пачки в порядке смещений —
+// тот самый порядок, в котором байты уже посчитаны. Повтор обязан собрать пачку
+// в нём же, иначе сумма не сойдётся.
+func (m *Meta) SealedMembers(ctx context.Context, packID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := m.Pool.Query(ctx, `
+SELECT id FROM objects WHERE pack_id = $1 ORDER BY pack_offset`, packID)
+	if err != nil {
+		return nil, fmt.Errorf("meta: участники пачки: %w", err)
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("meta: участники пачки: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // FailPackArchive возвращает участников в pending после отказа mover.

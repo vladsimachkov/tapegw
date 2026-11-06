@@ -91,6 +91,27 @@ func (a *Archiver) resolveUnknown(ctx context.Context, packID uuid.UUID, plan *P
 	return res, nil
 }
 
+// inOrder расставляет участников в заданном порядке. Используется при
+// продолжении: порядок запечатан в пачке, а батч мог прийти в другом.
+func inOrder(items []Item, order []uuid.UUID) ([]Item, error) {
+	byID := make(map[uuid.UUID]Item, len(items))
+	for _, it := range items {
+		byID[it.Version] = it
+	}
+	out := make([]Item, 0, len(order))
+	for _, id := range order {
+		it, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("migrator: участник %s запечатан, но его нет в батче — файл потерян?", id)
+		}
+		out = append(out, it)
+	}
+	if len(out) != len(items) {
+		return nil, fmt.Errorf("migrator: в батче %d участников, в пачке %d — состав разбежался", len(items), len(out))
+	}
+	return out, nil
+}
+
 func (a *Archiver) logger() *slog.Logger {
 	if a.Log != nil {
 		return a.Log
@@ -120,32 +141,69 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 		ids = append(ids, it.Version)
 	}
 
-	tx, packID, err := a.Meta.BeginPackArchive(ctx, poolID, ids)
+	// Шаг 1 — или новый батч, или продолжение запечатанной пачки после сбоя.
+	// Второй случай и есть причина всей схемы: без него следующий цикл завёл бы
+	// новую пачку с новым oid, и первая запись осталась бы на ленте никем не
+	// учтённой.
+	packID, err := a.Meta.PackOfArchiving(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
-	// Страховка от утечки соединения: любой ранний выход до коммита обязан
-	// закрыть транзакцию, иначе пул остаётся с занятым соединением и
-	// pool.Close() в cleanup тестов висит навсегда. После коммита откат —
-	// ErrTxClosed, его не смотрим.
-	defer tx.Rollback(ctx) //nolint:errcheck
+	resumed := packID != uuid.Nil
+	if resumed {
+		// Порядок участников берётся из пачки, а не из пришедшего батча:
+		// байты (и сумма) определяются порядком, а запечатаны они уже.
+		order, err := a.Meta.SealedMembers(ctx, packID)
+		if err != nil {
+			return nil, err
+		}
+		items, err = inOrder(items, order)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		tx, freshID, err := a.Meta.BeginPackArchive(ctx, poolID, ids)
+		if err != nil {
+			return nil, err
+		}
+		packID = freshID
+		// Страховка от утечки соединения: любой ранний выход до коммита обязан
+		// закрыть транзакцию, иначе пул остаётся с занятым соединением и
+		// pool.Close() в cleanup тестов висит навсегда. После коммита откат —
+		// ErrTxClosed, его не смотрим.
+		defer tx.Rollback(ctx) //nolint:errcheck
 
-	// Коммит здесь — смысл правила 13. Если перенести вызов mover'а выше этой
-	// строки, транзакция будет держать строки участников на всё время записи,
-	// и тест С8 это ловит явно: NOWAIT на строку объекта падает с 55P03.
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("migrator: закоммитить переход: %w", err)
+		// Коммит здесь — смысл правила 13. Если перенести вызов mover'а выше
+		// этой строки, транзакция будет держать строки участников на всё время
+		// записи, и тест С8 это ловит явно: NOWAIT на строку объекта 55P03.
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("migrator: закоммитить переход: %w", err)
+		}
 	}
 
+	// Шаг 2 — первый проход: размер, сумма и смещения.
 	plan, err := Measure(items)
 	if err != nil {
 		a.Meta.FailPackArchive(ctx, packID, ids, "сборка: "+err.Error())
 		return nil, err
 	}
 
+	// Шаг 3 — запечатать ДО отправки. Именно здесь у объектов появляется
+	// pack_id с адресом, и с этого момента сбой оставляет достаточное, чтобы
+	// повтор продолжил эту же пачку.
+	if !resumed {
+		if err := a.Meta.SealPack(ctx, packID, metaPlacements(plan.Placements)); err != nil {
+			a.Meta.FailPackArchive(ctx, packID, ids, "запечатывание: "+err.Error())
+			return nil, err
+		}
+	}
+
+	// Шаг 4 — второй проход и отправка. Транзакции нет (правило 13).
 	var buf bytes.Buffer
 	placements, err := BuildIndexed(&buf, items, plan)
 	if err != nil {
+		// Пачка запечатана, но на ленту ничего не шло: отказ определённый,
+		// снимается членство.
 		a.Meta.FailPackArchive(ctx, packID, ids, "второй проход: "+err.Error())
 		return nil, err
 	}

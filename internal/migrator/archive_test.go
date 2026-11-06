@@ -49,6 +49,8 @@ type probeMover struct {
 	forget      bool
 	statusCalls int
 	lastOp      uuid.UUID
+	lastID      uuid.UUID // oid, с которым mover реально вызвали
+	failPut     error     // если задан — put падает ДО записи (м mover лёг)
 }
 
 func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
@@ -81,6 +83,10 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 	}
 
 	p.lastOp = in.Op
+	p.lastID = in.ID
+	if p.failPut != nil {
+		return nil, p.failPut
+	}
 	p.accept = true
 	if p.written == nil {
 		p.written = map[uuid.UUID]int{}
@@ -351,5 +357,82 @@ func TestLostRegistryResendsSamePack(t *testing.T) {
 	}
 	if pm.replays[pm.lastOp] != 1 {
 		t.Errorf("повторов той же пачки %d, ждали 1 — пересылать надо тот же op, а не новый", pm.replays[pm.lastOp])
+	}
+}
+
+// Продолжение запечатанной пачки после сбоя.
+//
+// Сбой между запечатыванием и итогом оставляет объекты в 'archiving' с pack_id.
+// Повтор обязан продолжить ЕЁ ЖЕ: тот же oid, те же участники в том же порядке.
+// Если вместо этого заведётся новая пачка, первая запись останется на ленте
+// никем не учтённой — данные дважды, live_bytes врёт, reconciler не видит.
+func TestResumeContinuesSealedPack(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "resume", 3)
+	a, pm := archiver(t, m, ids[0])
+	pm.failPut = errors.New("mover недоступен")
+
+	if _, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil); err == nil {
+		t.Fatal("первая попытка должна была упасть")
+	}
+
+	// После сбоя участник обязан быть запечатан: без этого повтор заведёт новую
+	// пачку, и весь смысл запечатывания теряется.
+	var sealed uuid.UUID
+	var state string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT pack_id, state::text FROM objects WHERE id = $1`, ids[0]).Scan(&sealed, &state); err != nil {
+		t.Fatal(err)
+	}
+	if sealed == uuid.Nil {
+		t.Fatal("объект не запечатан до отправки — повтор заведёт вторую пачку")
+	}
+	var packState string
+	if err := m.Pool.QueryRow(ctx, `SELECT state::text FROM packs WHERE id = $1`, sealed).Scan(&packState); err != nil {
+		t.Fatal(err)
+	}
+	if packState != "sealed" {
+		t.Errorf("пачка в %s, ждали sealed", packState)
+	}
+
+	// «Перезапуск»: новый Archiver, тот же состав, порядок намеренно другой —
+	// он должен быть приведён к запечатанному, иначе байты не совпадут.
+	a2, pm2 := archiver(t, m, ids[0])
+	shuffled := itemsFor(ids)
+	for i, j := 0, len(shuffled)-1; i < j; i, j = i+1, j-1 {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	}
+	if _, err := a2.ArchivePack(ctx, 1, shuffled, nil); err != nil {
+		t.Fatalf("продолжение не прошло: %v", err)
+	}
+
+	if pm2.lastID != sealed {
+		t.Errorf("повтор отправил пачку %s вместо запечатанной %s — на ленте будет вторая копия",
+			pm2.lastID, sealed)
+	}
+	if len(pm2.written) != 1 {
+		t.Errorf("объектов на ленте %d, ждали 1", len(pm2.written))
+	}
+
+	// Ровно одна пачка на эти объекты: вторая означает дубль.
+	var packs int
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(DISTINCT pack_id) FROM objects WHERE id = ANY($1::uuid[])`, ids).Scan(&packs); err != nil {
+		t.Fatal(err)
+	}
+	if packs != 1 {
+		t.Errorf("пачек %d, ждали 1", packs)
+	}
+
+	var archived int
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM objects WHERE id = ANY($1::uuid[]) AND state = 'archived'`, ids).Scan(&archived); err != nil {
+		t.Fatal(err)
+	}
+	if archived != len(ids) {
+		t.Errorf("archived %d из %d", archived, len(ids))
 	}
 }

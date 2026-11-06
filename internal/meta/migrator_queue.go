@@ -332,8 +332,14 @@ func (m *Meta) RequeueArchiving(ctx context.Context, ids []uuid.UUID, reason str
 		       attempts = attempts + 1,
 		       last_error = $2,
 		       next_try_at = now() + (make_interval(secs => `+exp+`)::interval)
+		   -- Объекты с pack_id в pending не возвращаются (инвариант 2 цикла):
+		   -- они запечатаны в пачку, и повтор обязан продолжить её же. Возврат
+		   -- в pending здесь означал бы новую пачку с новым oid и вторую копию
+		   -- на ленте. Разбирается такая пачка явно — FailPackArchive снимает
+		   -- членство, когда точно известно, что на ленте её нет.
 		 WHERE id = ANY($1::uuid[])
-		   AND state = 'archiving'`,
+		   AND state = 'archiving'
+		   AND pack_id IS NULL`,
 		ids, reason)
 	if err != nil {
 		return 0, 0, fmt.Errorf("requeue: pending: %w", err)

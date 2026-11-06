@@ -62,29 +62,41 @@ func (it Item) member() (pack.Member, error) {
 	}, nil
 }
 
-// Plan — результат первого прохода: то, что migrator объявляет mover'у.
+// Plan — результат первого прохода: то, что migrator объявляет mover'у, и
+// смещения участников.
+//
+// Смещения здесь не «как бонус ко второму проходу»: на них держится
+// запечатывание пачки ДО отправки (шаг 3 цикла в docs/plans/m4-migrator-cycle.md).
+// Сборка детерминирована (ADR-0020), поэтому первый проход, который гоняет те же
+// байты в io.Discard, даёт те же смещения, что и второй. Если бы второй проход
+// дал другие, не сошлась бы сумма и отправка была бы отклонена.
 type Plan struct {
 	Size   int64
 	SHA256 string
+
+	// Placements — где каждый участник ляжет в пачку. Порядок совпадает с
+	// порядком items.
+	Placements []Placement
 }
 
-// Measure — первый проход: сборка в io.Discard с подсчётом размера и суммы.
+// Measure — первый проход: сборка в io.Discard с подсчётом размера, суммы и
+// смещений участников.
 //
 // Байты этого прохода никуда не пишутся специально: если записать их на
 // landing, смысл двухпроходной схемы теряется.
 func Measure(items []Item) (*Plan, error) {
 	sum := sha256.New()
-	n, err := build(io.Discard, items, sum)
+	placements, n, err := buildIndexed(io.Discard, items, sum)
 	if err != nil {
 		return nil, err
 	}
-	return &Plan{Size: n, SHA256: hex.EncodeToString(sum.Sum(nil))}, nil
+	return &Plan{Size: n, SHA256: hex.EncodeToString(sum.Sum(nil)), Placements: placements}, nil
 }
 
-// Placement — где участник лежит в пачке. Нужен, чтобы поставить ссылку
-// objects.pack_id + pack_offset + pack_length одной транзакцией с переходом в
-// archived: CHECK objects_pack_member не допускает pack_id без смещения, и это
-// верно — ссылка без адреса ничего не стоит.
+// Placement — где участник лежит в пачке. Ставится в objects.pack_id +
+// pack_offset + pack_length на шаге запечатывания, до отправки: CHECK
+// objects_pack_member не допускает pack_id без смещения, и это верно — ссылка
+// без адреса ничего не стоит.
 type Placement struct {
 	Version uuid.UUID
 	Offset  uint64
@@ -120,15 +132,11 @@ func BuildIndexed(w io.Writer, items []Item, plan *Plan) ([]Placement, error) {
 	return placements, nil
 }
 
-// build собирает пачку в w и, если sum задан, считает SHA-256 записанного.
+// buildIndexed собирает пачку в w и, если sum задан, считает SHA-256
+// записанного; обратно отдаёт смещения участников.
 //
 // Порядок участников задаёт вызывающий, и оба прохода обязаны идти в нём:
 // перестановка меняет байты, а значит и сумму.
-func build(w io.Writer, items []Item, sum hash.Hash) (int64, error) {
-	_, n, err := buildIndexed(w, items, sum)
-	return n, err
-}
-
 func buildIndexed(w io.Writer, items []Item, sum hash.Hash) ([]Placement, int64, error) {
 	cw := &countWriter{w: w, sum: sum}
 	tw := pack.NewWriter(cw)
