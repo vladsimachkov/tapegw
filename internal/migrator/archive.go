@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -91,27 +92,6 @@ func (a *Archiver) resolveUnknown(ctx context.Context, packID uuid.UUID, plan *P
 	return res, nil
 }
 
-// inOrder расставляет участников в заданном порядке. Используется при
-// продолжении: порядок запечатан в пачке, а батч мог прийти в другом.
-func inOrder(items []Item, order []uuid.UUID) ([]Item, error) {
-	byID := make(map[uuid.UUID]Item, len(items))
-	for _, it := range items {
-		byID[it.Version] = it
-	}
-	out := make([]Item, 0, len(order))
-	for _, id := range order {
-		it, ok := byID[id]
-		if !ok {
-			return nil, fmt.Errorf("migrator: участник %s запечатан, но его нет в батче — файл потерян?", id)
-		}
-		out = append(out, it)
-	}
-	if len(out) != len(items) {
-		return nil, fmt.Errorf("migrator: в батче %d участников, в пачке %d — состав разбежался", len(items), len(out))
-	}
-	return out, nil
-}
-
 func (a *Archiver) logger() *slog.Logger {
 	if a.Log != nil {
 		return a.Log
@@ -141,44 +121,25 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 		ids = append(ids, it.Version)
 	}
 
-	// Шаг 1 — или новый батч, или продолжение запечатанной пачки после сбоя.
-	// Второй случай и есть причина всей схемы: без него следующий цикл завёл бы
-	// новую пачку с новым oid, и первая запись осталась бы на ленте никем не
-	// учтённой.
-	packID, err := a.Meta.PackOfArchiving(ctx, ids)
+	// Шаг 1 — завести пачку и перевести объекты в archiving. Продолжением
+	// запечатанных пачек занимается ResumePacks: там вход от пачки, потому что
+	// после перезапуска списка объектов ниоткуда не берётся.
+	tx, freshID, err := a.Meta.BeginPackArchive(ctx, poolID, ids)
 	if err != nil {
 		return nil, err
 	}
-	resumed := packID != uuid.Nil
-	if resumed {
-		// Порядок участников берётся из пачки, а не из пришедшего батча:
-		// байты (и сумма) определяются порядком, а запечатаны они уже.
-		order, err := a.Meta.SealedMembers(ctx, packID)
-		if err != nil {
-			return nil, err
-		}
-		items, err = inOrder(items, order)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		tx, freshID, err := a.Meta.BeginPackArchive(ctx, poolID, ids)
-		if err != nil {
-			return nil, err
-		}
-		packID = freshID
-		// Страховка от утечки соединения: любой ранний выход до коммита обязан
-		// закрыть транзакцию, иначе пул остаётся с занятым соединением и
-		// pool.Close() в cleanup тестов висит навсегда. После коммита откат —
-		// ErrTxClosed, его не смотрим.
-		defer tx.Rollback(ctx) //nolint:errcheck
+	packID := freshID
+	// Страховка от утечки соединения: любой ранний выход до коммита обязан
+	// закрыть транзакцию, иначе пул остаётся с занятым соединением и
+	// pool.Close() в cleanup тестов висит навсегда. После коммита откат —
+	// ErrTxClosed, его не смотрим.
+	defer tx.Rollback(ctx) //nolint:errcheck
 
-		// Коммит здесь — смысл правила 13. Если перенести вызов mover'а выше
-		// этой строки, транзакция будет держать строки участников на всё время
-		// записи, и тест С8 это ловит явно: NOWAIT на строку объекта 55P03.
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("migrator: закоммитить переход: %w", err)
-		}
+	// Коммит здесь — смысл правила 13. Если перенести вызов mover'а выше этой
+	// строки, транзакция будет держать строки участников на всё время записи,
+	// и тест С8 это ловит явно: NOWAIT на строку объекта 55P03.
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("migrator: закоммитить переход: %w", err)
 	}
 
 	// Шаг 2 — первый проход: размер, сумма и смещения.
@@ -190,14 +151,25 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 
 	// Шаг 3 — запечатать ДО отправки. Именно здесь у объектов появляется
 	// pack_id с адресом, и с этого момента сбой оставляет достаточное, чтобы
-	// повтор продолжил эту же пачку.
-	if !resumed {
-		if err := a.Meta.SealPack(ctx, packID, metaPlacements(plan.Placements)); err != nil {
-			a.Meta.FailPackArchive(ctx, packID, ids, "запечатывание: "+err.Error())
-			return nil, err
-		}
+	// пачку продолжил любой процесс (ResumePacks), а не только этот.
+	if err := a.Meta.SealPack(ctx, packID, metaPlacements(plan.Placements), plan.Size); err != nil {
+		a.Meta.FailPackArchive(ctx, packID, ids, "запечатывание: "+err.Error())
+		return nil, err
 	}
 
+	// Шаги 4 и 5 — отправка и итог.
+	return a.deliver(ctx, packID, items, plan, attrs)
+}
+
+// deliver — шаги 4 и 5: второй проход, отправка, разбор неизвестного итога и
+// запись результата. Транзакции во время вызова mover'а нет (правило 13).
+// Общий для ArchivePack и ResumePacks: продолжение обязано пройти ровно тот же
+// путь, иначе «продолжили не так» превратится в вторую копию.
+func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, plan *Plan, attrs map[string]string) (*Plan, error) {
+	ids := make([]uuid.UUID, 0, len(items))
+	for _, it := range items {
+		ids = append(ids, it.Version)
+	}
 	// Шаг 4 — второй проход и отправка. Транзакции нет (правило 13).
 	var buf bytes.Buffer
 	placements, err := BuildIndexed(&buf, items, plan)
@@ -260,4 +232,82 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 		return nil, err
 	}
 	return plan, nil
+}
+
+// LoadItems поднимает участников по id: файлы на landing, обёрнутые DEK,
+// длина шифротекста. Его пишет воркер M4 — и продолжению нужен ровно тот же
+// загрузчик, что и обычной архивации, иначе «продолжили не так» даст другие
+// байты и сумма не сойдётся.
+type LoadItems func(ctx context.Context, ids []uuid.UUID) ([]Item, error)
+
+// ResumePacks — точка входа восстановления после перезапуска.
+//
+// Вход от пачки, а не от объектов, и это принципиально: участники запечатанной
+// пачки сидят в 'archiving' с pack_id, в батч не попадают (ClaimMigrationBatch
+// берёт только 'pending') и в pending не возвращаются (инвариант 2). Если искать
+// по списку объектов, список взять неоткуда, и пачка останется в 'sealed'
+// навсегда — то самое тихое зависание, только в другом месте.
+//
+// Возвращает число доведённых пачек и первую ошибку, если она была: одна
+// разбороненная пачка не должна мешать остальным.
+func (a *Archiver) ResumePacks(ctx context.Context, processID string, ttl time.Duration,
+	load LoadItems, attrs map[string]string) (int, error) {
+
+	if load == nil {
+		return 0, fmt.Errorf("migrator: ResumePacks без загрузчика участников")
+	}
+	done, firstErr := 0, error(nil)
+	for {
+		packID, err := a.Meta.ClaimSealedPack(ctx, processID, ttl)
+		if err != nil {
+			return done, err
+		}
+		if packID == uuid.Nil {
+			return done, firstErr
+		}
+		if err := a.resumeOne(ctx, packID, load, attrs); err != nil {
+			a.logger().Error("продолжение пачки не удалось",
+				"pack", packID.String(), "err", err.Error())
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			done++
+		}
+		if err := a.Meta.ReleasePack(ctx, packID); err != nil {
+			return done, err
+		}
+	}
+}
+
+func (a *Archiver) resumeOne(ctx context.Context, packID uuid.UUID, load LoadItems, attrs map[string]string) error {
+	// Порядок берётся из пачки по смещениям: он определяет байты, а смещения
+	// зафиксированы при запечатывании.
+	members, err := a.Meta.SealedMembers(ctx, packID)
+	if err != nil {
+		return err
+	}
+	if len(members) == 0 {
+		return fmt.Errorf("migrator: пачка %s запечатана без участников", packID)
+	}
+	items, err := load(ctx, members)
+	if err != nil {
+		return fmt.Errorf("migrator: загрузить участников пачки %s: %w", packID, err)
+	}
+	// Порядок — не деталь вежливости: он определяет байты. Загрузчик обязан
+	// вернуть участников в том же порядке, что и запросили, и проверка здесь
+	// стоит ровно потому, что перестановка всплывёт только как «сумма не
+	// сошлась» где-то далеко от причины.
+	for i, id := range members {
+		if items[i].Version != id {
+			return fmt.Errorf("migrator: загрузчик вернул %s на месте %s — порядок определяет байты пачки",
+				items[i].Version, id)
+		}
+	}
+	plan, err := Measure(items)
+	if err != nil {
+		return fmt.Errorf("migrator: пересобрать пачку %s: %w", packID, err)
+	}
+	_, err = a.deliver(ctx, packID, items, plan, attrs)
+	return err
 }

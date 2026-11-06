@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"time"
 )
 
 // Placement — где участник лежит внутри пачки. Ставится в objects одной
@@ -142,7 +143,13 @@ WHERE id = $1 AND state = 'sealed'`, packID)
 // ADR-0020) и ставятся ДО mover'а. После этого сбой на любом шаге оставляет
 // объекты в 'archiving' с pack_id, и повтор продолжает ТУ ЖЕ пачку — тот же
 // UUID, тот же oid Phobos, те же участники в том же порядке.
-func (m *Meta) SealPack(ctx context.Context, packID uuid.UUID, placements []Placement) error {
+// sizeBytes — полный размер пачки из плана, а НЕ сумма pack_length
+// участников: в пачку входят заголовки tar/pax (~1 КБ на участника), индекс и
+// футер. Планировщик ёмкости читает total_bytes и на сумме недооценивал бы
+// занятое место, что для мелких участников заметно. Отсюда следствие, которое
+// стоит помнить: у полностью живой пачки live_bytes / total_bytes чуть меньше
+// единицы, и это не ошибка учёта.
+func (m *Meta) SealPack(ctx context.Context, packID uuid.UUID, placements []Placement, sizeBytes int64) error {
 	if len(placements) == 0 {
 		return fmt.Errorf("meta: нечего запечатывать")
 	}
@@ -172,11 +179,11 @@ WHERE id = $4 AND state = 'archiving' AND pack_id IS NULL`,
 	// запечатанную пачку с нулём.
 	tag, err := tx.Exec(ctx, `
 UPDATE packs SET state = 'sealed',
-       total_bytes   = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
+       total_bytes   = $2,
        live_bytes    = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
        members_total = (SELECT count(*) FROM objects WHERE pack_id = $1),
        members_live  = (SELECT count(*) FROM objects WHERE pack_id = $1)
-WHERE id = $1 AND state = 'open'`, packID)
+WHERE id = $1 AND state = 'open'`, packID, sizeBytes)
 	if err != nil {
 		return fmt.Errorf("meta: запечатать пачку: %w", err)
 	}
@@ -184,6 +191,52 @@ WHERE id = $1 AND state = 'open'`, packID)
 		return fmt.Errorf("meta: пачка %s не в open — повторное запечатывание", packID)
 	}
 	return tx.Commit(ctx)
+}
+
+// ClaimSealedPack берёт на продолжение одну запечатанную пачку, которую сейчас
+// никто не ведёт. Возвращает uuid.Nil, если таких нет.
+//
+// Это точка входа восстановления после перезапуска: объекты запечатанной пачки
+// сидят в 'archiving' с pack_id, в батч не попадают и в pending не возвращаются,
+// поэтому искать надо от пачки, а не от списка объектов.
+//
+// Захват — отметка в строке, а не локи на время работы: отправка mover'у
+// занимает минуты, и держать блокировку столько значило бы нарушить правило 13.
+// FOR UPDATE SKIP LOCKED держится только внутри этой короткой транзакции.
+func (m *Meta) ClaimSealedPack(ctx context.Context, processID string, ttl time.Duration) (uuid.UUID, error) {
+	if processID == "" || ttl <= 0 {
+		return uuid.Nil, fmt.Errorf("meta: захват пачки: нужен processID и ttl > 0")
+	}
+	var packID uuid.UUID
+	err := m.Pool.QueryRow(ctx, `
+UPDATE packs SET claimed_by = $1, claim_expires_at = now() + $2::interval
+WHERE id = (
+    SELECT id FROM packs
+     WHERE state = 'sealed'
+       AND (claim_expires_at IS NULL OR claim_expires_at < now())
+     ORDER BY created_at
+     FOR UPDATE SKIP LOCKED
+     LIMIT 1
+)
+RETURNING id`, processID, fmt.Sprintf("%d seconds", int(ttl.Seconds()))).Scan(&packID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, nil
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("meta: захват запечатанной пачки: %w", err)
+	}
+	return packID, nil
+}
+
+// ReleasePack снимает захват — после успешного продолжения или когда процесс
+// понял, что не справится, и не хочет держать пачку до истечения ttl.
+func (m *Meta) ReleasePack(ctx context.Context, packID uuid.UUID) error {
+	_, err := m.Pool.Exec(ctx,
+		`UPDATE packs SET claimed_by = NULL, claim_expires_at = NULL WHERE id = $1`, packID)
+	if err != nil {
+		return fmt.Errorf("meta: снять захват пачки: %w", err)
+	}
+	return nil
 }
 
 // PackOfArchiving возвращает пачку, в которую эти объекты уже запечатаны.

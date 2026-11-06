@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -360,12 +361,12 @@ func TestLostRegistryResendsSamePack(t *testing.T) {
 	}
 }
 
-// Продолжение запечатанной пачки после сбоя.
+// Продолжение запечатанной пачки после настоящего перезапуска.
 //
-// Сбой между запечатыванием и итогом оставляет объекты в 'archiving' с pack_id.
-// Повтор обязан продолжить ЕЁ ЖЕ: тот же oid, те же участники в том же порядке.
-// Если вместо этого заведётся новая пачка, первая запись останется на ленте
-// никем не учтённой — данные дважды, live_bytes врёт, reconciler не видит.
+// Сбой между запечатыванием и итогом оставляет объекты в 'archiving' с pack_id:
+// в батч они не попадут, в pending не вернутся. Поэтому вход у продолжения — от
+// пачки. Если вместо продолжения заведётся новая пачка, первая запись останется
+// на ленте никем не учтённой: данные дважды, live_bytes врёт, reconciler не видит.
 func TestResumeContinuesSealedPack(t *testing.T) {
 	m := testdb.Connect(t)
 	ctx := context.Background()
@@ -398,33 +399,33 @@ func TestResumeContinuesSealedPack(t *testing.T) {
 		t.Errorf("пачка в %s, ждали sealed", packState)
 	}
 
-	// «Перезапуск»: новый Archiver, тот же состав, порядок намеренно другой —
-	// он должен быть приведён к запечатанному, иначе байты не совпадут.
+	// «Настоящий перезапуск»: новый Archiver, и список id НЕ передаётся —
+	// migrator обязан найти пачку сам. Именно это и проверяет тест: если поиск
+	// идёт от списка объектов, после перезапуска его взять неоткуда.
 	a2, pm2 := archiver(t, m, ids[0])
-	shuffled := itemsFor(ids)
-	for i, j := 0, len(shuffled)-1; i < j; i, j = i+1, j-1 {
-		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	load := func(ctx context.Context, ids []uuid.UUID) ([]Item, error) {
+		return itemsFor(ids), nil
 	}
-	if _, err := a2.ArchivePack(ctx, 1, shuffled, nil); err != nil {
-		t.Fatalf("продолжение не прошло: %v", err)
+	done, err := a2.ResumePacks(ctx, "test-process", time.Minute, load, nil)
+	if err != nil {
+		t.Fatalf("ResumePacks: %v", err)
 	}
-
+	if done != 1 {
+		t.Fatalf("доведено пачек %d, ждали 1", done)
+	}
 	if pm2.lastID != sealed {
-		t.Errorf("повтор отправил пачку %s вместо запечатанной %s — на ленте будет вторая копия",
-			pm2.lastID, sealed)
+		t.Errorf("продолжение отправило пачку %s вместо запечатанной %s", pm2.lastID, sealed)
 	}
 	if len(pm2.written) != 1 {
 		t.Errorf("объектов на ленте %d, ждали 1", len(pm2.written))
 	}
-
-	// Ровно одна пачка на эти объекты: вторая означает дубль.
-	var packs int
+	var claimed int
 	if err := m.Pool.QueryRow(ctx,
-		`SELECT count(DISTINCT pack_id) FROM objects WHERE id = ANY($1::uuid[])`, ids).Scan(&packs); err != nil {
+		`SELECT count(*) FROM packs WHERE id = $1 AND claimed_by IS NOT NULL`, sealed).Scan(&claimed); err != nil {
 		t.Fatal(err)
 	}
-	if packs != 1 {
-		t.Errorf("пачек %d, ждали 1", packs)
+	if claimed != 0 {
+		t.Error("захват не снят после успешного продолжения — следующая попытка придёт нескоро")
 	}
 
 	var archived int

@@ -315,6 +315,10 @@ func TestMigration0018MediaRegistry(t *testing.T) {
 
 	// --- Down / повторный Up на наполненной схеме ---
 
+	// 0021 добавляет колонки в packs — её снимаем раньше всех, кто трогает packs.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0021, "Down")); err != nil {
+		t.Fatalf("Down 0021: %v", err)
+	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0020, "Down")); err != nil {
 		t.Fatalf("Down 0020 перед 0019: %v", err)
 	}
@@ -334,6 +338,12 @@ func TestMigration0018MediaRegistry(t *testing.T) {
 	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0020, "Up")); err != nil {
 		t.Fatalf("Up 0020: %v", err)
+	}
+	// 0021 возвращается последней: goose считает схему актуальной по версии,
+	// а её он не трогал — если не вернуть колонки сами, они так и останутся
+	// срезанными, и следующий прогон скажет «миграций нет» про схему без них.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0021, "Up")); err != nil {
+		t.Fatalf("Up 0021: %v", err)
 	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0019, "Up")); err != nil {
 		t.Fatalf("повторный Up 0019 после 0018: %v", err)
