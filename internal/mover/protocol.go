@@ -58,9 +58,17 @@ const (
 	CodeChecksumMismatch Code = "checksum_mismatch"
 	CodeNoBuffer         Code = "no_buffer"
 	CodeOpConflict       Code = "op_conflict"
-	CodeExpired          Code = "expired"
-	CodeIO               Code = "io"
-	CodeUnknown          Code = "unknown"
+	// CodeExists — в Phobos уже есть объект с таким oid. Это НЕ успех: дубля
+	// нет, но из exists не следует, что копия цела — incomplete после обрыва
+	// посреди записи выглядит так же (спайк M0-02). Разбирается stat'ом по oid
+	// (#101); до него вызывающий обязан не повторять, а поднять сигнал.
+	//
+	// Раньше этот случай маппился в CodeOK, то есть «записали» там, где ничего
+	// не проверяли.
+	CodeExists  Code = "exists"
+	CodeExpired Code = "expired"
+	CodeIO      Code = "io"
+	CodeUnknown Code = "unknown"
 )
 
 // Состояния операции. Нужны затем, чтобы обрыв соединения не отменял запись:
