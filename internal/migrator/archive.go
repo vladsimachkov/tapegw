@@ -49,17 +49,23 @@ type Archiver struct {
 	// Log — куда писать про ленту вне реестра. По умолчанию slog.Default().
 	Log *slog.Logger
 
-	// ProcessID идентифицирует процесс migrator для захвата пачки, ClaimTTL —
-	// на сколько. Захват продлевается во время отправки (см. heartbeat), поэтому
-	// ttl может быть заметно меньше самой долгой отправки; после сбоя именно
-	// ttl определяет, как долго пачка простоит без продолжения.
+	// WorkerID — идентичность захвата, и это НЕ процесс: внутри migrator
+	// воркеров архивации несколько (ADR-0007 — по одному на mover, то есть на
+	// драйв), и общий на всех идентификатор превратил бы «свою пачку забрать
+	// сразу» в «чужую пачку забрать сразу»: второй воркер украл бы пачку у
+	// первого, пока тот жив и продлевает захват.
 	//
-	// ProcessID должен быть УСТОЙЧИВ между запусками одного процесса (имя хоста
-	// или unit'а, не pid) и уникален между разными процессами. Устойчивость
-	// нужна, чтобы перезапущенный процесс забрал свою пачку сразу, не дожидаясь
-	// ttl; уникальность — чтобы «свой захват» не превратился в «любой захват».
-	ProcessID string
-	ClaimTTL  time.Duration
+	// Формат — узел плюс слот воркера, например host-a/mover-2. Слот устойчив
+	// между перезапусками (это драйв из конфига), поэтому «свою пачку после
+	// рестарта забрать без ожидания ttl» продолжает работать: её заберёт воркер
+	// того же слота. Уникальность слота между воркерами обязательна.
+	//
+	// ClaimTTL — на сколько ставится захват. Он продлевается во время отправки
+	// (см. heartbeat), поэтому ttl может быть заметно меньше самой долгой
+	// отправки; после сбоя именно ttl определяет, как долго пачка простоит без
+	// продолжения.
+	WorkerID string
+	ClaimTTL time.Duration
 }
 
 // sendPack — одна попытка put. Ошибка здесь означает «итог неизвестен», а не
@@ -123,7 +129,7 @@ func (a *Archiver) heartbeat(ctx context.Context, packID uuid.UUID) (func(), fun
 			case <-done:
 				return
 			case <-tick.C:
-				ok, err := a.Meta.RenewPackClaim(ctx, packID, a.ProcessID, a.ClaimTTL)
+				ok, err := a.Meta.RenewPackClaim(ctx, packID, a.WorkerID, a.ClaimTTL)
 				if err != nil || !ok {
 					mu.Lock()
 					lost = true
@@ -160,7 +166,7 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 	if a.Meta == nil || a.Put == nil {
 		return nil, fmt.Errorf("migrator: Archiver без Meta или Put")
 	}
-	if a.ProcessID == "" || a.ClaimTTL <= 0 {
+	if a.WorkerID == "" || a.ClaimTTL <= 0 {
 		return nil, fmt.Errorf("migrator: Archiver без ProcessID/ClaimTTL: пачку нельзя закрепить за собой")
 	}
 	ids := make([]uuid.UUID, 0, len(items))
@@ -199,7 +205,7 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 	// Шаг 3 — запечатать ДО отправки. Именно здесь у объектов появляется
 	// pack_id с адресом, и с этого момента сбой оставляет достаточное, чтобы
 	// пачку продолжил любой процесс (ResumePacks), а не только этот.
-	if err := a.Meta.SealPack(ctx, packID, metaPlacements(plan.Placements), plan.Size, a.ProcessID, a.ClaimTTL); err != nil {
+	if err := a.Meta.SealPack(ctx, packID, metaPlacements(plan.Placements), plan.Size, a.WorkerID, a.ClaimTTL); err != nil {
 		a.Meta.FailPackArchive(ctx, packID, ids, "запечатывание: "+err.Error())
 		return nil, err
 	}
@@ -288,7 +294,7 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 				"label", res.Extents[0], "pack", packID.String(), "spec", a.Spec)
 		}
 	}
-	if err := a.Meta.FinishPackArchive(ctx, packID, metaPlacements(placements), a.Spec, packID.String(), res.Version, a.Format, raw, mediumID, a.ProcessID); err != nil {
+	if err := a.Meta.FinishPackArchive(ctx, packID, metaPlacements(placements), a.Spec, packID.String(), res.Version, a.Format, raw, mediumID, a.WorkerID); err != nil {
 		return nil, err
 	}
 	return plan, nil

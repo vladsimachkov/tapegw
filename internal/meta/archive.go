@@ -81,12 +81,12 @@ WHERE id = ANY($1::uuid[]) AND state = 'pending'`, ids)
 // archive_copies_done_has_medium не позволяет объявить копию готовой без
 // носителя, и это верно: 'done' без ответа на вопрос «где лежит» невозможно
 // ни прочитать, ни проверить.
-// processID — кто завершает. Пачку завершает только её текущий владелец:
+// workerID — кто завершает. Пачку завершает только её текущий владелец:
 // иначе процесс, который опоздал и уже потерял захват, переведёт объекты в
 // 'archived' поверх чужой работы.
-func (m *Meta) FinishPackArchive(ctx context.Context, packID uuid.UUID, placements []Placement, spec, phobosOID string, version, format int, sha256 []byte, mediumID int64, processID string) error {
-	if processID == "" {
-		return fmt.Errorf("meta: завершение пачки без processID")
+func (m *Meta) FinishPackArchive(ctx context.Context, packID uuid.UUID, placements []Placement, spec, phobosOID string, version, format int, sha256 []byte, mediumID int64, workerID string) error {
+	if workerID == "" {
+		return fmt.Errorf("meta: завершение пачки без workerID")
 	}
 	if len(sha256) != 32 {
 		return fmt.Errorf("meta: сумма копии %d байт, ждали 32", len(sha256))
@@ -133,7 +133,7 @@ WHERE id = $3 AND pack_id = $1 AND pack_offset = $2 AND state = 'archiving'`,
 -- Владение проверяется здесь: процесс, который опоздал и уже потерял захват,
 -- не должен переводить объекты в archived поверх чужой работы.
 UPDATE packs SET state = 'archived', archived_at = now(), claimed_by = NULL, claim_expires_at = NULL
-WHERE id = $1 AND state = 'sealed' AND claimed_by = $2`, packID, processID)
+WHERE id = $1 AND state = 'sealed' AND claimed_by = $2`, packID, workerID)
 	if err != nil {
 		return fmt.Errorf("meta: закрыть пачку: %w", err)
 	}
@@ -157,13 +157,13 @@ WHERE id = $1 AND state = 'sealed' AND claimed_by = $2`, packID, processID)
 // занятое место, что для мелких участников заметно. Отсюда следствие, которое
 // стоит помнить: у полностью живой пачки live_bytes / total_bytes чуть меньше
 // единицы, и это не ошибка учёта.
-// processID и ttl — захват в той же транзакции, что и запечатывание. Без него
+// workerID и ttl — захват в той же транзакции, что и запечатывание. Без него
 // только что запечатанная пачка доступна любому процессу, и второй migrator
 // начнёт отправлять её параллельно с первым: это не сценарий сбоя, а обычная
 // работа двух воркеров.
 func (m *Meta) SealPack(ctx context.Context, packID uuid.UUID, placements []Placement, sizeBytes int64,
-	processID string, ttl time.Duration) error {
-	if processID == "" || ttl <= 0 {
+	workerID string, ttl time.Duration) error {
+	if workerID == "" || ttl <= 0 {
 		return fmt.Errorf("meta: запечатывание без владельца: пачку сразу заберёт другой процесс")
 	}
 	if len(placements) == 0 {
@@ -201,7 +201,7 @@ UPDATE packs SET state = 'sealed',
        members_live  = (SELECT count(*) FROM objects WHERE pack_id = $1),
        claimed_by    = $3,
        claim_expires_at = now() + $4::interval
-WHERE id = $1 AND state = 'open'`, packID, sizeBytes, processID, interval(ttl))
+WHERE id = $1 AND state = 'open'`, packID, sizeBytes, workerID, interval(ttl))
 	if err != nil {
 		return fmt.Errorf("meta: запечатать пачку: %w", err)
 	}
@@ -221,9 +221,9 @@ WHERE id = $1 AND state = 'open'`, packID, sizeBytes, processID, interval(ttl))
 // Захват — отметка в строке, а не локи на время работы: отправка mover'у
 // занимает минуты, и держать блокировку столько значило бы нарушить правило 13.
 // FOR UPDATE SKIP LOCKED держится только внутри этой короткой транзакции.
-func (m *Meta) ClaimSealedPack(ctx context.Context, processID string, ttl time.Duration) (uuid.UUID, error) {
-	if processID == "" || ttl <= 0 {
-		return uuid.Nil, fmt.Errorf("meta: захват пачки: нужен processID и ttl > 0")
+func (m *Meta) ClaimSealedPack(ctx context.Context, workerID string, ttl time.Duration) (uuid.UUID, error) {
+	if workerID == "" || ttl <= 0 {
+		return uuid.Nil, fmt.Errorf("meta: захват пачки: нужен workerID и ttl > 0")
 	}
 	var packID uuid.UUID
 	err := m.Pool.QueryRow(ctx, `
@@ -231,16 +231,16 @@ UPDATE packs SET claimed_by = $1, claim_expires_at = now() + $2::interval
 WHERE id = (
     SELECT id FROM packs
      WHERE state = 'sealed'
-       -- Свой захват процесс забирает и до истечения срока: после рестарта
-       -- тот же ProcessID возвращается через секунду, а ttl — минуты. Чужой
-       -- процесс при этом обязан иметь уникальный ProcessID, иначе захват
-       -- вообще ничего не значит.
+       -- Свой захват воркер забирает и до истечения срока: после рестарта тот
+       -- же слот возвращается через секунду, а ttl — минуты. Идентичность
+       -- обязана быть на воркера, а не на процесс: воркеров в процессе несколько
+       -- (ADR-0007), и общий id превратил бы «своё» в «любое чужое».
        AND (claim_expires_at IS NULL OR claim_expires_at < now() OR claimed_by = $1)
      ORDER BY created_at
      FOR UPDATE SKIP LOCKED
      LIMIT 1
 )
-RETURNING id`, processID, interval(ttl)).Scan(&packID)
+RETURNING id`, workerID, interval(ttl)).Scan(&packID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, nil
 	}
@@ -258,10 +258,10 @@ RETURNING id`, processID, interval(ttl)).Scan(&packID)
 // монтирование — по ADR-0021 это десятки минут. Срок, выставленный один раз,
 // истёк бы посреди отправки, и второй процесс отправил бы пачку повторно, пока
 // первая отправка ещё идёт.
-func (m *Meta) RenewPackClaim(ctx context.Context, packID uuid.UUID, processID string, ttl time.Duration) (bool, error) {
+func (m *Meta) RenewPackClaim(ctx context.Context, packID uuid.UUID, workerID string, ttl time.Duration) (bool, error) {
 	tag, err := m.Pool.Exec(ctx, `
 UPDATE packs SET claim_expires_at = now() + $3::interval
-WHERE id = $1 AND claimed_by = $2`, packID, processID, interval(ttl))
+WHERE id = $1 AND claimed_by = $2`, packID, workerID, interval(ttl))
 	if err != nil {
 		return false, fmt.Errorf("meta: продлить захват пачки: %w", err)
 	}

@@ -190,7 +190,7 @@ VALUES ('TST-MIG', 'active', 1, 'L8', 'L8', 1000) ON CONFLICT (label) DO NOTHING
 		t.Fatal(err)
 	}
 	return &Archiver{Meta: m, Put: pm, Spec: "pool:archive", Format: 1,
-		ProcessID: "proc-" + uuid.NewString(), ClaimTTL: 30 * time.Second}, pm
+		WorkerID: "test-host/mover-" + uuid.NewString(), ClaimTTL: 30 * time.Second}, pm
 }
 
 // С8: во время вызова mover транзакция Postgres не открыта.
@@ -408,14 +408,13 @@ func TestResumeContinuesSealedPack(t *testing.T) {
 	// migrator обязан найти пачку сам. Именно это и проверяет тест: если поиск
 	// идёт от списка объектов, после перезапуска его взять неоткуда.
 	a2, pm2 := archiver(t, m, ids[0])
-	// ProcessID обязан быть устойчивым между запусками (имя хоста, имя unit'а —
-	// не pid): иначе перезапущенный процесс не заберёт СВОЮ пачку до истечения
-	// ttl, и после каждого рестарта пачки будут простаивать по минуте.
-	a2.ProcessID = a.ProcessID
+	// Тот же слот воркера: «перезапуск» — это тот же воркер, вернувшийся за
+	// своей пачкой, а не другой воркер того же процесса.
+	a2.WorkerID = a.WorkerID
 	load := func(ctx context.Context, ids []uuid.UUID) ([]Item, error) {
 		return itemsFor(ids), nil
 	}
-	done, err := a2.ResumePacks(ctx, a.ProcessID, time.Minute, load, nil)
+	done, err := a2.ResumePacks(ctx, a.WorkerID, time.Minute, load, nil)
 	if err != nil {
 		t.Fatalf("ResumePacks: %v", err)
 	}
@@ -556,11 +555,64 @@ func TestFinishRequiresOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := m.SealPack(ctx, packID, []meta.Placement{{Version: ids[0], Offset: 0, Length: 10}},
-		4096, a.ProcessID, a.ClaimTTL); err != nil {
+		4096, a.WorkerID, a.ClaimTTL); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.FinishPackArchive(ctx, packID, []meta.Placement{{Version: ids[0], Offset: 0, Length: 10}},
 		"pool:archive", packID.String(), 1, 1, make([]byte, 32), 0, "не-владелец"); err == nil {
 		t.Error("пачку завершил не владелец захвата")
+	}
+}
+
+// Идентичность захвата — на воркера, а не на процесс.
+//
+// Внутри migrator воркеров архивации несколько (ADR-0007: по одному на mover),
+// и если бы захват был на процесс, второй воркер того же процесса забрал бы
+// пачку первого по правилу «своё забираем сразу» — ровно то, от чего захват и
+// защищает. Пока воркер один, ошибка не видна.
+func TestSecondWorkerOfSameProcessDoesNotSteal(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "twoworkers", 2)
+	w1, pm := archiver(t, m, ids[0])
+	w1.WorkerID = "host-a/mover-1"
+	w1.ClaimTTL = 300 * time.Millisecond
+	pm.block = make(chan struct{})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := w1.ArchivePack(ctx, 1, itemsFor(ids), nil)
+		done <- err
+	}()
+
+	var sealed uuid.UUID
+	for i := 0; i < 200; i++ {
+		if err := m.Pool.QueryRow(ctx,
+			`SELECT pack_id FROM objects WHERE id = $1`, ids[0]).Scan(&sealed); err == nil && sealed != uuid.Nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sealed == uuid.Nil {
+		t.Fatal("пачка не запечатана")
+	}
+
+	// Тот же процесс, другой слот — и другой слот не «свой».
+	w2, _ := archiver(t, m, ids[0])
+	w2.WorkerID = "host-a/mover-2"
+	got, err := w2.Meta.ClaimSealedPack(ctx, w2.WorkerID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != uuid.Nil {
+		t.Errorf("воркер %s забрал пачку %s у воркера %s — идентичность захвата должна быть на воркера",
+			w2.WorkerID, got, w1.WorkerID)
+	}
+
+	close(pm.block)
+	if err := <-done; err != nil {
+		t.Fatalf("ArchivePack: %v", err)
 	}
 }
