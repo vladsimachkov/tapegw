@@ -50,8 +50,9 @@ type probeMover struct {
 	forget      bool
 	statusCalls int
 	lastOp      uuid.UUID
-	lastID      uuid.UUID // oid, с которым mover реально вызвали
-	failPut     error     // если задан — put падает ДО записи (м mover лёг)
+	lastID      uuid.UUID     // oid, с которым mover реально вызвали
+	failPut     error         // если задан — put падает ДО записи (м mover лёг)
+	block       chan struct{} // если задан — put ждёт в него перед записи
 }
 
 func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
@@ -87,6 +88,9 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 	p.lastID = in.ID
 	if p.failPut != nil {
 		return nil, p.failPut
+	}
+	if p.block != nil {
+		<-p.block
 	}
 	p.accept = true
 	if p.written == nil {
@@ -185,7 +189,8 @@ INSERT INTO media (label, lifecycle, pool_id, generation, medium_type, free_byte
 VALUES ('TST-MIG', 'active', 1, 'L8', 'L8', 1000) ON CONFLICT (label) DO NOTHING`); err != nil {
 		t.Fatal(err)
 	}
-	return &Archiver{Meta: m, Put: pm, Spec: "pool:archive", Format: 1}, pm
+	return &Archiver{Meta: m, Put: pm, Spec: "pool:archive", Format: 1,
+		ProcessID: "proc-" + uuid.NewString(), ClaimTTL: 30 * time.Second}, pm
 }
 
 // С8: во время вызова mover транзакция Postgres не открыта.
@@ -403,10 +408,14 @@ func TestResumeContinuesSealedPack(t *testing.T) {
 	// migrator обязан найти пачку сам. Именно это и проверяет тест: если поиск
 	// идёт от списка объектов, после перезапуска его взять неоткуда.
 	a2, pm2 := archiver(t, m, ids[0])
+	// ProcessID обязан быть устойчивым между запусками (имя хоста, имя unit'а —
+	// не pid): иначе перезапущенный процесс не заберёт СВОЮ пачку до истечения
+	// ttl, и после каждого рестарта пачки будут простаивать по минуте.
+	a2.ProcessID = a.ProcessID
 	load := func(ctx context.Context, ids []uuid.UUID) ([]Item, error) {
 		return itemsFor(ids), nil
 	}
-	done, err := a2.ResumePacks(ctx, "test-process", time.Minute, load, nil)
+	done, err := a2.ResumePacks(ctx, a.ProcessID, time.Minute, load, nil)
 	if err != nil {
 		t.Fatalf("ResumePacks: %v", err)
 	}
@@ -435,5 +444,123 @@ func TestResumeContinuesSealedPack(t *testing.T) {
 	}
 	if archived != len(ids) {
 		t.Errorf("archived %d из %d", archived, len(ids))
+	}
+}
+
+// Две дыры захвата, обе про одновременную работу двух процессов.
+
+// Только что запечатанную пачку не должен забирать другой процесс: её ещё
+// отправляет тот, кто запечатал. Иначе два воркера пишут одну пачку параллельно.
+func TestFreshlySealedPackIsNotStolen(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "steal", 2)
+	a, pm := archiver(t, m, ids[0])
+	pm.block = make(chan struct{})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil)
+		done <- err
+	}()
+
+	// Ждём, пока пачка точно запечатана: без захвата в SealPack второй процесс
+	// подхватил бы её именно здесь.
+	var sealed uuid.UUID
+	for i := 0; i < 200; i++ {
+		if err := m.Pool.QueryRow(ctx,
+			`SELECT pack_id FROM objects WHERE id = $1`, ids[0]).Scan(&sealed); err == nil && sealed != uuid.Nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sealed == uuid.Nil {
+		t.Fatal("пачка так и не запечатана")
+	}
+
+	other, _ := archiver(t, m, ids[0])
+	got, err := other.Meta.ClaimSealedPack(ctx, "чужой-процесс", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != uuid.Nil {
+		t.Errorf("второй процесс забрал пачку %s, которую первый уже отправляет", got)
+	}
+
+	close(pm.block)
+	if err := <-done; err != nil {
+		t.Fatalf("ArchivePack: %v", err)
+	}
+}
+
+// Захват продлевается во время отправки. Без продления срок истёк бы посреди
+// записи (ожидание драйва и монтирование — десятки минут по ADR-0021), и второй
+// процесс отправил бы пачку повторно параллельно с первой.
+func TestClaimRenewedDuringSend(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "renew", 2)
+	a, pm := archiver(t, m, ids[0])
+	a.ClaimTTL = 300 * time.Millisecond // истёк бы раньше конца отправки
+	pm.block = make(chan struct{})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil)
+		done <- err
+	}()
+
+	var sealed uuid.UUID
+	for i := 0; i < 200; i++ {
+		if err := m.Pool.QueryRow(ctx,
+			`SELECT pack_id FROM objects WHERE id = $1`, ids[0]).Scan(&sealed); err == nil && sealed != uuid.Nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Больше срока захвата: без продления пачка стала бы доступной чужим.
+	time.Sleep(2 * a.ClaimTTL)
+
+	other, _ := archiver(t, m, ids[0])
+	got, err := other.Meta.ClaimSealedPack(ctx, "чужой-процесс", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != uuid.Nil {
+		t.Errorf("захват истёк посреди отправки: второй процесс получил %s", got)
+	}
+
+	close(pm.block)
+	if err := <-done; err != nil {
+		t.Fatalf("ArchivePack: %v", err)
+	}
+}
+
+// Потерянный захват не даёт завершить пачку поверх чужой работы.
+func TestFinishRequiresOwnership(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "owner", 1)
+	a, _ := archiver(t, m, ids[0])
+	tx, packID, err := m.BeginPackArchive(ctx, 1, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SealPack(ctx, packID, []meta.Placement{{Version: ids[0], Offset: 0, Length: 10}},
+		4096, a.ProcessID, a.ClaimTTL); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.FinishPackArchive(ctx, packID, []meta.Placement{{Version: ids[0], Offset: 0, Length: 10}},
+		"pool:archive", packID.String(), 1, 1, make([]byte, 32), 0, "не-владелец"); err == nil {
+		t.Error("пачку завершил не владелец захвата")
 	}
 }

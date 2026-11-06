@@ -292,7 +292,7 @@ func TestRequeueSkipsSealedObjects(t *testing.T) {
 		{Version: ids[0], Offset: 0, Length: 10},
 		{Version: ids[1], Offset: 10, Length: 10},
 		{Version: ids[2], Offset: 20, Length: 10},
-	}, 4096); err != nil {
+	}, 4096, "proc-1", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 

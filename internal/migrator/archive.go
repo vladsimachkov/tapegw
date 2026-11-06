@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,6 +48,18 @@ type Archiver struct {
 
 	// Log — куда писать про ленту вне реестра. По умолчанию slog.Default().
 	Log *slog.Logger
+
+	// ProcessID идентифицирует процесс migrator для захвата пачки, ClaimTTL —
+	// на сколько. Захват продлевается во время отправки (см. heartbeat), поэтому
+	// ttl может быть заметно меньше самой долгой отправки; после сбоя именно
+	// ttl определяет, как долго пачка простоит без продолжения.
+	//
+	// ProcessID должен быть УСТОЙЧИВ между запусками одного процесса (имя хоста
+	// или unit'а, не pid) и уникален между разными процессами. Устойчивость
+	// нужна, чтобы перезапущенный процесс забрал свою пачку сразу, не дожидаясь
+	// ttl; уникальность — чтобы «свой захват» не превратился в «любой захват».
+	ProcessID string
+	ClaimTTL  time.Duration
 }
 
 // sendPack — одна попытка put. Ошибка здесь означает «итог неизвестен», а не
@@ -92,6 +105,37 @@ func (a *Archiver) resolveUnknown(ctx context.Context, packID uuid.UUID, plan *P
 	return res, nil
 }
 
+// heartbeat продлевает захват пачки раз в треть срока. Возвращает функцию
+// остановки и проверку «захват потерян».
+//
+// Продление — короткий UPDATE ... WHERE claimed_by = me, вне всякой транзакции
+// отправки (правило 13). Если строка уже не наша, дальше продлевать незачем и
+// вызывающий обязан не завершать пачку.
+func (a *Archiver) heartbeat(ctx context.Context, packID uuid.UUID) (func(), func() bool) {
+	lost := false
+	done := make(chan struct{})
+	var mu sync.Mutex
+	go func() {
+		tick := time.NewTicker(a.ClaimTTL / 3)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				ok, err := a.Meta.RenewPackClaim(ctx, packID, a.ProcessID, a.ClaimTTL)
+				if err != nil || !ok {
+					mu.Lock()
+					lost = true
+					mu.Unlock()
+					return
+				}
+			}
+		}
+	}()
+	return func() { close(done) }, func() bool { mu.Lock(); defer mu.Unlock(); return lost }
+}
+
 func (a *Archiver) logger() *slog.Logger {
 	if a.Log != nil {
 		return a.Log
@@ -115,6 +159,9 @@ func metaPlacements(ps []Placement) []meta.Placement {
 func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, attrs map[string]string) (*Plan, error) {
 	if a.Meta == nil || a.Put == nil {
 		return nil, fmt.Errorf("migrator: Archiver без Meta или Put")
+	}
+	if a.ProcessID == "" || a.ClaimTTL <= 0 {
+		return nil, fmt.Errorf("migrator: Archiver без ProcessID/ClaimTTL: пачку нельзя закрепить за собой")
 	}
 	ids := make([]uuid.UUID, 0, len(items))
 	for _, it := range items {
@@ -152,7 +199,7 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 	// Шаг 3 — запечатать ДО отправки. Именно здесь у объектов появляется
 	// pack_id с адресом, и с этого момента сбой оставляет достаточное, чтобы
 	// пачку продолжил любой процесс (ResumePacks), а не только этот.
-	if err := a.Meta.SealPack(ctx, packID, metaPlacements(plan.Placements), plan.Size); err != nil {
+	if err := a.Meta.SealPack(ctx, packID, metaPlacements(plan.Placements), plan.Size, a.ProcessID, a.ClaimTTL); err != nil {
 		a.Meta.FailPackArchive(ctx, packID, ids, "запечатывание: "+err.Error())
 		return nil, err
 	}
@@ -180,7 +227,20 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 		return nil, err
 	}
 
+	// Захват продлевается на всё время отправки: она включает ожидание драйва и
+	// монтирование (ADR-0021 — десятки минут), и срок, выставленный один раз,
+	// истёк бы посреди неё. Второй процесс забрал бы пачку и отправил её повторно
+	// параллельно с первой.
+	stop, lost := a.heartbeat(ctx, packID)
+	defer stop()
+
 	res, err := a.sendPack(ctx, packID, plan, attrs, buf.Bytes())
+	if lost() {
+		// Захват потерян: пачкой занимается другой процесс. Саму отправку
+		// прервать нельзя (вызов Phobos не прерывается), но и завершать её за
+		// нас некому — FinishPackArchive всё равно не пропустил бы чужого.
+		return nil, fmt.Errorf("migrator: захват пачки %s потерян — её ведёт другой процесс", packID)
+	}
 	if err != nil {
 		// Итог неизвестен. Пачку НЕ выбрасываем: если запись успела пройти,
 		// объекты остаются в archiving, а строка пачки живёт, и следующий
@@ -228,7 +288,7 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 				"label", res.Extents[0], "pack", packID.String(), "spec", a.Spec)
 		}
 	}
-	if err := a.Meta.FinishPackArchive(ctx, packID, metaPlacements(placements), a.Spec, packID.String(), res.Version, a.Format, raw, mediumID); err != nil {
+	if err := a.Meta.FinishPackArchive(ctx, packID, metaPlacements(placements), a.Spec, packID.String(), res.Version, a.Format, raw, mediumID, a.ProcessID); err != nil {
 		return nil, err
 	}
 	return plan, nil
