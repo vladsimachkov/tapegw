@@ -6,8 +6,8 @@
 #include <errno.h>
 
 int tapegw_put(const char *objid, int fd, long size, int family,
-               const char *layout_name, char **keys, char **vals, int nattrs,
-               long *tid_out) {
+               const char *library, const char *layout_name, char **keys,
+               char **vals, int nattrs, long *tid_out) {
     *tid_out = tapegw_tid();
 
     struct pho_xfer_desc xd;
@@ -15,7 +15,11 @@ int tapegw_put(const char *objid, int fd, long size, int family,
     xd.xd_op = PHO_XFER_OP_PUT;
     /* Без family Phobos берёт семейство по умолчанию из конфига, и на стенде
      * это лента: put уходит в драйв и получает ENODEV. */
+    /* libphobos не читает профиль: нужны явные family, library и layout,
+     * иначе -19 ENODEV («No compatible device found for write alloc»),
+     * спайк M0-02. */
     xd.xd_params.put.family = (enum rsc_family)family;
+    xd.xd_params.put.library = library;
     xd.xd_params.put.layout_name = layout_name;
     xd.xd_ntargets = 1;
     xd.xd_targets = calloc(1, sizeof(struct pho_xfer_target));

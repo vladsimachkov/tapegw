@@ -184,10 +184,12 @@ func (s *Store) putOne(it store.PutItem, opt store.PutOptions) error {
 	runtime.KeepAlive(it.File)
 	var tid C.long
 	cl := cstr(opt.Layout)
+	clib := cstr(opt.Library)
 	defer C.free(unsafe.Pointer(cl)) // C.free(nil) безопасен
+	defer C.free(unsafe.Pointer(clib))
 
 	rc := C.tapegw_put(id, C.int(it.File.Fd()), C.long(it.Size),
-		C.int(familyOf(opt.Family)), cl, keys, vals,
+		C.int(familyOf(opt.Family)), clib, cl, keys, vals,
 		C.int(len(it.Attrs)), &tid)
 	s.noteTID(tid)
 	switch {
