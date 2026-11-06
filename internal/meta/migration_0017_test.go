@@ -20,8 +20,7 @@ import (
 const migration0017 = "migrations/0017_packs.sql"
 
 func TestMigration0017Packs(t *testing.T) {
-	m := testdb.Connect(t)
-	testdb.Clean(t, m)
+	m := testdb.MigrationScratch(t, testdb.AllVersions)
 	ctx := context.Background()
 
 	// Таблица и её колонки.

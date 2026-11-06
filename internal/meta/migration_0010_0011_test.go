@@ -18,7 +18,7 @@ import (
 // Откат 0010 невозможен (Postgres не удаёт значения enum), поэтому Down там
 // закомментирован — это проверяет тест на текст файла миграции.
 func TestMigrationMarkerState(t *testing.T) {
-	m := testdb.Connect(t)
+	m := testdb.MigrationScratch(t, testdb.AllVersions)
 	ctx := context.Background()
 
 	var n int

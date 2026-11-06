@@ -14,9 +14,8 @@ const migration0020 = "migrations/0020_write_targets.sql"
 // наполненной таблице: на пустой Down/Up проходит даже когда роняет строки.
 
 func TestMigration0020UpDown(t *testing.T) {
-	m := testdb.Connect(t)
+	m := testdb.MigrationScratch(t, testdb.AllVersions)
 	ctx := context.Background()
-	testdb.Clean(t, m)
 
 	// Наполняем media до отката. Down обязан оставить строки в целости: он
 	// роняет только представление и пересоздаёт индекс.

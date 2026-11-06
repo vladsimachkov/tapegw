@@ -22,8 +22,7 @@ import (
 const migration0018 = "migrations/0018_media_registry.sql"
 
 func TestMigration0018MediaRegistry(t *testing.T) {
-	m := testdb.Connect(t)
-	testdb.Clean(t, m)
+	m := testdb.MigrationScratch(t, testdb.AllVersions)
 	ctx := context.Background()
 
 	for _, tc := range []struct{ table, cols string }{

@@ -20,8 +20,7 @@ import (
 const migration0021 = "migrations/0021_pack_claim.sql"
 
 func TestMigration0021PackClaim(t *testing.T) {
-	m := testdb.Connect(t)
-	testdb.Clean(t, m)
+	m := testdb.MigrationScratch(t, testdb.AllVersions)
 	ctx := context.Background()
 
 	if n := columnIn(t, ctx, m, "packs", "claimed_by"); n != 1 {

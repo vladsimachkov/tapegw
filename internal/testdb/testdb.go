@@ -273,6 +273,83 @@ var SeedTables = []SeedTable{
 // схему, а запущенный параллельно обычный прогон уже выполнил миграции через свой
 // sync.Once и работает со схемой, которой больше нет. Развести прогоны надёжнее,
 // чем помнить «не запускай одновременно».
+// AllVersions — «применить все миграции» для MigrationScratch. Число заведомо
+// больше любой реальной версии: заводить константу «текущая версия» означало бы
+// снова держать правило в памяти — её придётся обновлять в каждом PR с
+// миграцией, и однажды забудут.
+const AllVersions = 999
+
+// MigrationScratch разворачивает ОДНОРАЗОВУЮ схему под тест миграции и
+// возвращает подключение к ней. upTo — версия, до которой схема разворачивается
+// goose'ом (0 — пустая схема).
+//
+// Причина не в аккуратности, а в том, что тесты миграций снимают и применяют
+// чужие миграции. В общей схеме пакета каждый следующий тест зависит от того,
+// что предыдущий успел вернуть, а каждая новая миграция добавляет дыру, которую
+// надо помнить закрыть во всех предыдущих тестах. Так ломалось дважды: сначала
+// колонки 0021, потом 0022 — и каждый раз чинили точечно, заводя ещё один
+// «верни чужое».
+//
+// Схема удаляется в t.Cleanup, поэтому тесты миграций не зависят друг от друга
+// и могут идти параллельно.
+func MigrationScratch(t *testing.T, upTo int) *meta.Meta {
+	t.Helper()
+
+	dsn := os.Getenv(DSNEnv)
+	if dsn == "" {
+		t.Skipf("%s не задан — пропускаем тест, которому нужен Postgres", DSNEnv)
+	}
+	schema := fmt.Sprintf("%s_mig%02d_%s", PackageSchema(t), upTo, sanitizeIdent(strings.ToLower(t.Name())))
+	dsn, err := withSchema(dsn, schema)
+	if err != nil {
+		t.Fatalf("%s: %v", DSNEnv, err)
+	}
+
+	if upTo == AllVersions {
+		v, err := meta.LatestVersion()
+		if err != nil {
+			t.Fatalf("версия последней миграции: %v", err)
+		}
+		upTo = v
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	t.Cleanup(cancel)
+
+	// Мусор от прерванного прогона: goose посчитает схему актуальной по версии,
+	// а нужных объектов в ней может и не быть.
+	drop := func() {
+		bg, cancelDrop := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelDrop()
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			return
+		}
+		defer db.Close()
+		db.ExecContext(bg, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pgx.Identifier{schema}.Sanitize())) //nolint:errcheck
+	}
+	drop()
+	t.Cleanup(drop)
+
+	if err := meta.MigrateUpTo(ctx, dsn, upTo); err != nil {
+		t.Fatalf("развернуть схему %s до %d: %v", schema, upTo, err)
+	}
+	m, err := meta.Connect(ctx, meta.Options{DSN: dsn, MaxConns: 4, ConnectTimeout: 10 * time.Second})
+	if err != nil {
+		t.Fatalf("подключение к %s: %v", schema, err)
+	}
+	t.Cleanup(func() {
+		done := make(chan struct{})
+		go func() { m.Close(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			panic("testdb: пул не закрылся за 15s — похоже, соединение занято незакрытой транзакцией")
+		}
+	})
+	return m
+}
+
 func PackageSchema(t *testing.T) string {
 	t.Helper()
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), ".test")

@@ -21,8 +21,7 @@ import (
 const migration0009 = "migrations/0009_version_seq.sql"
 
 func TestMigration0009VersionSeq(t *testing.T) {
-	m := testdb.Connect(t)
-	testdb.Clean(t, m)
+	m := testdb.MigrationScratch(t, testdb.AllVersions)
 	ctx := context.Background()
 
 	// Колонка есть, NOT NULL, и значение берётся из последовательности.
