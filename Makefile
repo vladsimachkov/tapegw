@@ -11,6 +11,9 @@ GOBIN    ?= $(shell $(GO) env GOPATH)/bin
 PKG      ?= ./...
 DSN      ?= postgres://tapegw:tapegw@localhost:55432/phobos?search_path=tapegw_test
 
+hooks:
+	@git config core.hooksPath .githooks && echo "### хуки: .githooks (pre-push гоняет make check перед push)"
+
 check:
 	@echo "### gofmt"; out=$$(gofmt -l .); if [ -n "$$out" ]; then echo "$$out"; exit 1; fi
 	@echo "### go vet";        $(GO) vet $(PKG)
