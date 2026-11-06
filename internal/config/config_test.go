@@ -344,3 +344,84 @@ func TestLoadEmptyFileIsNotAnError(t *testing.T) {
 		})
 	}
 }
+
+// Именованные коллекции (уточнение к правилу 9): ключ вместо индекса, потому
+// что индекс привязан к порядку — переставишь элементы в YAML, и переменная
+// окружения молча начнёт править другую запись.
+
+func moversCfg() *Config {
+	c := Default()
+	c.Root.Access, c.Root.Secret = "a", "b"
+	c.IAM.KEKFile = testKEKFile
+	c.Phobos.Movers = map[string]Mover{
+		"drive1": {Addr: "lib1:7443", Node: "lib1", Library: "lib-main"},
+		"drive2": {Addr: "lib1:7444", Node: "lib1", Library: "lib-main"},
+	}
+	return c
+}
+
+func TestMoversEnvOverridesOneKey(t *testing.T) {
+	t.Setenv("TAPEGW_PHOBOS_MOVERS_DRIVE1_ADDR", "lib2:7443")
+	cfg := moversCfg()
+	if err := applyEnv(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Phobos.Movers["drive1"].Addr; got != "lib2:7443" {
+		t.Errorf("drive1.addr = %q, ждали lib2:7443", got)
+	}
+	if got := cfg.Phobos.Movers["drive2"].Addr; got != "lib1:7444" {
+		t.Errorf("drive2.addr = %q: чужой mover задет", got)
+	}
+}
+
+func TestMoversEnvRejectsUnknownKey(t *testing.T) {
+	// Новый mover через переменную добавить нельзя: он бы «добавился», но не
+	// добавился — конфиг его не знает.
+	t.Setenv("TAPEGW_PHOBOS_MOVERS_DRIVE9_ADDR", "lib9:7443")
+	if err := applyEnv(moversCfg()); err == nil || !strings.Contains(err.Error(), "DRIVE9") {
+		t.Fatalf("ошибка про неизвестную переменную не получена: %v", err)
+	}
+}
+
+func TestMoversWholeAndFieldConflict(t *testing.T) {
+	t.Setenv("TAPEGW_PHOBOS_MOVERS", `{"nvme1":{"addr":"a:1","node":"n","library":"l"}}`)
+	t.Setenv("TAPEGW_PHOBOS_MOVERS_DRIVE1_ADDR", "lib1:7443")
+	if err := applyEnv(moversCfg()); err == nil {
+		t.Fatal("задано целиком и полем: угадывать, что главнее, нельзя")
+	}
+}
+
+func TestMoversWholeCollectionEnv(t *testing.T) {
+	t.Setenv("TAPEGW_PHOBOS_MOVERS", `{"nvme1":{"addr":"a:1","node":"n","library":"l"}}`)
+	cfg := moversCfg()
+	if err := applyEnv(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Phobos.Movers["nvme1"]; !ok {
+		t.Fatalf("коллекция целиком не заменила YAML: %v", cfg.Phobos.Movers)
+	}
+	if _, ok := cfg.Phobos.Movers["drive1"]; ok {
+		t.Error("drive1 остался: замена должна заменять, а не дополнять")
+	}
+}
+
+func TestMoversRejectsAmbiguousKey(t *testing.T) {
+	// drive-1 и drive_1 дали бы одну переменную окружения.
+	cfg := moversCfg()
+	cfg.Phobos.Movers["drive-1"] = Mover{Addr: "x:1", Node: "n", Library: "l"}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "drive-1") {
+		t.Fatalf("ключ вне шаблона не отклонён: %v", err)
+	}
+}
+
+func TestMoversRequireFields(t *testing.T) {
+	cfg := moversCfg()
+	cfg.Phobos.Movers["drive3"] = Mover{}
+	err := cfg.Validate()
+	for _, want := range []string{"drive3.addr", "drive3.node", "drive3.library"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("про %s не сказано: %v", want, err)
+		}
+	}
+}
