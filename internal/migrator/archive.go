@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -46,6 +48,24 @@ type Archiver struct {
 
 	// Log — куда писать про ленту вне реестра. По умолчанию slog.Default().
 	Log *slog.Logger
+
+	// WorkerID — идентичность захвата, и это НЕ процесс: внутри migrator
+	// воркеров архивации несколько (ADR-0007 — по одному на mover, то есть на
+	// драйв), и общий на всех идентификатор превратил бы «свою пачку забрать
+	// сразу» в «чужую пачку забрать сразу»: второй воркер украл бы пачку у
+	// первого, пока тот жив и продлевает захват.
+	//
+	// Формат — узел плюс слот воркера, например host-a/mover-2. Слот устойчив
+	// между перезапусками (это драйв из конфига), поэтому «свою пачку после
+	// рестарта забрать без ожидания ttl» продолжает работать: её заберёт воркер
+	// того же слота. Уникальность слота между воркерами обязательна.
+	//
+	// ClaimTTL — на сколько ставится захват. Он продлевается во время отправки
+	// (см. heartbeat), поэтому ttl может быть заметно меньше самой долгой
+	// отправки; после сбоя именно ttl определяет, как долго пачка простоит без
+	// продолжения.
+	WorkerID string
+	ClaimTTL time.Duration
 }
 
 // sendPack — одна попытка put. Ошибка здесь означает «итог неизвестен», а не
@@ -91,6 +111,37 @@ func (a *Archiver) resolveUnknown(ctx context.Context, packID uuid.UUID, plan *P
 	return res, nil
 }
 
+// heartbeat продлевает захват пачки раз в треть срока. Возвращает функцию
+// остановки и проверку «захват потерян».
+//
+// Продление — короткий UPDATE ... WHERE claimed_by = me, вне всякой транзакции
+// отправки (правило 13). Если строка уже не наша, дальше продлевать незачем и
+// вызывающий обязан не завершать пачку.
+func (a *Archiver) heartbeat(ctx context.Context, packID uuid.UUID) (func(), func() bool) {
+	lost := false
+	done := make(chan struct{})
+	var mu sync.Mutex
+	go func() {
+		tick := time.NewTicker(a.ClaimTTL / 3)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				ok, err := a.Meta.RenewPackClaim(ctx, packID, a.WorkerID, a.ClaimTTL)
+				if err != nil || !ok {
+					mu.Lock()
+					lost = true
+					mu.Unlock()
+					return
+				}
+			}
+		}
+	}()
+	return func() { close(done) }, func() bool { mu.Lock(); defer mu.Unlock(); return lost }
+}
+
 func (a *Archiver) logger() *slog.Logger {
 	if a.Log != nil {
 		return a.Log
@@ -115,15 +166,22 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 	if a.Meta == nil || a.Put == nil {
 		return nil, fmt.Errorf("migrator: Archiver без Meta или Put")
 	}
+	if a.WorkerID == "" || a.ClaimTTL <= 0 {
+		return nil, fmt.Errorf("migrator: Archiver без ProcessID/ClaimTTL: пачку нельзя закрепить за собой")
+	}
 	ids := make([]uuid.UUID, 0, len(items))
 	for _, it := range items {
 		ids = append(ids, it.Version)
 	}
 
-	tx, packID, err := a.Meta.BeginPackArchive(ctx, poolID, ids)
+	// Шаг 1 — завести пачку и перевести объекты в archiving. Продолжением
+	// запечатанных пачек занимается ResumePacks: там вход от пачки, потому что
+	// после перезапуска списка объектов ниоткуда не берётся.
+	tx, freshID, err := a.Meta.BeginPackArchive(ctx, poolID, ids)
 	if err != nil {
 		return nil, err
 	}
+	packID := freshID
 	// Страховка от утечки соединения: любой ранний выход до коммита обязан
 	// закрыть транзакцию, иначе пул остаётся с занятым соединением и
 	// pool.Close() в cleanup тестов висит навсегда. После коммита откат —
@@ -132,25 +190,63 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 
 	// Коммит здесь — смысл правила 13. Если перенести вызов mover'а выше этой
 	// строки, транзакция будет держать строки участников на всё время записи,
-	// и тест С8 это ловит явно: NOWAIT на строку объекта падает с 55P03.
+	// и тест С8 это ловит явно: NOWAIT на строку объекта 55P03.
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("migrator: закоммитить переход: %w", err)
 	}
 
+	// Шаг 2 — первый проход: размер, сумма и смещения.
 	plan, err := Measure(items)
 	if err != nil {
 		a.Meta.FailPackArchive(ctx, packID, ids, "сборка: "+err.Error())
 		return nil, err
 	}
 
+	// Шаг 3 — запечатать ДО отправки. Именно здесь у объектов появляется
+	// pack_id с адресом, и с этого момента сбой оставляет достаточное, чтобы
+	// пачку продолжил любой процесс (ResumePacks), а не только этот.
+	if err := a.Meta.SealPack(ctx, packID, metaPlacements(plan.Placements), plan.Size, a.WorkerID, a.ClaimTTL); err != nil {
+		a.Meta.FailPackArchive(ctx, packID, ids, "запечатывание: "+err.Error())
+		return nil, err
+	}
+
+	// Шаги 4 и 5 — отправка и итог.
+	return a.deliver(ctx, packID, items, plan, attrs)
+}
+
+// deliver — шаги 4 и 5: второй проход, отправка, разбор неизвестного итога и
+// запись результата. Транзакции во время вызова mover'а нет (правило 13).
+// Общий для ArchivePack и ResumePacks: продолжение обязано пройти ровно тот же
+// путь, иначе «продолжили не так» превратится в вторую копию.
+func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, plan *Plan, attrs map[string]string) (*Plan, error) {
+	ids := make([]uuid.UUID, 0, len(items))
+	for _, it := range items {
+		ids = append(ids, it.Version)
+	}
+	// Шаг 4 — второй проход и отправка. Транзакции нет (правило 13).
 	var buf bytes.Buffer
 	placements, err := BuildIndexed(&buf, items, plan)
 	if err != nil {
+		// Пачка запечатана, но на ленту ничего не шло: отказ определённый,
+		// снимается членство.
 		a.Meta.FailPackArchive(ctx, packID, ids, "второй проход: "+err.Error())
 		return nil, err
 	}
 
+	// Захват продлевается на всё время отправки: она включает ожидание драйва и
+	// монтирование (ADR-0021 — десятки минут), и срок, выставленный один раз,
+	// истёк бы посреди неё. Второй процесс забрал бы пачку и отправил её повторно
+	// параллельно с первой.
+	stop, lost := a.heartbeat(ctx, packID)
+	defer stop()
+
 	res, err := a.sendPack(ctx, packID, plan, attrs, buf.Bytes())
+	if lost() {
+		// Захват потерян: пачкой занимается другой процесс. Саму отправку
+		// прервать нельзя (вызов Phobos не прерывается), но и завершать её за
+		// нас некому — FinishPackArchive всё равно не пропустил бы чужого.
+		return nil, fmt.Errorf("migrator: захват пачки %s потерян — её ведёт другой процесс", packID)
+	}
 	if err != nil {
 		// Итог неизвестен. Пачку НЕ выбрасываем: если запись успела пройти,
 		// объекты остаются в archiving, а строка пачки живёт, и следующий
@@ -198,8 +294,86 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 				"label", res.Extents[0], "pack", packID.String(), "spec", a.Spec)
 		}
 	}
-	if err := a.Meta.FinishPackArchive(ctx, packID, metaPlacements(placements), a.Spec, packID.String(), res.Version, a.Format, raw, mediumID); err != nil {
+	if err := a.Meta.FinishPackArchive(ctx, packID, metaPlacements(placements), a.Spec, packID.String(), res.Version, a.Format, raw, mediumID, a.WorkerID); err != nil {
 		return nil, err
 	}
 	return plan, nil
+}
+
+// LoadItems поднимает участников по id: файлы на landing, обёрнутые DEK,
+// длина шифротекста. Его пишет воркер M4 — и продолжению нужен ровно тот же
+// загрузчик, что и обычной архивации, иначе «продолжили не так» даст другие
+// байты и сумма не сойдётся.
+type LoadItems func(ctx context.Context, ids []uuid.UUID) ([]Item, error)
+
+// ResumePacks — точка входа восстановления после перезапуска.
+//
+// Вход от пачки, а не от объектов, и это принципиально: участники запечатанной
+// пачки сидят в 'archiving' с pack_id, в батч не попадают (ClaimMigrationBatch
+// берёт только 'pending') и в pending не возвращаются (инвариант 2). Если искать
+// по списку объектов, список взять неоткуда, и пачка останется в 'sealed'
+// навсегда — то самое тихое зависание, только в другом месте.
+//
+// Возвращает число доведённых пачек и первую ошибку, если она была: одна
+// разбороненная пачка не должна мешать остальным.
+func (a *Archiver) ResumePacks(ctx context.Context, processID string, ttl time.Duration,
+	load LoadItems, attrs map[string]string) (int, error) {
+
+	if load == nil {
+		return 0, fmt.Errorf("migrator: ResumePacks без загрузчика участников")
+	}
+	done, firstErr := 0, error(nil)
+	for {
+		packID, err := a.Meta.ClaimSealedPack(ctx, processID, ttl)
+		if err != nil {
+			return done, err
+		}
+		if packID == uuid.Nil {
+			return done, firstErr
+		}
+		if err := a.resumeOne(ctx, packID, load, attrs); err != nil {
+			a.logger().Error("продолжение пачки не удалось",
+				"pack", packID.String(), "err", err.Error())
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			done++
+		}
+		if err := a.Meta.ReleasePack(ctx, packID); err != nil {
+			return done, err
+		}
+	}
+}
+
+func (a *Archiver) resumeOne(ctx context.Context, packID uuid.UUID, load LoadItems, attrs map[string]string) error {
+	// Порядок берётся из пачки по смещениям: он определяет байты, а смещения
+	// зафиксированы при запечатывании.
+	members, err := a.Meta.SealedMembers(ctx, packID)
+	if err != nil {
+		return err
+	}
+	if len(members) == 0 {
+		return fmt.Errorf("migrator: пачка %s запечатана без участников", packID)
+	}
+	items, err := load(ctx, members)
+	if err != nil {
+		return fmt.Errorf("migrator: загрузить участников пачки %s: %w", packID, err)
+	}
+	// Порядок — не деталь вежливости: он определяет байты. Загрузчик обязан
+	// вернуть участников в том же порядке, что и запросили, и проверка здесь
+	// стоит ровно потому, что перестановка всплывёт только как «сумма не
+	// сошлась» где-то далеко от причины.
+	for i, id := range members {
+		if items[i].Version != id {
+			return fmt.Errorf("migrator: загрузчик вернул %s на месте %s — порядок определяет байты пачки",
+				items[i].Version, id)
+		}
+	}
+	plan, err := Measure(items)
+	if err != nil {
+		return fmt.Errorf("migrator: пересобрать пачку %s: %w", packID, err)
+	}
+	_, err = a.deliver(ctx, packID, items, plan, attrs)
+	return err
 }

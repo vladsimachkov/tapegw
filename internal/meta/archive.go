@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"time"
 )
 
 // Placement — где участник лежит внутри пачки. Ставится в objects одной
@@ -80,7 +81,13 @@ WHERE id = ANY($1::uuid[]) AND state = 'pending'`, ids)
 // archive_copies_done_has_medium не позволяет объявить копию готовой без
 // носителя, и это верно: 'done' без ответа на вопрос «где лежит» невозможно
 // ни прочитать, ни проверить.
-func (m *Meta) FinishPackArchive(ctx context.Context, packID uuid.UUID, placements []Placement, spec, phobosOID string, version, format int, sha256 []byte, mediumID int64) error {
+// workerID — кто завершает. Пачку завершает только её текущий владелец:
+// иначе процесс, который опоздал и уже потерял захват, переведёт объекты в
+// 'archived' поверх чужой работы.
+func (m *Meta) FinishPackArchive(ctx context.Context, packID uuid.UUID, placements []Placement, spec, phobosOID string, version, format int, sha256 []byte, mediumID int64, workerID string) error {
+	if workerID == "" {
+		return fmt.Errorf("meta: завершение пачки без workerID")
+	}
 	if len(sha256) != 32 {
 		return fmt.Errorf("meta: сумма копии %d байт, ждали 32", len(sha256))
 	}
@@ -108,36 +115,222 @@ VALUES ($1, $2, $3, $4, $5, '%s', $6, NULLIF($7, 0), %s)`, state, doneAt),
 		return fmt.Errorf("meta: записать копию пачки: %w", err)
 	}
 
+	// Адреса участников уже стоят (SealPack, до отправки). Здесь только переход
+	// в 'archived': данные на ленте и копия учтена.
 	for _, pl := range placements {
-		if pl.Length == 0 {
-			tx.Rollback(ctx)
-			return fmt.Errorf("meta: участник %s нулевой длины — CHECK objects_pack_member не примет такую ссылку", pl.Version)
-		}
 		tag, err := tx.Exec(ctx, `
-UPDATE objects SET state = 'archived', archived_at = now(),
-       pack_id = $1, pack_offset = $2, pack_length = $3
-WHERE id = $4 AND state = 'archiving'`,
-			packID, pl.Offset, pl.Length, pl.Version)
+UPDATE objects SET state = 'archived', archived_at = now()
+WHERE id = $3 AND pack_id = $1 AND pack_offset = $2 AND state = 'archiving'`,
+			packID, pl.Offset, pl.Version)
 		if err != nil {
 			return fmt.Errorf("meta: перевести в archived: %w", err)
 		}
 		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("meta: участник %s не из этой пачки", pl.Version)
+			return fmt.Errorf("meta: участник %s не из этой пачки или не запечатан", pl.Version)
 		}
 	}
-	if _, err := tx.Exec(ctx, `
--- live_bytes приравнивается total_bytes прямо здесь: пачка только что
-    -- записана, мёртвых байт в ней быть не может, а планировщик ёмкости читает
-    -- именно live_bytes.
-UPDATE packs SET state = 'sealed',
-       total_bytes = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
-       live_bytes  = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
-       members_total = (SELECT count(*) FROM objects WHERE pack_id = $1),
-       members_live  = (SELECT count(*) FROM objects WHERE pack_id = $1)
-WHERE id = $1`, packID); err != nil {
+	tag, err := tx.Exec(ctx, `
+-- Владение проверяется здесь: процесс, который опоздал и уже потерял захват,
+-- не должен переводить объекты в archived поверх чужой работы.
+UPDATE packs SET state = 'archived', archived_at = now(), claimed_by = NULL, claim_expires_at = NULL
+WHERE id = $1 AND state = 'sealed' AND claimed_by = $2`, packID, workerID)
+	if err != nil {
 		return fmt.Errorf("meta: закрыть пачку: %w", err)
 	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("meta: пачка %s не запечатана или принадлежит другому процессу — завершать нечем", packID)
+	}
 	return tx.Commit(ctx)
+}
+
+// SealPack — шаг 3 цикла: пачка запечатана, адреса участников известны, отправки
+// ещё не было.
+//
+// Смысл ровно тот же, что у CHECK objects_pack_member: ссылка без адреса ничего
+// не стоит. Поэтому смещения берутся из первого прохода (сборка детерминирована,
+// ADR-0020) и ставятся ДО mover'а. После этого сбой на любом шаге оставляет
+// объекты в 'archiving' с pack_id, и повтор продолжает ТУ ЖЕ пачку — тот же
+// UUID, тот же oid Phobos, те же участники в том же порядке.
+// sizeBytes — полный размер пачки из плана, а НЕ сумма pack_length
+// участников: в пачку входят заголовки tar/pax (~1 КБ на участника), индекс и
+// футер. Планировщик ёмкости читает total_bytes и на сумме недооценивал бы
+// занятое место, что для мелких участников заметно. Отсюда следствие, которое
+// стоит помнить: у полностью живой пачки live_bytes / total_bytes чуть меньше
+// единицы, и это не ошибка учёта.
+// workerID и ttl — захват в той же транзакции, что и запечатывание. Без него
+// только что запечатанная пачка доступна любому процессу, и второй migrator
+// начнёт отправлять её параллельно с первым: это не сценарий сбоя, а обычная
+// работа двух воркеров.
+func (m *Meta) SealPack(ctx context.Context, packID uuid.UUID, placements []Placement, sizeBytes int64,
+	workerID string, ttl time.Duration) error {
+	if workerID == "" || ttl <= 0 {
+		return fmt.Errorf("meta: запечатывание без владельца: пачку сразу заберёт другой процесс")
+	}
+	if len(placements) == 0 {
+		return fmt.Errorf("meta: нечего запечатывать")
+	}
+	tx, err := m.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("meta: начать запечатывание: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // после commit нечего откатывать
+
+	for _, pl := range placements {
+		if pl.Length == 0 {
+			return fmt.Errorf("meta: участник %s нулевой длины — CHECK objects_pack_member не примет такую ссылку", pl.Version)
+		}
+		tag, err := tx.Exec(ctx, `
+UPDATE objects SET pack_id = $1, pack_offset = $2, pack_length = $3
+WHERE id = $4 AND state = 'archiving' AND pack_id IS NULL`,
+			packID, pl.Offset, pl.Length, pl.Version)
+		if err != nil {
+			return fmt.Errorf("meta: проставить размещение: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("meta: участник %s не из этой пачки или уже запечатан", pl.Version)
+		}
+	}
+	// Итоги пачки считаются здесь же: они зависят только от смещений, а они
+	// известны. Планировщик ёмкости читает live_bytes и не должен видеть
+	// запечатанную пачку с нулём.
+	tag, err := tx.Exec(ctx, `
+UPDATE packs SET state = 'sealed',
+       total_bytes   = $2,
+       live_bytes    = (SELECT coalesce(sum(pack_length), 0) FROM objects WHERE pack_id = $1),
+       members_total = (SELECT count(*) FROM objects WHERE pack_id = $1),
+       members_live  = (SELECT count(*) FROM objects WHERE pack_id = $1),
+       claimed_by    = $3,
+       claim_expires_at = now() + $4::interval
+WHERE id = $1 AND state = 'open'`, packID, sizeBytes, workerID, interval(ttl))
+	if err != nil {
+		return fmt.Errorf("meta: запечатать пачку: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("meta: пачка %s не в open — повторное запечатывание", packID)
+	}
+	return tx.Commit(ctx)
+}
+
+// ClaimSealedPack берёт на продолжение одну запечатанную пачку, которую сейчас
+// никто не ведёт. Возвращает uuid.Nil, если таких нет.
+//
+// Это точка входа восстановления после перезапуска: объекты запечатанной пачки
+// сидят в 'archiving' с pack_id, в батч не попадают и в pending не возвращаются,
+// поэтому искать надо от пачки, а не от списка объектов.
+//
+// Захват — отметка в строке, а не локи на время работы: отправка mover'у
+// занимает минуты, и держать блокировку столько значило бы нарушить правило 13.
+// FOR UPDATE SKIP LOCKED держится только внутри этой короткой транзакции.
+func (m *Meta) ClaimSealedPack(ctx context.Context, workerID string, ttl time.Duration) (uuid.UUID, error) {
+	if workerID == "" || ttl <= 0 {
+		return uuid.Nil, fmt.Errorf("meta: захват пачки: нужен workerID и ttl > 0")
+	}
+	var packID uuid.UUID
+	err := m.Pool.QueryRow(ctx, `
+UPDATE packs SET claimed_by = $1, claim_expires_at = now() + $2::interval
+WHERE id = (
+    SELECT id FROM packs
+     WHERE state = 'sealed'
+       -- Свой захват воркер забирает и до истечения срока: после рестарта тот
+       -- же слот возвращается через секунду, а ttl — минуты. Идентичность
+       -- обязана быть на воркера, а не на процесс: воркеров в процессе несколько
+       -- (ADR-0007), и общий id превратил бы «своё» в «любое чужое».
+       AND (claim_expires_at IS NULL OR claim_expires_at < now() OR claimed_by = $1)
+     ORDER BY created_at
+     FOR UPDATE SKIP LOCKED
+     LIMIT 1
+)
+RETURNING id`, workerID, interval(ttl)).Scan(&packID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, nil
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("meta: захват запечатанной пачки: %w", err)
+	}
+	return packID, nil
+}
+
+// RenewPackClaim продлевает захват. Возвращает false, если захват уже потерян
+// (истёк и его забрал другой, либо строку сняли) — вызывающий обязан прервать
+// отправку: пачкой занимается кто-то другой, и дописывать её нельзя.
+//
+// Продление нужно потому, что отправка включает ожидание свободного драйва и
+// монтирование — по ADR-0021 это десятки минут. Срок, выставленный один раз,
+// истёк бы посреди отправки, и второй процесс отправил бы пачку повторно, пока
+// первая отправка ещё идёт.
+func (m *Meta) RenewPackClaim(ctx context.Context, packID uuid.UUID, workerID string, ttl time.Duration) (bool, error) {
+	tag, err := m.Pool.Exec(ctx, `
+UPDATE packs SET claim_expires_at = now() + $3::interval
+WHERE id = $1 AND claimed_by = $2`, packID, workerID, interval(ttl))
+	if err != nil {
+		return false, fmt.Errorf("meta: продлить захват пачки: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// Миллисекунды, не секунды: int(d.Seconds()) режет 300ms в 0, и продление
+// выставило бы срок «истёк сразу» — захват формально есть, и тут же просрочен.
+func interval(d time.Duration) string { return fmt.Sprintf("%d milliseconds", d.Milliseconds()) }
+
+// ReleasePack снимает захват — после успешного продолжения или когда процесс
+// понял, что не справится, и не хочет держать пачку до истечения ttl.
+func (m *Meta) ReleasePack(ctx context.Context, packID uuid.UUID) error {
+	_, err := m.Pool.Exec(ctx,
+		`UPDATE packs SET claimed_by = NULL, claim_expires_at = NULL WHERE id = $1`, packID)
+	if err != nil {
+		return fmt.Errorf("meta: снять захват пачки: %w", err)
+	}
+	return nil
+}
+
+// PackOfArchiving возвращает пачку, в которую эти объекты уже запечатаны.
+// Нужна для продолжения после сбоя: без неё следующий цикл завёл бы новую пачку
+// с новым oid, и первая запись осталась на ленте никем не учтённой.
+//
+// Возвращает uuid.Nil, если единой пачки нет: объекты без pack_id или из
+// разных пачек. Смешанную компанию продолжат отдельными пачками — перемешивать
+// участников между пачками нельзя, это меняет байты.
+func (m *Meta) PackOfArchiving(ctx context.Context, ids []uuid.UUID) (uuid.UUID, error) {
+	var missing, distinct int
+	var packID *uuid.UUID
+	err := m.Pool.QueryRow(ctx, `
+SELECT count(*) FILTER (WHERE pack_id IS NULL),
+       count(DISTINCT pack_id),
+       -- min(uuid) в Postgres нет, а нужен «любой из, раз они все равны»:
+       -- равенство проверяет distinct = 1 выше.
+       (array_agg(pack_id) FILTER (WHERE pack_id IS NOT NULL))[1]
+FROM objects WHERE id = ANY($1::uuid[])`, ids).Scan(&missing, &distinct, &packID)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("meta: найти пачку объектов: %w", err)
+	}
+	// Единая пачка — это когда у ВСЕХ объектов она есть и она одна. Иначе
+	// продолжения нет: часть без адреса, или компания разбросана по пачкам, а
+	// перемешивать участников нельзя (байты и сумма другие).
+	if missing > 0 || distinct != 1 || packID == nil {
+		return uuid.Nil, nil
+	}
+	return *packID, nil
+}
+
+// SealedMembers возвращает участников запечатанной пачки в порядке смещений —
+// тот самый порядок, в котором байты уже посчитаны. Повтор обязан собрать пачку
+// в нём же, иначе сумма не сойдётся.
+func (m *Meta) SealedMembers(ctx context.Context, packID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := m.Pool.Query(ctx, `
+SELECT id FROM objects WHERE pack_id = $1 ORDER BY pack_offset`, packID)
+	if err != nil {
+		return nil, fmt.Errorf("meta: участники пачки: %w", err)
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("meta: участники пачки: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // FailPackArchive возвращает участников в pending после отказа mover.

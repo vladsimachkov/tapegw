@@ -253,3 +253,86 @@ func TestBrokenPacksDetectsDrift(t *testing.T) {
 		t.Errorf("расхождение не обнаружено: %+v", broken)
 	}
 }
+
+// Инвариант 2: перезапуск не возвращает в pending объекты запечатанной пачки.
+//
+// Возврат означал бы, что следующий цикл заведёт новую пачку с новым oid, а
+// первая запись останется на ленте никем не учтённой.
+func TestRequeueSkipsSealedObjects(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	mustBucket(t, m, "requeue-sealed")
+	var bucketID int64
+	if err := m.Pool.QueryRow(ctx, `SELECT id FROM buckets WHERE name = 'requeue-sealed'`).Scan(&bucketID); err != nil {
+		t.Fatal(err)
+	}
+	var ids []uuid.UUID
+	for i := 0; i < 3; i++ {
+		id := uuid.New()
+		if _, err := m.Pool.Exec(ctx,
+			`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class, state,
+			                      landing, online_until, tenant_id, pool_id, is_current, wrapped_dek)
+			  VALUES ($1,$2,$3,10,'etag','GLACIER','pending',true,
+			          now() + interval '1 day', 1, 1, true, 'x'::bytea)`,
+			id, bucketID, keyN(i)); err != nil {
+			t.Fatalf("участник %d: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+	tx, packID, err := m.BeginPackArchive(ctx, 1, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SealPack(ctx, packID, []meta.Placement{
+		{Version: ids[0], Offset: 0, Length: 10},
+		{Version: ids[1], Offset: 10, Length: 10},
+		{Version: ids[2], Offset: 20, Length: 10},
+	}, 4096, "proc-1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	requeued, failed, err := m.RequeueArchiving(ctx, ids, "таймаут", 5, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeued != 0 || failed != 0 {
+		t.Errorf("requeued=%d failed=%d, ждали 0/0: запечатанные объекты трогать нельзя", requeued, failed)
+	}
+	var states []string
+	rows, err := m.Pool.Query(ctx, `SELECT state::text FROM objects WHERE id = ANY($1::uuid[])`, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		states = append(states, s)
+	}
+	rows.Close()
+	for _, s := range states {
+		if s != "archiving" {
+			t.Errorf("объект ушёл в %s — он же запечатан", s)
+		}
+	}
+
+	// А определённый отказ — снимает членство целиком, иначе объект вернётся в
+	// pending с висящим pack_id.
+	if err := m.FailPackArchive(ctx, packID, ids, "отказ"); err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM objects WHERE id = ANY($1::uuid[]) AND pack_id IS NOT NULL`, ids).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 {
+		t.Errorf("у %d объектов остался pack_id после определённого отказа", left)
+	}
+}
