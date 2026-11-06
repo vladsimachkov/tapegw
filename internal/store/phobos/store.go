@@ -19,8 +19,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -52,6 +52,10 @@ type Store struct {
 	ready chan struct{}
 	done  chan struct{}
 
+	// cfgPath — конфиг Phobos, с которым инициализирован libphobos. CLI
+	// получает его явно (cliEnv), иначе «записали одним конфигом, ищем другим».
+	cfgPath string
+
 	initErr error
 
 	tidMu sync.Mutex
@@ -74,10 +78,17 @@ func (s *Store) noteTID(tid C.long) {
 
 // Open вызывает phobos_init внутри горутины-владельца.
 func Open(ctx context.Context) (*Store, error) {
+	return OpenWithConfig(ctx, os.Getenv("PHOBOS_CFG_FILE"))
+}
+
+// OpenWithConfig — то же, но конфиг задан явно: mover обязан инициализировать
+// libphobos и вызывать CLI одним и тем же файлом.
+func OpenWithConfig(ctx context.Context, cfgPath string) (*Store, error) {
 	s := &Store{
-		reqs:  make(chan *request),
-		ready: make(chan struct{}),
-		done:  make(chan struct{}),
+		reqs:    make(chan *request),
+		ready:   make(chan struct{}),
+		done:    make(chan struct{}),
+		cfgPath: cfgPath,
 	}
 	go s.owner()
 	select {
@@ -229,7 +240,7 @@ func (s *Store) Stat(ctx context.Context, id uuid.UUID) (store.Meta, error) {
 	// вызов libphobos, поэтому запускается НЕ из горутины-владельца: запуск
 	// Python заблокировал бы владельца на всё время старта, ничего не дав
 	// взамен. ADR-0008 соблюдён: тот же источник, что и для носителя.
-	ei, err := extentList(ctx, id)
+	ei, err := extentList(ctx, id, s.cfgPath)
 	if err != nil {
 		return store.Meta{}, err
 	}
@@ -268,13 +279,35 @@ type extentInfo struct {
 	State     []string `json:"state"`
 }
 
-func extentList(ctx context.Context, id uuid.UUID) (extentInfo, error) {
+// cliEnv — окружение для CLI Phobos. PHOBOS_CFG_FILE передаётся явно:
+// полагаться на унаследованное нельзя, потому что libphobos внутри mover
+// инициализирован конкретным конфигом, а CLI по умолчанию читает свой.
+// Расхождение выглядит как «объект записан, но extent list его не видит».
+func cliEnv(cfgPath string) []string {
+	// Наследованное значение удаляется всегда: libphobos инициализирован
+	// конкретным конфигом (или значением по умолчанию), а CLI иначе прочитал бы
+	// то, что лил в окружение кто-то снаружи.
+	env := os.Environ()
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "PHOBOS_CFG_FILE=") {
+			out = append(out, kv)
+		}
+	}
+	if cfgPath != "" {
+		out = append(out, "PHOBOS_CFG_FILE="+cfgPath)
+	}
+	return out
+}
+
+func extentList(ctx context.Context, id uuid.UUID, cfgPath string) (extentInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	var out, errb bytes.Buffer
 	cmd := exec.CommandContext(ctx, "phobos", "extent", "list", "-f", "json",
 		"-o", "oid,size,media_name,state", id.String())
+	cmd.Env = cliEnv(cfgPath)
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
@@ -342,14 +375,74 @@ func cAttrs(attrs map[string]string) (**C.char, **C.char, func()) {
 
 // Get и Delete — в 1a-2. Отвечают явно: «не реализовано» честнее, чем
 // молчаливая заглушка (правило 4).
-func (s *Store) Get(context.Context, []store.GetItem) []store.Result {
-	return []store.Result{{Err: errors.New("phobos: Get ещё не реализован (1a-2)")}}
+func (s *Store) Get(ctx context.Context, items []store.GetItem) []store.Result {
+	res := make([]store.Result, len(items))
+	for i, it := range items {
+		res[i] = store.Result{ID: it.ID, Err: s.getOne(ctx, it)}
+	}
+	return res
 }
 
-func (s *Store) Delete(context.Context, []uuid.UUID) []store.Result {
-	return []store.Result{{Err: errors.New("phobos: Delete ещё не реализован (1a-2)")}}
+func (s *Store) getOne(ctx context.Context, it store.GetItem) error {
+	// Файл подготавливает само хранилище: Phobos пишет в fd с текущей позиции,
+	// а буфер мог быть прочитан до конца (см. store.PrepareForWrite).
+	if err := store.PrepareForWrite(it.File); err != nil {
+		return err
+	}
+	_, err := s.do(ctx, func() (any, error) {
+		cid := C.CString(it.ID.String())
+		defer C.free(unsafe.Pointer(cid))
+		runtime.KeepAlive(it.File)
+		var tid C.long
+		rc := C.tapegw_get(cid, C.int(it.File.Fd()), 1 /* DSS_OBJ_ALIVE */, &tid)
+		s.noteTID(tid)
+		if rc != 0 {
+			return nil, fmt.Errorf("phobos: get %s: %w", it.ID, syscall.Errno(-rc))
+		}
+		return nil, nil
+	})
+	return err
 }
 
-func (s *Store) Extents(context.Context, []uuid.UUID) (map[uuid.UUID][]string, error) {
-	return nil, errors.New("phobos: Extents ещё не реализован (1a-2)")
+func (s *Store) Delete(ctx context.Context, ids []uuid.UUID) []store.Result {
+	res := make([]store.Result, len(ids))
+	for i, id := range ids {
+		res[i] = store.Result{ID: id, Err: s.deleteOne(ctx, id)}
+	}
+	return res
+}
+
+func (s *Store) deleteOne(ctx context.Context, id uuid.UUID) error {
+	_, err := s.do(ctx, func() (any, error) {
+		cid := C.CString(id.String())
+		defer C.free(unsafe.Pointer(cid))
+		var tid C.long
+		rc := C.tapegw_delete(cid, &tid)
+		s.noteTID(tid)
+		switch {
+		case rc == 0:
+			return nil, nil
+		// Уже удалён — не ошибка: воркер повторяет шаг после падения и должен
+		// сходиться к том же результату.
+		case syscall.Errno(-rc) == syscall.ENOENT:
+			return nil, nil
+		}
+		return nil, fmt.Errorf("phobos: delete %s: %w", id, syscall.Errno(-rc))
+	})
+	return err
+}
+
+func (s *Store) Extents(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]string, error) {
+	// Носитель узнаётся при архивации через CLI (ADR-0008): libpho_core не
+	// линкуем. Вызов редкий и идёт вне горутины-владельца — он не вызывает
+	// libphobos, а значит не обязан ждать владельца.
+	out := make(map[uuid.UUID][]string, len(ids))
+	for _, id := range ids {
+		ei, err := extentList(ctx, id, s.cfgPath)
+		if err != nil {
+			return nil, err
+		}
+		out[id] = ei.MediaName
+	}
+	return out, nil
 }

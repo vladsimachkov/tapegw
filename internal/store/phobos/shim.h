@@ -31,6 +31,13 @@ int tapegw_put(const char *objid, int fd, long size, int family,
                char **vals, int nattrs, char **lyt_keys, char **lyt_vals,
                int nlyt, long *tid_out);
 
+/* Читает объект в fd (xt_fd — файл для записи). scope: 1 = только живые. */
+int tapegw_get(const char *objid, int fd, int scope, long *tid_out);
+
+/* Удаляет объект. Возвращает 0 и при «уже удалён»: идемпотентность нужна
+   воркеру, который повторяет шаг после падения. */
+int tapegw_delete(const char *objid, long *tid_out);
+
 /* Метаданные объекта: размер и версия. *found = 0, если объекта нет. */
 int tapegw_getmd(const char *objid, long *size_out, int *version_out,
                  int *found, long *tid_out);
