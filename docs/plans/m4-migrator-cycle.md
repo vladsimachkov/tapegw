@@ -11,6 +11,15 @@
 - [ ] **1c попутно**: проверка уникальности `(library, addr)` в `phobos.movers` —
   ключ YAML сам по себе не повторится, но одна и та же физика может быть описана
   дважды под разными ключами.
+- [x] **Разведка стенда для 1a** (192.168.1.144, Phobos 3.4.1):
+  заголовок — `/usr/include/phobos_store.h` (38 КБ), рядом `phobos_admin.h`;
+  библиотеки — `/usr/lib64/libphobos_store.so{,.0,.0.0.0}` и `libphobos_admin.so`;
+  есть `pkg-config phobos` (`Cflags: -I/usr/include`,
+  `Libs: -L/usr/lib64 -lphobos_store -lphobos_admin -L/usr/lib64/phobos
+  -Wl,-rpath,/usr/lib64/phobos -lpho_core`), зависимости — glib-2.0, gthread-2.0,
+  jansson >= 2.5, libattr. Значит cgo-пакет собирается через
+  `#cgo pkg-config: phobos`, а не ручным списком флагов: список зависимостей
+  чужой и меняется с релизом.
 - [ ] **1a**: `internal/store/phobos` под тегом `phobos`; вызовы — из одной
   горутины-владельца с `runtime.LockOSThread()` (поправка в ADR-0007), не из
   мьютекса. Спайк M0-13.
