@@ -439,17 +439,46 @@ SELECT c.copy_name, c.version, c.copy_status, e.medium_id, e.state
 сессию (см. выше). Затем `systemctl start phobosd` и проверить `pgrep -a phobosd`
 — процесс обязан быть ровно один.
 
+### `No locks available (37)` и `ENODEV` на `dir`: поток устройства умер
+
+Симптом: `put` на `dir` отвечает `No such device`, а в журнале phobosd:
+
+```
+Error when releasing device (family 'dir', name 'localhost:/var/lib/phobos/dir1',
+  library 'dirlib') with current lock (hostname localhost, owner 180349):
+  No locks available (37)
+device thread (...) terminated with error: No locks available (37)
+No compatible device found for write alloc: No such device (19)
+```
+
+Причина: поток устройства завершился из-за `ENOLCK`, и LRS остаётся без
+устройства — отсюда `ENODEV`. Локи в DSS при этом могут выглядеть чистыми
+(`lock_owner = 0`), а `phobos lock clean` без ключей отвечает `0 lock(s) cleaned`:
+без `--force` он не трогает локи при работающем phobosd, а тип и семейство надо
+указывать явно (`-t device -f dir --force`).
+
+Что делать: **не найдено**. `phobos lock clean -t device -f dir --force` и
+`systemctl restart phobosd` положение не исправили — `put` по-прежнему `ENODEV`.
+Следующая гипотеза: `ENOLCK` приходит из DSS (Postgres), и перед рестартом надо
+останавливать и TLC, и phobosd полностью. TLC на этом стенде тоже запущен
+вручную (`phobos_tlc -i`, юнит `inactive`) — тот же класс ошибки, что и с
+phobosd.
+
 ### `Transport endpoint is not connected` при активном юните
 
 Симптом: `systemctl is-active phobosd` = `active`, а CLI отвечает
 `Cannot contact 'phobosd': Transport endpoint is not connected`. Конфиг задаёт
 `server_socket = /tmp/socklrs`, файла в `/tmp` нет.
 
-Причина: **не найдена**. Гипотеза `PrivateTmp=yes` проверена и **отвергнута**:
-`systemctl show phobosd -p PrivateTmp` → `PrivateTmp=no`, `RuntimeDirectory=phobosd`
-уже задан, и в `/proc/<pid>/root/tmp` сокета тоже нет. То есть демон активен, но
-сокет по пути из конфига не создаёт — куда он его создаёт (или почему не создаёт),
-не установлено.
+Причина: **не найдена, и сама постановка была неверна**. Сокет существует:
+`ss -xlp | grep phobos` показывает `/tmp/socklrs` в состоянии LISTEN у процесса
+phobosd. Ошибка «Transport endpoint is not connected» наблюдалась в окно между
+смертью старого процесса и созданием сокета новым — то есть это гонка при
+рестарте, а не «сокет не создаётся».
+
+Гипотеза `PrivateTmp=yes` проверена и **отвергнута**: `PrivateTmp=no`,
+`RuntimeDirectory=phobosd` уже задан, в `/proc/<pid>/root/tmp` сокета нет — и не
+должно быть, сокет в общем `/tmp`.
 
 Что делать: разбираться, а не обходить. Проверить, какой конфиг читает демон
 (`PHOBOS_CFG_FILE` в юните), и нет ли второго phobosd.
