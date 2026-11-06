@@ -257,11 +257,23 @@ func (s *Server) handle(conn net.Conn) {
 			// Удаляем только то, что сами объявили неполным: целая копия
 			// удаляться «чтобы повторить» не должна. Отказ — это ответ, а не
 			// обрыв: соединение нужно клиенту и дальше.
+			// Проверка закрыта в опасную сторону: если Stat не ответил, мы НЕ
+			// знаем, целый ли объект, — и не удаляем ничего. Разрешать
+			// разрушительное действие при сбое проверки — значит потерять
+			// архивный объект из-за временной недоступности LRS.
 			code := CodeOK
-			if st, err := s.st.Stat(context.Background(), d.ID); err == nil && st.Complete {
-				code = CodeDenied
-			} else if res := s.st.Delete(context.Background(), []uuid.UUID{d.ID}); len(res) == 1 && res[0].Err != nil && !errors.Is(res[0].Err, store.ErrNotFound) {
+			st, err := s.st.Stat(context.Background(), d.ID)
+			switch {
+			case errors.Is(err, store.ErrNotFound):
+				// Удалять нечего: для delete это успех, повтор тоже ok.
+			case err != nil:
 				code = CodeIO
+			case st.Complete:
+				code = CodeDenied
+			default:
+				if res := s.st.Delete(context.Background(), []uuid.UUID{d.ID}); len(res) == 1 && res[0].Err != nil {
+					code = CodeIO
+				}
 			}
 			_ = WriteJSON(tconn, Result{Type: "result", Op: d.ID, Code: code, State: StateDone})
 		case "release":

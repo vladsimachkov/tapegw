@@ -2,6 +2,7 @@ package mover_test
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -85,5 +86,41 @@ func TestDeleteRefusesCompleteObject(t *testing.T) {
 	}
 	if res.Code != mover.CodeOK {
 		t.Errorf("удаление неполной копии: %s, ждали ok", res.Code)
+	}
+}
+
+// Ошибка Stat — это «мы не знаем», а не «объекта нет». Разрушительная операция
+// при неизвестном состоянии выполняться не должна: иначе недоступный LRS
+// превращается в потерю архивной копии.
+func TestDeleteRefusedWhenStatFails(t *testing.T) {
+	e := startEnv(t, 1<<20)
+	c := e.dial(t)
+
+	body := []byte("do not delete me")
+	op := uuid.New()
+	if _, err := c.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(body)), SHA256: sum(body), Body: bytes.NewReader(body)}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.st.FailStat(errors.New("phobos: LRS недоступен"))
+	res, err := c.DeleteObject(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != mover.CodeIO {
+		t.Errorf("delete при ошибке stat: %s, ждали io", res.Code)
+	}
+	e.st.FailStat(nil)
+	if !e.st.Has(op) {
+		t.Error("объект удалён, хотя его состояние неизвестно")
+	}
+
+	// Нет объекта — удалять нечего, это успех, а не ошибка.
+	res, err = c.DeleteObject(uuid.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != mover.CodeOK {
+		t.Errorf("delete отсутствующего: %s, ждали ok", res.Code)
 	}
 }
