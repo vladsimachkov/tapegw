@@ -64,6 +64,14 @@ func ConnectSchema(t *testing.T, schema string) *meta.Meta {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 
+	// Соединение проверяется ПЕРВЫМ шагом, до миграций. Без этого недоступная
+	// база приходит не как «базы нет», а как «миграции не применились,
+	// пересоздаём схему» — и это отправляет искать не туда: упавший контейнер
+	// Postgres выглядит как сломанный SQL.
+	if err := pingDB(ctx, dsn); err != nil {
+		t.Fatalf("%s: база недоступна: %v\nЭто не ошибка миграций: поднимите Postgres или поправьте DSN", DSNEnv, err)
+	}
+
 	if err := meta.Migrate(ctx, dsn); err != nil {
 		// Миграции не легли на существующую схему. Для тестовой базы это штатная
 		// ситуация, а не поломка: схема переживает прогон, в ней остаются строки
@@ -77,6 +85,14 @@ func ConnectSchema(t *testing.T, schema string) *meta.Meta {
 		// молча: пустая схема не чинит сломанный SQL.
 		t.Logf("миграции не применились к схеме, пересоздаём: %v", err)
 		DropSchema(t, schema)
+		// Соединение проверяется ПЕРВЫМ шагом, до миграций. Без этого недоступная
+		// база приходит не как «базы нет», а как «миграции не применились,
+		// пересоздаём схему» — и это отправляет искать не туда: упавший контейнер
+		// Postgres выглядит как сломанный SQL.
+		if err := pingDB(ctx, dsn); err != nil {
+			t.Fatalf("%s: база недоступна: %v\nЭто не ошибка миграций: поднимите Postgres или поправьте DSN", DSNEnv, err)
+		}
+
 		if err := meta.Migrate(ctx, dsn); err != nil {
 			t.Fatalf("миграции после пересоздания схемы: %v", err)
 		}
@@ -283,6 +299,20 @@ var nonIdent = regexp.MustCompile(`[^a-z0-9_]`)
 // withSchema подменяет search_path в DSN. Ошибку возвращаем наружу: кривой DSN
 // в тесте должен быть виден сразу, а не превращаться в «тест работает не с той
 // схемой».
+// pingDB — дешёвая проверка, что по DSN вообще можно выполнить запрос.
+func pingDB(ctx context.Context, dsn string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(ctx)
+	var one int
+	if err := conn.QueryRow(ctx, "SELECT 1").Scan(&one); err != nil {
+		return err
+	}
+	return nil
+}
+
 func withSchema(dsn, schema string) (string, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
