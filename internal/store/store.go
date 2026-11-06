@@ -105,7 +105,10 @@ type Result struct {
 
 // PutOptions — параметры записи, приходят из конфига (family, layout, tags).
 type PutOptions struct {
-	Family       string
+	Family string
+	// Library — библиотека носителей. libphobos не берёт её из профиля: без
+	// явных family/library/layout PUT отвечает -19 ENODEV (спайк M0-02).
+	Library      string
 	Layout       string
 	LayoutParams map[string]string
 	Tags         []string
