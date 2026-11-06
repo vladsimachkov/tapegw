@@ -8,6 +8,13 @@
 [ADR-0020](../adr/0020-tape-record-format.md),
 [ADR-0021](../adr/0021-mover-protocol.md), [ADR-0022](../adr/0022-copies-as-separate-objects.md).
 
+- [ ] **1c попутно**: проверка уникальности `(library, addr)` в `phobos.movers` —
+  ключ YAML сам по себе не повторится, но одна и та же физика может быть описана
+  дважды под разными ключами.
+- [ ] **1a**: `internal/store/phobos` под тегом `phobos`; вызовы — из одной
+  горутины-владельца с `runtime.LockOSThread()` (поправка в ADR-0007), не из
+  мьютекса. Спайк M0-13.
+
 ## Что выбирает migrator, а что — Phobos
 
 **Носитель выбирает Phobos** по тегам копии, которые migrator передаёт в `put`.
