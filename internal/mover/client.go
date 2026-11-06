@@ -117,6 +117,10 @@ type PutIn struct {
 	Attrs  map[string]string
 	Body   io.Reader
 
+	// Tags — теги Phobos: именно они разводят копии по носителям (ADR-0013).
+	// Без них «копия left» и «копия right» лягут по умолчанию Phobos.
+	Tags []string
+
 	// FromOp — локальная передача (Ф0.4): записать объект из буфера другой
 	// завершённой операции этого же mover'а. Body при этом не нужен.
 	FromOp uuid.UUID
@@ -140,7 +144,7 @@ func (c *Client) Put(in PutIn) (*Result, error) {
 	if in.ID != in.Op {
 		return nil, fmt.Errorf("mover: oid объекта — это op, а %s != %s", in.ID, in.Op)
 	}
-	if err := WriteJSON(c.conn, Put{Type: "put", Op: in.Op, Size: in.Size, SHA256: in.SHA256, Attrs: in.Attrs, FromOp: in.FromOp, Hold: in.Hold}); err != nil {
+	if err := WriteJSON(c.conn, Put{Type: "put", Op: in.Op, Size: in.Size, SHA256: in.SHA256, Attrs: in.Attrs, Tags: in.Tags, FromOp: in.FromOp, Hold: in.Hold}); err != nil {
 		return nil, err
 	}
 

@@ -185,6 +185,23 @@ type fakeStore struct {
 	// нельзя вызвать вообще.
 	exists     map[uuid.UUID]bool
 	incomplete map[uuid.UUID]bool
+
+	// Что реально легло на «ленту»: теги и атрибуты по oid. Тест копий
+	// проверяет ими, что копии — разные объекты с разными тегами.
+	tags  map[uuid.UUID][]string
+	attrs map[uuid.UUID]map[string]string
+}
+
+func (f *fakeStore) Tags(id uuid.UUID) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tags[id]
+}
+
+func (f *fakeStore) Attrs(id uuid.UUID) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attrs[id]
 }
 
 func (f *fakeStore) forceExists(id uuid.UUID, incomplete bool) {
@@ -204,10 +221,12 @@ func (f *fakeStore) init() {
 		f.locateOK = true
 		f.exists = map[uuid.UUID]bool{}
 		f.incomplete = map[uuid.UUID]bool{}
+		f.tags = map[uuid.UUID][]string{}
+		f.attrs = map[uuid.UUID]map[string]string{}
 	}
 }
 
-func (f *fakeStore) Put(_ context.Context, batch []store.PutItem, _ store.PutOptions) []store.Result {
+func (f *fakeStore) Put(_ context.Context, batch []store.PutItem, opt store.PutOptions) []store.Result {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -224,6 +243,8 @@ func (f *fakeStore) Put(_ context.Context, batch []store.PutItem, _ store.PutOpt
 			continue
 		}
 		f.data[it.ID] = b
+		f.tags[it.ID] = append([]string(nil), opt.Tags...)
+		f.attrs[it.ID] = it.Attrs
 		out = append(out, store.Result{ID: it.ID, Version: 1})
 	}
 	return out

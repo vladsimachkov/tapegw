@@ -54,9 +54,17 @@ type Archiver struct {
 	// обычным put и держит буфер (hold) для остальных. Пусто — копия одна.
 	Specs []string
 
-	// MoverFor выбирает mover по спецификации: копии лежат на разных носителях,
-	// значит пишутся разными драйвами. Если не задан, все копии пишет Put.
-	MoverFor func(spec string) (Putter, error)
+	// SpecTags — теги Phobos по спецификации: копии разводят по носителям
+	// именно тегами (ADR-0013, ADR-0022). Без них «копия left» и «копия right»
+	// лягут туда, куда решит Phobos по умолчанию, в том числе на одну сторону,
+	// а вся цель разведения пропадёт.
+	SpecTags map[string][]string
+
+	// Копии пишет тот же mover, что держит буфер: реестр операций и буфер
+	// принадлежат конкретному mover'у, и другой на from_op ответит not_found.
+	// Параллельная запись копий разными драйвами требует общего буфера и
+	// реестра на сервер библиотеки — это записано в ADR-0021 как целевая форма,
+	// а не как то, что здесь забыли подключить.
 
 	// Log — куда писать про ленту вне реестра. По умолчанию slog.Default().
 	Log *slog.Logger
@@ -88,12 +96,41 @@ func (a *Archiver) sendPack(ctx context.Context, packID uuid.UUID, plan *Plan, a
 		ID:     packID, // oid Phobos = UUID пачки: повтор бьёт в тот же объект
 		Size:   plan.Size,
 		SHA256: plan.SHA256,
-		Attrs:  attrs,
+		Attrs:  a.attrsFor(attrs, a.Spec),
+		Tags:   a.SpecTags[a.Spec],
 		// Буфер держим, только если с него пойдут копии: иначе mover освободит
 		// данные сразу, и второй копии нечего читать и не с чем сверять.
 		Hold: len(a.copySpecs()) > 1,
 		Body: bytes.NewReader(body),
 	})
+}
+
+// copyOp — операция (и oid Phobos) одной копии. Детерминированная: UUIDv5 от
+// пачки и имени копии, чтобы повтор после обрыва бился в тот же объект Phobos,
+// а не плодил второй.
+//
+// У копии обязан быть свой oid: по ADR-0022 каждая копия — отдельный объект
+// Phobos. Общего oid на все копии быть не может: вторая запись на тот же oid
+// дала бы EEXIST, mover разобрал бы его как «целая копия» и вернул ok — то есть
+// копия считается записанной, а на ленте ничего не легло.
+//
+// Имя вида «<uuid>.left» здесь не используется: протокол связывает oid объекта с
+// UUID операции (иначе «продолжить передачу» и «записать заново» неразличимы),
+// поэтому уникальность даёт сам UUID. См. ADR-0022, поправка.
+func copyOp(packID uuid.UUID, spec string) uuid.UUID {
+	return uuid.NewSHA1(packID, []byte(spec))
+}
+
+// attrsFor — атрибуты конкретной копии: к общим добавляется tapegw.copy, он
+// пишется и когда копия одна (иначе rebuild-meta находит несколько
+// неразличимых записей об одном ключе).
+func (a *Archiver) attrsFor(base map[string]string, spec string) map[string]string {
+	out := make(map[string]string, len(base)+1)
+	for k, v := range base {
+		out[k] = v
+	}
+	out["tapegw.copy"] = spec
+	return out
 }
 
 // resolveUnknown разбирает итог операции, по которой оборвалась связь.
@@ -385,17 +422,12 @@ func (a *Archiver) writeExtraCopies(ctx context.Context, packID uuid.UUID, plan 
 	}
 	for _, spec := range specs[1:] {
 		mv := a.Put
-		if a.MoverFor != nil {
-			var err error
-			if mv, err = a.MoverFor(spec); err != nil {
-				a.logger().Error("копия не написана: нет mover'а",
-					"pack", packID.String(), "spec", spec, "err", err.Error())
-				continue
-			}
-		}
+		op := copyOp(packID, spec)
 		res, err := mv.Put(mover.PutIn{
-			Op: packID, ID: packID, Size: plan.Size, SHA256: plan.SHA256,
-			Attrs: attrs, FromOp: packID,
+			Op: op, ID: op, Size: plan.Size, SHA256: plan.SHA256,
+			Attrs:  a.attrsFor(attrs, spec),
+			Tags:   a.SpecTags[spec],
+			FromOp: packID,
 		})
 		if err != nil || res == nil || res.Code != mover.CodeOK {
 			code := "transport"
@@ -413,7 +445,8 @@ func (a *Archiver) writeExtraCopies(ctx context.Context, packID uuid.UUID, plan 
 				return err
 			}
 		}
-		if _, err := a.Meta.RecordPackCopy(ctx, packID, spec, packID.String(), res.Version, a.Format, raw, mediumID); err != nil {
+		// oid копии — её собственный объект Phobos, не oid пачки.
+		if _, err := a.Meta.RecordPackCopy(ctx, packID, spec, op.String(), res.Version, a.Format, raw, mediumID); err != nil {
 			return err
 		}
 	}
