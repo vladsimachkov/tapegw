@@ -33,7 +33,11 @@ podman build -f "$here/deploy/Containerfile.ci-dir" -t "$IMAGE" "$here" || exit 
 podman rm -f "$NAME" >/dev/null 2>&1
 # Репозиторий монтируем сразу: тесты каркаса (go test -tags phobos) должны идти
 # внутри контейнера, где есть заголовки и библиотеки Phobos и сокет phobosd.
-podman run -d --name "$NAME" -v "$here:/src:ro" "$IMAGE" >/dev/null || exit 1
+# Репозиторий и кэш модулей монтируем: до реестра Go из контейнера не достать,
+# поэтому зависимости берутся с машины, которая собирает стенд.
+podman run -d --name "$NAME" \
+    -v "$here:/src:ro" -v "$(go env GOMODCACHE):/gomodcache:ro" \
+    "$IMAGE" >/dev/null || exit 1
 
 echo "== ожидание готовности"
 for _ in $(seq 1 60); do
@@ -52,7 +56,11 @@ podman exec "$NAME" bash -c \
 
 if [ "${1:-}" = "--test" ]; then
     echo "== тесты каркаса cgo внутри контейнера"
-    podman exec -w /src "$NAME" go test -tags phobos -count=1 ./internal/store/phobos
+    # TAPEGW_PHOBOS_DIR_MEDIA — два носителя: на них проверяется число реплик.
+    podman exec -e GOMODCACHE=/gomodcache -e GOFLAGS=-mod=mod \
+        -e TAPEGW_PHOBOS_TEST=1 \
+        -e TAPEGW_PHOBOS_DIR_MEDIA=/var/lib/phobos/dir1,/var/lib/phobos/dir2 \
+        -w /src "$NAME" go test -tags phobos -count=1 ./internal/store/phobos
 fi
 
 echo "== остаётся запущенным: podman exec -it $NAME bash"

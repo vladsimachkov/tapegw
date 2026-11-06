@@ -3,10 +3,13 @@
 package phobos_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -138,4 +141,88 @@ func TestAllCallsFromOneThread(t *testing.T) {
 		t.Errorf("вызовы C пришли из %d потоков ОС (%v): горутина-владельца не удерживает поток", len(seen), seen)
 	}
 	t.Logf("M0-13: %d вызовов C, все из tid %d", len(tids), tids[0])
+}
+
+// TestReplicaCountIsOne — проверка «ровно одна реплика», не требующая ленты.
+//
+// extent list у семейства dir расширений не показывает (выводит только oid),
+// поэтому считаем напрямую: носитель dir — обычный каталог, реплика объекта —
+// файл в нём. На стенде два носителя, поэтому:
+//   - put с repl_count=1 оставляет файл ровно в одном каталоге;
+//   - put без параметров layout (raid1 по умолчанию берёт две реплики) —
+//     в обоих.
+//
+// Второй случай заодно доказывает, что параметры действительно доходят до Phobos:
+// если бы они игнорировались, обе строки вели себя одинаково.
+func TestReplicaCountIsOne(t *testing.T) {
+	requirePhobos(t)
+	media := strings.Split(os.Getenv("TAPEGW_PHOBOS_DIR_MEDIA"), ",")
+	if len(media) < 2 {
+		t.Skip("нужно два носителя dir: TAPEGW_PHOBOS_DIR_MEDIA=dir1,dir2")
+	}
+	ctx := context.Background()
+	st, err := phobos.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Размер выбираем некруглый и уникальный для теста: считаем файлом ровно
+	// то, что записали, и не должны поймать чужой объект того же размера.
+	size := int64(16391)
+
+	put := func(name string, params map[string]string) {
+		f, err := os.CreateTemp(t.TempDir(), "obj")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write(bytes.Repeat([]byte{0xAB}, int(size))); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		res := st.Put(ctx, []store.PutItem{{ID: uuid.New(), File: f, Size: size}},
+			store.PutOptions{Family: "dir", Library: "dirlib", Layout: "raid1",
+				LayoutParams: params})
+		if len(res) != 1 {
+			t.Fatalf("%s: результатов %d, ждём 1", name, len(res))
+		}
+		if res[0].Err != nil {
+			t.Fatalf("%s: %v", name, res[0].Err)
+		}
+	}
+
+	put("с repl_count=1", map[string]string{"repl_count": "1"})
+	got := 0
+	for _, m := range media {
+		got += countFilesOfSize(m, size)
+	}
+	if got != 1 {
+		t.Errorf("с repl_count=1: реплик %d, хотим 1", got)
+	}
+
+	put("без параметров layout", nil)
+	got = 0
+	for _, m := range media {
+		got += countFilesOfSize(m, size)
+	}
+	if got != 3 { // одна из первого put плюс две новые
+		t.Errorf("без параметров: файлов %d, хотим 3 (1 + 2 реплики)", got)
+	}
+}
+
+func countFilesOfSize(root string, size int64) int {
+	n := 0
+	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		if info, err := d.Info(); err == nil && info.Size() == size {
+			n++
+		}
+		return nil
+	})
+	return n
 }
