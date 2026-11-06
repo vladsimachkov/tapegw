@@ -153,7 +153,7 @@ func (s *Store) Put(ctx context.Context, items []store.PutItem, opt store.PutOpt
 			out = append(out, Result{ID: it.ID, Err: store.ErrAttrTooLarge})
 			continue
 		}
-		data, err := readAll(it.Reader)
+		data, err := readAll(it.File)
 		if err != nil {
 			out = append(out, Result{ID: it.ID, Err: err})
 			continue
@@ -250,7 +250,7 @@ func (s *Store) Get(ctx context.Context, items []store.GetItem) []Result {
 			out = append(out, Result{ID: it.ID, Err: store.ErrIncomplete})
 			continue
 		}
-		if _, err := it.Writer.Write(b.data); err != nil {
+		if _, err := it.File.Write(b.data); err != nil {
 			out = append(out, Result{ID: it.ID, Err: err})
 			continue
 		}

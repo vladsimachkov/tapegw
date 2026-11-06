@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -490,7 +491,7 @@ func (s *Server) writeFrom(p *Put, src uuid.UUID) Result {
 	return s.putReader(p, f)
 }
 
-func (s *Server) putReader(p *Put, f io.Reader) Result {
+func (s *Server) putReader(p *Put, f *os.File) Result {
 	s.phobosMu.Lock()
 	defer s.phobosMu.Unlock()
 
@@ -498,7 +499,7 @@ func (s *Server) putReader(p *Put, f io.Reader) Result {
 		Family: s.cfg.Family, Layout: s.cfg.Layout,
 		LayoutParams: s.cfg.LayoutParams, Tags: p.Tags, NoSplit: p.NoSplit,
 	}
-	items := []store.PutItem{{ID: p.Op, Reader: f, Size: p.Size, Attrs: p.Attrs}}
+	items := []store.PutItem{{ID: p.Op, File: f, Size: p.Size, Attrs: p.Attrs}}
 	res := s.st.Put(context.Background(), items, opt)
 	if len(res) != 1 {
 		return Result{Code: CodeUnknown}
@@ -548,7 +549,7 @@ func (s *Server) handleGet(conn net.Conn, g *Get) *Frame {
 		send(Result{Code: CodeIO, State: StateFailed})
 		return nil
 	}
-	res := s.st.Get(context.Background(), []store.GetItem{{ID: g.ID, Writer: f}})
+	res := s.st.Get(context.Background(), []store.GetItem{{ID: g.ID, File: f}})
 	code := CodeIO
 	if len(res) == 1 {
 		code = codeFor(res[0].Err)

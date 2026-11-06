@@ -155,7 +155,7 @@ func (f *Store) Put(_ context.Context, batch []store.PutItem, opt store.PutOptio
 			out = append(out, store.Result{ID: it.ID, Err: store.ErrExists})
 			continue
 		}
-		b, err := io.ReadAll(it.Reader)
+		b, err := io.ReadAll(it.File)
 		if err != nil {
 			out = append(out, store.Result{ID: it.ID, Err: err})
 			continue
@@ -179,8 +179,8 @@ func (f *Store) Get(_ context.Context, items []store.GetItem) []store.Result {
 			out = append(out, store.Result{ID: it.ID, Err: store.ErrNotFound})
 			continue
 		}
-		if it.Writer != nil {
-			_, _ = it.Writer.Write(b)
+		if it.File != nil {
+			_, _ = it.File.Write(b)
 		}
 		out = append(out, store.Result{ID: it.ID, Version: 1})
 	}
