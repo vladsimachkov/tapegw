@@ -97,6 +97,14 @@ type GetItem struct {
 
 // Result — итог по одному объекту батча. Батч может частично удалиться,
 // поэтому ошибка у каждого элемента своя.
+// Extent — один экстент объекта так, как его отдаёт Phobos: размер, носитель и
+// состояние копии. Никаких выводов здесь не зашито.
+type Extent struct {
+	Size  int64
+	Media string
+	State string
+}
+
 type Result struct {
 	ID      uuid.UUID
 	Version int
@@ -140,6 +148,11 @@ type Meta struct {
 	Version  int
 	Complete bool
 	Attrs    map[string]string
+
+	// Extents — экстенты объекта как их вернул Phobos, без интерпретации.
+	// Sumму не считаем: 94 байта — это и две реплики по 47, и один объект на
+	// 94, а для разбора EEXIST это противоположные случаи.
+	Extents []Extent
 }
 
 // Store — клиент Phobos. Все методы батчевые: один вызов = один xfer, это
@@ -183,3 +196,26 @@ var (
 	// конфигурации вызывающей стороны, а не лента: обнаруживается до xfer.
 	ErrAttrTooLarge = errors.New("store: attributes exceed LTFS budget")
 )
+
+// CheckExtents — проверка экстентов против плана. Вызывает её тот, у кого план
+// есть (migrator при EEXIST), потому что «сколько должно быть» знает только он.
+// Причины разделены: «не то число реплик», «копия не дописана» и «размер не тот»
+// — это разные неисправности, и искать их надо по-разному.
+func CheckExtents(ext []Extent, wantSize int64, wantCopies int) error {
+	if len(ext) != wantCopies {
+		return fmt.Errorf("экстентов %d, ожидалось %d — проверьте repl_count", len(ext), wantCopies)
+	}
+	for _, e := range ext {
+		if e.State != "sync" {
+			return fmt.Errorf("копия на %s в состоянии %q, а не sync", e.Media, e.State)
+		}
+	}
+	var total int64
+	for _, e := range ext {
+		total += e.Size
+	}
+	if wantCopies == 1 && total != wantSize {
+		return fmt.Errorf("размер %d, план %d", total, wantSize)
+	}
+	return nil
+}

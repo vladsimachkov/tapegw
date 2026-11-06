@@ -3,10 +3,13 @@
 package phobos_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -64,8 +67,9 @@ func TestPutThenStat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if meta.Size != int64(len(body)) {
-		t.Errorf("размер %d, ждали %d", meta.Size, len(body))
+	// Stat размер не интерпретирует — план проверяет тот, у кого он есть.
+	if err := store.CheckExtents(meta.Extents, int64(len(body)), 1); err != nil {
+		t.Errorf("экстенты не сходятся с планом: %v", err)
 	}
 	if !meta.Complete {
 		t.Error("копия помечена неполной сразу после записи")
@@ -138,4 +142,106 @@ func TestAllCallsFromOneThread(t *testing.T) {
 		t.Errorf("вызовы C пришли из %d потоков ОС (%v): горутина-владельца не удерживает поток", len(seen), seen)
 	}
 	t.Logf("M0-13: %d вызовов C, все из tid %d", len(tids), tids[0])
+}
+
+// TestReplicaCountIsOne — проверка «ровно одна реплика», не требующая ленты.
+//
+// extent list у семейства dir расширений не показывает (выводит только oid),
+// поэтому считаем напрямую: носитель dir — обычный каталог, реплика объекта —
+// файл в нём. На стенде два носителя, поэтому:
+//   - put с repl_count=1 оставляет файл ровно в одном каталоге;
+//   - put без параметров layout (raid1 по умолчанию берёт две реплики) —
+//     в обоих.
+//
+// Второй случай заодно доказывает, что параметры действительно доходят до Phobos:
+// если бы они игнорировались, обе строки вели себя одинаково.
+func TestReplicaCountIsOne(t *testing.T) {
+	requirePhobos(t)
+	media := strings.Split(os.Getenv("TAPEGW_PHOBOS_DIR_MEDIA"), ",")
+	if len(media) < 2 {
+		t.Skip("нужно два носителя dir: TAPEGW_PHOBOS_DIR_MEDIA=dir1,dir2")
+	}
+	ctx := context.Background()
+	st, err := phobos.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Реплика — файл <oid с / -> _>.<uuid> в каталоге носителя (замер —
+	// docs/ops/tape-library.md). Считаем по oid, а не по размеру: по размеру
+	// в зачёт идут файлы других объектов и прошлых прогонов.
+	count := func(id uuid.UUID) int {
+		n := 0
+		for _, m := range media {
+			filepath.WalkDir(m, func(p string, d fs.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return err
+				}
+				if strings.HasPrefix(d.Name(), id.String()+".") {
+					n++
+				}
+				return nil
+			})
+		}
+		return n
+	}
+
+	size := int64(4096)
+	put := func(name string, params map[string]string) uuid.UUID {
+		f, err := os.CreateTemp(t.TempDir(), "obj")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f.Name())
+		if _, err := f.Write(bytes.Repeat([]byte{0xAB}, int(size))); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		id := uuid.New()
+		res := st.Put(ctx, []store.PutItem{{ID: id, File: f, Size: size}},
+			store.PutOptions{Family: "dir", Library: "dirlib", Layout: "raid1",
+				LayoutParams: params})
+		if len(res) != 1 || res[0].Err != nil {
+			t.Fatalf("%s: %v", name, res)
+		}
+		return id
+	}
+
+	// Без параметров layout raid1 берёт две реплики — устройств на стенде ровно
+	// два, поэтому запись проходит. Доказательство, что параметры доходят: при
+	// их игноре обе проверки дали бы одно и то же.
+	check := func(name string, id uuid.UUID, wantCopies int) {
+		meta, err := st.Stat(ctx, id)
+		if err != nil {
+			t.Fatalf("%s: Stat: %v", name, err)
+		}
+		if got := count(id); got != len(meta.Extents) {
+			t.Errorf("%s: файлов на носителях %d, экстентов %d — считалка разошлась", name, got, len(meta.Extents))
+		}
+		// План всегда один: одна реплика, размер size. Ошибка конфигурации
+		// (две реплики вместо одной) должна быть названа своим именем, а не
+		// «размер не совпадает»: иначе разбирать начнут не с того конца.
+		err = store.CheckExtents(meta.Extents, size, 1)
+		if wantCopies == 1 {
+			if err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+			return
+		}
+		if err == nil {
+			t.Fatalf("%s: проверка прошла, хотя реплик больше плана", name)
+		}
+		if !strings.Contains(err.Error(), "repl_count") {
+			t.Errorf("%s: причина %q, хотим про repl_count", name, err)
+		}
+	}
+
+	id1 := put("с repl_count=1", map[string]string{"repl_count": "1"})
+	check("с repl_count=1", id1, 1)
+
+	id2 := put("без параметров layout", nil)
+	check("без параметров layout", id2, 2)
 }

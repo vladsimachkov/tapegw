@@ -248,7 +248,8 @@ func (s *Server) handle(conn net.Conn) {
 				if ext, err := s.st.Extents(context.Background(), []uuid.UUID{q.ID}); err == nil {
 					extents = ext[q.ID]
 				}
-				_ = WriteJSON(tconn, Result{Type: "result", Op: q.ID, Code: CodeOK, Version: st.Version, Extents: extents, Size: st.Size})
+				_ = WriteJSON(tconn, Result{Type: "result", Op: q.ID, Code: CodeOK, Version: st.Version,
+					Extents: extents, ExtentInfo: extentsOf(st), Size: st.Size})
 			}
 		case "delete":
 			var d Delete
@@ -306,6 +307,15 @@ func (s *Server) handle(conn net.Conn) {
 			return
 		}
 	}
+}
+
+// extentsOf — экстенты из store.Meta в вид протокола, без интерпретации.
+func extentsOf(m store.Meta) []ExtentInfo {
+	out := make([]ExtentInfo, 0, len(m.Extents))
+	for _, e := range m.Extents {
+		out = append(out, ExtentInfo{Size: e.Size, Media: e.Media, State: e.State})
+	}
+	return out
 }
 
 func (s *Server) handleStatus(conn net.Conn, op uuid.UUID) {

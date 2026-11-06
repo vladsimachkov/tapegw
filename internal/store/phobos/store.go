@@ -16,12 +16,17 @@ package phobos
 import "C"
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/google/uuid"
@@ -181,6 +186,12 @@ func (s *Store) putOne(it store.PutItem, opt store.PutOptions) error {
 	keys, vals, freeAttrs := cAttrs(it.Attrs)
 	defer freeAttrs()
 
+	// Параметры layout передаются явно: без них Phobos берёт значение по
+	// умолчанию, а raid1 без repl_count требует два устройства и на одном
+	// даёт ENODEV без какой-либо ошибки в журнале phobosd.
+	lkeys, lvals, freeLyt := cAttrs(opt.LayoutParams)
+	defer freeLyt()
+
 	runtime.KeepAlive(it.File)
 	var tid C.long
 	cl := cstr(opt.Layout)
@@ -190,7 +201,7 @@ func (s *Store) putOne(it store.PutItem, opt store.PutOptions) error {
 
 	rc := C.tapegw_put(id, C.int(it.File.Fd()), C.long(it.Size),
 		C.int(familyOf(opt.Family)), clib, cl, keys, vals,
-		C.int(len(it.Attrs)), &tid)
+		C.int(len(it.Attrs)), lkeys, lvals, C.int(len(opt.LayoutParams)), &tid)
 	s.noteTID(tid)
 	switch {
 	case rc == 0:
@@ -210,7 +221,74 @@ func (s *Store) Stat(ctx context.Context, id uuid.UUID) (store.Meta, error) {
 	if err != nil {
 		return store.Meta{}, err
 	}
-	return v.(store.Meta), nil
+	meta := v.(store.Meta)
+
+	// Размер берётся из CLI, а не из getmd: phobos_getmd отдаёт только
+	// пользовательские атрибуты, xt_size для GETMD не заполняется (замерено на
+	// ci-dir: put проходит, Stat рапортует 0). CLI — отдельный процесс, а не
+	// вызов libphobos, поэтому запускается НЕ из горутины-владельца: запуск
+	// Python заблокировал бы владельца на всё время старта, ничего не дав
+	// взамен. ADR-0008 соблюдён: тот же источник, что и для носителя.
+	ei, err := extentList(ctx, id)
+	if err != nil {
+		return store.Meta{}, err
+	}
+	if len(ei.Size) == 0 {
+		return store.Meta{}, fmt.Errorf("phobos: stat %s: экстентов нет", id)
+	}
+	// Экстенты отдаём как есть. Sumму не считаем: 94 — это и две реплики по 47,
+	// и один объект на 94, а для разбора EEXIST это противоположные случаи.
+	// Проверяет их тот, у кого есть план (store.CheckExtents).
+	meta.Extents = make([]store.Extent, 0, len(ei.Size))
+	for i, n := range ei.Size {
+		e := store.Extent{Size: n, State: ei.State[i]}
+		if i < len(ei.MediaName) {
+			e.Media = ei.MediaName[i]
+		}
+		meta.Extents = append(meta.Extents, e)
+	}
+	meta.Complete = allSync(ei.State)
+	return meta, nil
+}
+
+func allSync(states []string) bool {
+	for _, st := range states {
+		if st != "sync" {
+			return false
+		}
+	}
+	return true
+}
+
+// extentInfo — строка вывода `phobos extent list -f json`. Без `-o` CLI
+// выдаёт один oid, поэтому поля перечислены явно (см. docs/ops/tape-library.md).
+type extentInfo struct {
+	Size      []int64  `json:"size"`
+	MediaName []string `json:"media_name"`
+	State     []string `json:"state"`
+}
+
+func extentList(ctx context.Context, id uuid.UUID) (extentInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	var out, errb bytes.Buffer
+	cmd := exec.CommandContext(ctx, "phobos", "extent", "list", "-f", "json",
+		"-o", "oid,size,media_name,state", id.String())
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		return extentInfo{}, fmt.Errorf("phobos extent list %s: %w: %s",
+			id, err, strings.TrimSpace(errb.String()))
+	}
+	var rows []extentInfo
+	if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+		return extentInfo{}, fmt.Errorf("phobos extent list %s: разбор вывода: %w", id, err)
+	}
+	if len(rows) != 1 {
+		return extentInfo{}, fmt.Errorf("phobos extent list %s: записей %d, ждём 1", id, len(rows))
+	}
+	return rows[0], nil
 }
 
 func (s *Store) statOne(id uuid.UUID) (store.Meta, error) {
@@ -229,7 +307,10 @@ func (s *Store) statOne(id uuid.UUID) (store.Meta, error) {
 	if found == 0 {
 		return store.Meta{}, store.ErrNotFound
 	}
-	return store.Meta{ID: id, Size: int64(size), Version: int(version), Complete: true}, nil
+	// Size и Complete заполняет вызвавший: getmd их не отдаёт, а придумывать
+	// здесь «Complete: true» означало бы считать копию целой без проверки.
+	_ = size
+	return store.Meta{ID: id, Version: int(version)}, nil
 }
 
 // cAttrs — массивы C-строк для pho_attr_set. Освобождение — одним вызовом,

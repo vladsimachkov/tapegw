@@ -532,3 +532,42 @@ phobosd. Ошибка «Transport endpoint is not connected» наблюдала
 
 Что делать: `phobos dir list -o all` и смотреть `fs.status`,
 `stats.phys_spc_free`, `lock_owner`, `adm_status`.
+
+### Как `dir` раскладывает объект на носителе
+
+Замерено на чистом `ci-dir`: один `put`, потом `find` по каталогам носителей.
+
+```
+/var/lib/phobos/dir1/8f/c8/probe_one.0c2a7223-a991-4b50-85c8-18e1f93832fd
+/var/lib/phobos/dir2/55/39/ci_probe.a3bde3e2-cdb8-4450-98fc-764705f0f7f1
+```
+
+Имя файла реплики — `<oid, где / заменён на _>.<uuid>`, каталог — два уровня по
+первым двум парам хеша; в корне каждого носителя служебный `.phobos_dir_label`.
+
+Отсюда практическое: **число реплик считается по oid в имени файла**, а не по
+размеру. Подсчёт по размеру считает и файлы других объектов того же размера, и
+файлы прошлых прогонов — носители `dir` между запусками живут.
+
+### `phobos extent list -f json` отдаёт только поля из `-o`
+
+Без `-o` в json попадает один `oid` — выглядит так, будто экстентов нет:
+
+```bash
+phobos extent list -f json probe/one
+→ [{"oid": "probe/one"}]
+```
+
+Поля надо перечислить явно, и тогда размер приходит машиночитаемо:
+
+```bash
+phobos extent list -f json -o oid,size,media_name,state probe/one
+→ [{"oid": "probe/one", "size": [16391],
+    "media_name": ["/var/lib/phobos/dir1"], "state": ["sync"]}]
+```
+
+Значения — массивы по числу экстентов; при `repl_count = 1` и `no_split`
+элемент ровно один. Отсюда порядок для `Stat`/`resolveByStat` (ADR-0008
+соблюдён, `libpho_core` линковать не нужно): одним вызовом получаем и носитель
+для `archive_copies`, и измеренный размер. Разбирать строго: ровно один
+экстент, иначе ошибка; `state = sync`, иначе объект не считается целым.

@@ -37,7 +37,12 @@ phobos_db setup_tables -s 3.3
 # (административная операция через LRS, без демона даёт «Transport endpoint is
 # not connected»). Обратный порядок — phobosd стартует без единого устройства и
 # падает на инициализации планировщика с EINVAL.
-phobos dir add --unlock -L dirlib /var/lib/phobos/dir1
+# Второй носитель нужен, чтобы считать реплики: у dir носитель — обычный
+# каталог, и «реплика в оба» отличается от «реплика в один» подсчётом файлов.
+# Он же делает тест «параметры layout передаются» отличным от «их проигнорировали»:
+# с одним носителем raid1 по умолчанию падает и с параметрами тоже не проходит.
+mkdir -p /var/lib/phobos/dir1 /var/lib/phobos/dir2
+phobos dir add --unlock -L dirlib /var/lib/phobos/dir1 /var/lib/phobos/dir2
 
 phobosd
 for _ in $(seq 1 30); do
@@ -45,7 +50,7 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
-phobos dir format --unlock --fs POSIX /var/lib/phobos/dir1
+phobos dir format --unlock --fs POSIX /var/lib/phobos/dir1 /var/lib/phobos/dir2
 
 echo "ci-dir: готов"
 
