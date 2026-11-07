@@ -569,3 +569,106 @@ func TestLoadEnvOverridesMoverSection(t *testing.T) {
 		t.Errorf("tls.ca = %q, вложенное поле из env не применено", cfg.Phobos.Mover.TLS.CA)
 	}
 }
+
+// --- S2b: роль mover'а, сертификат планировщика, включение воркера ---
+
+// setRole — роль в элементе map: присвоить полю значения из map нельзя.
+func setRole(cfg *Config, key, role string) {
+	m := cfg.Phobos.Movers[key]
+	m.Role = role
+	cfg.Phobos.Movers[key] = m
+}
+
+func TestMoverRoleValidated(t *testing.T) {
+	// Пустая роль — ошибка: воркер выбирает mover'а по роли, «не указано» не
+	// означает «подойдёт любой».
+	cfg := moversCfg()
+	err := cfg.Validate()
+	for _, want := range []string{"drive1.role", "drive2.role"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("про %s не сказано: %v", want, err)
+		}
+	}
+
+	cfg = moversCfg()
+	setRole(cfg, "drive1", "migrator")
+	setRole(cfg, "drive2", "scheduler")
+	cfg.Phobos.MoverClient = MoverTLS{Cert: "c", Key: "k", CA: "ca"}
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), `drive2.role: "scheduler"`) {
+		t.Errorf("неизвестная роль не отклонена: %v", err)
+	}
+}
+
+func TestMoverClientRequiredForMigrator(t *testing.T) {
+	cfg := moversCfg()
+	setRole(cfg, "drive1", "migrator")
+	setRole(cfg, "drive2", "recaller")
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "mover_client") {
+		t.Errorf("mover роли migrator без сертификата планировщика не отклонён: %v", err)
+	}
+	cfg.Phobos.MoverClient = MoverTLS{Cert: "c", Key: "k", CA: "ca"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("заполненный mover_client, а конфиг невалиден: %v", err)
+	}
+
+	// Только recaller-ы — планировщик архивации не подключается, сертификат
+	// не нужен: требовать его значило бы ломать конфиг тем, кто архивацию
+	// ещё не поднимал.
+	cfg2 := moversCfg()
+	setRole(cfg2, "drive1", "recaller")
+	setRole(cfg2, "drive2", "recaller")
+	if err := cfg2.Validate(); err != nil {
+		t.Errorf("пул только с recaller не должен требовать mover_client: %v", err)
+	}
+}
+
+func TestWorkerEnabledValue(t *testing.T) {
+	// nil = включён: молчание в конфиге не должно выключать архивацию.
+	var w Worker
+	if !w.EnabledValue() {
+		t.Error("пустой Worker обязан быть включённым по умолчанию")
+	}
+	off, on := false, true
+	w.Enabled = &off
+	if w.EnabledValue() {
+		t.Error("enabled=false не учтён")
+	}
+	w.Enabled = &on
+	if !w.EnabledValue() {
+		t.Error("enabled=true не учтён")
+	}
+}
+
+func TestWorkerSettingsEnvOverrides(t *testing.T) {
+	// Правило 9: каждое поле переопределяется TAPEGW_* по пути в YAML,
+	// включая *bool и поля вложенного mover_client.
+	t.Setenv("TAPEGW_MIGRATOR_ENABLED", "false")
+	t.Setenv("TAPEGW_MIGRATOR_CLAIM_TTL", "90s")
+	t.Setenv("TAPEGW_MIGRATOR_SHUTDOWN_GRACE", "2m")
+	t.Setenv("TAPEGW_PHOBOS_MOVERS_DRIVE1_ROLE", "migrator")
+	t.Setenv("TAPEGW_PHOBOS_MOVER_CLIENT_CERT", "/etc/tapegw/sched.crt")
+	cfg := moversCfg()
+	if err := applyEnv(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Migrator.EnabledValue() {
+		t.Error("TAPEGW_MIGRATOR_ENABLED=false не применён")
+	}
+	if cfg.Migrator.ClaimTTL != 90*time.Second {
+		t.Errorf("claim_ttl = %v", cfg.Migrator.ClaimTTL)
+	}
+	if cfg.Migrator.ShutdownGrace != 2*time.Minute {
+		t.Errorf("shutdown_grace = %v", cfg.Migrator.ShutdownGrace)
+	}
+	if cfg.Phobos.Movers["drive1"].Role != "migrator" {
+		t.Errorf("role = %q, из env не применён", cfg.Phobos.Movers["drive1"].Role)
+	}
+	if cfg.Phobos.MoverClient.Cert != "/etc/tapegw/sched.crt" {
+		t.Errorf("mover_client.cert = %q", cfg.Phobos.MoverClient.Cert)
+	}
+	if cfg.Recaller.EnabledValue() != true {
+		t.Error("чужой воркер задет")
+	}
+}

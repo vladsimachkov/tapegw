@@ -170,6 +170,12 @@ type Phobos struct {
 	// вместо трёх, которые могут разойтись.
 	Movers map[string]Mover `yaml:"movers"`
 
+	// MoverClient — сертификат tapegw как клиента mover'ов: планировщик
+	// архивации (SAN-URI tapegw://scheduler, ADR-0021). Один на все mover'ы:
+	// различаются mover'ы драйвом в SAN, а роль клиента у планировщика одна.
+	// Читается только когда включён migrator и в библиотеке есть mover'ы.
+	MoverClient MoverTLS `yaml:"mover_client"`
+
 	// Mover — конфигурация самого процесса tapegw-mover (ADR-0021). tapegw
 	// эти поля не читает: они живут в том же файле, потому что один файл —
 	// одна установка, а переменные TAPEGW_PHOBOS_MOVER_* выводятся из пути.
@@ -181,6 +187,12 @@ type Mover struct {
 	Addr    string `yaml:"addr"`
 	Node    string `yaml:"node"`
 	Library string `yaml:"library"`
+	// Role — роль mover'а: migrator (архивация) или recaller (восстановление).
+	// Фильтр по роли, а не только по библиотеке: в одной библиотеке могут стоять
+	// драйвы обоих пулов, и планировщик архивации обязан брать только свои —
+	// иначе он отдаст архивацию драйву, который ждёт restorer'а, и получит
+	// отказ рукопожатия (или, что хуже, подключится не туда).
+	Role string `yaml:"role"`
 }
 
 // MoverServer — настройки процесса tapegw-mover: слушатель, идентичность и
@@ -235,11 +247,30 @@ type MoverTLS struct {
 
 // Worker — настройки одного фоновыего воркера (migrator или recaller).
 type Worker struct {
+	// Enabled — включать ли воркер. По умолчанию true, и включённый воркер
+	// обязан найти себе mover'а: «включено, но ходить некому» — отказ на
+	// старте с внятной ошибкой, а не молчаливый простой очереди.
+	// false — воркер не стартует, и это громко пишется в лог и в /health/ready:
+	// выключенная архивация, о которой никто не знает, дороже.
+	// recaller.enabled читается, когда recaller появится (S5).
+	Enabled *bool `yaml:"enabled"`
+	// ClaimTTL — на сколько воркер запечатывает пачку за собой. Продлевается
+	// во время отправки, поэтому может быть меньше самой долгой отправки; после
+	// сбоя именно он определяет, как долго пачка простоит без продолжения.
+	ClaimTTL time.Duration `yaml:"claim_ttl"`
+	// ShutdownGrace — сколько ждём текущую отправку при остановке. Контекст
+	// воркера отменяется по сигналу, но начатая пачка доходит до конца; если
+	// mover висит дольше grace, процесс уходит, а пачка остаётся в sealed с
+	// захватом, у которого истекает срок, — её продолжит следующий запуск.
+	ShutdownGrace   time.Duration `yaml:"shutdown_grace"`
 	BatchMaxObjects int           `yaml:"batch_max_objects"`
 	BatchMaxBytes   ByteSize      `yaml:"batch_max_bytes"`
 	BatchMaxWait    time.Duration `yaml:"batch_max_wait"`
 	MaxAttempts     int           `yaml:"max_attempts"`
 }
+
+// EnabledValue — включён ли воркер с учётом умолчания (nil = true).
+func (w Worker) EnabledValue() bool { return w.Enabled == nil || *w.Enabled }
 
 type Metrics struct {
 	Listen string `yaml:"listen"`
@@ -398,6 +429,10 @@ func Default() *Config {
 			BatchMaxBytes:   200 * GiB,
 			BatchMaxWait:    15 * time.Minute,
 			MaxAttempts:     10,
+			ClaimTTL:        5 * time.Minute,
+			// 30 минут: батч на 200 GiB идёт минуты, grace обязан переживать
+			// штатную отправку, но не превращать остановку в вечное ожидание.
+			ShutdownGrace: 30 * time.Minute,
 		},
 		Recaller: Worker{
 			BatchMaxObjects: 500,
@@ -825,6 +860,7 @@ func (c *Config) Validate() error {
 	default:
 		add("phobos.family: %q, ожидаются tape или dir", c.Phobos.Family)
 	}
+	hasMigratorMover := false
 	for name, mv := range c.Phobos.Movers {
 		// Ключ проверяется и здесь, не только на пути к переменной окружения:
 		// без ограничения два ключа (drive-1 и drive_1) дали бы одну
@@ -844,6 +880,18 @@ func (c *Config) Validate() error {
 			// планировщик выбирает mover'ы своей библиотеки.
 			add("phobos.movers.%s.library обязателен: по нему планировщик выбирает mover'ы своей библиотеки", name)
 		}
+		switch mv.Role {
+		case "migrator", "recaller":
+			if mv.Role == "migrator" {
+				hasMigratorMover = true
+			}
+		default:
+			add("phobos.movers.%s.role: %q, ожидаются migrator или recaller — воркер выбирает mover'а по роли, а не только по библиотеке", name, mv.Role)
+		}
+	}
+	if hasMigratorMover && c.Phobos.MoverClient.Cert == "" {
+		add("phobos.mover_client: cert/key/ca обязательны, в phobos.movers есть mover роли migrator — " +
+			"планировщику архивации нечем представиться (SAN-URI tapegw://scheduler, ADR-0021)")
 	}
 
 	switch strings.ToLower(c.Logging.Format) {

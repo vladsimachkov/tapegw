@@ -68,6 +68,13 @@ if [ "${1:-}" = "--test" ]; then
     podman exec -e GOMODCACHE=/gomodcache -e GOFLAGS=-mod=mod \
         -e TAPEGW_PHOBOS_TEST=1 \
         -w /src "$NAME" go test -tags phobos -count=1 ./cmd/tapegw-mover
+
+    # Критерий S2b: вертикальный срез — настоящий tapegw с воркерами, mover и
+    # Phobos; объект крупнее одного кадра доходит до archived сам.
+    echo "== вертикальный срез: tapegw → mover → Phobos"
+    podman exec -e GOMODCACHE=/gomodcache -e GOFLAGS=-mod=mod \
+        -e TAPEGW_PHOBOS_TEST=1 \
+        -w /src "$NAME" go test -tags phobos -count=1 -timeout 10m ./cmd/tapegw
 fi
 
 echo "== остаётся запущенным: podman exec -it $NAME bash"

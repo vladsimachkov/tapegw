@@ -70,6 +70,33 @@ type Store struct {
 	incomplete map[uuid.UUID]bool
 	statErr    error
 	extents    []string
+	putBlock   chan struct{}
+}
+
+// SetPutBlock включает ловушку: Put ждёт закрытия канала перед записью. Тесты
+// остановки ловят им окно «запись в хранилище идёт» — без него остановка
+// проверялась бы на простое, а не на середине отправки.
+func (f *Store) SetPutBlock(ch chan struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.putBlock = ch
+}
+
+// waitPutBlock читает ловушку под мьютексом и ждёт вне него: ждать внутри
+// означало бы заблокировать весь Store, а не только одну операцию.
+func (f *Store) waitPutBlock(ctx context.Context) error {
+	f.mu.Lock()
+	ch := f.putBlock
+	f.mu.Unlock()
+	if ch == nil {
+		return nil
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func NewStore() *Store {
@@ -145,7 +172,14 @@ func (f *Store) Has(id uuid.UUID) bool {
 	return ok
 }
 
-func (f *Store) Put(_ context.Context, batch []store.PutItem, opt store.PutOptions) []store.Result {
+func (f *Store) Put(ctx context.Context, batch []store.PutItem, opt store.PutOptions) []store.Result {
+	if err := f.waitPutBlock(ctx); err != nil {
+		out := make([]store.Result, 0, len(batch))
+		for _, it := range batch {
+			out = append(out, store.Result{ID: it.ID, Err: err})
+		}
+		return out
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls["put"]++
@@ -361,8 +395,17 @@ func (e *Env) DialNoCert(t *testing.T) error {
 // mover'а поднимал тот же набор, что и тесты протокола.
 func NewPKI(t *testing.T) PKI {
 	t.Helper()
+	return NewPKIWithDrive(t, "drive-A", "drive-B")
+}
+
+// NewPKIWithDrive — PKI с заданными именами драйвов. Нужен, когда имя драйва
+// обязано быть ещё и ключом в phobos.movers: ключи коллекции ограничены
+// [a-z0-9_] (иначе имя переменной окружения неоднозначно), а SAN-URI обязан
+// совпадать с ключом — «drive-A» в phobos.movers завести нельзя.
+func NewPKIWithDrive(t *testing.T, drive, other string) PKI {
+	t.Helper()
 	dir := t.TempDir()
-	p := PKI{Drive: "drive-A", OtherDrive: "drive-B"}
+	p := PKI{Drive: drive, OtherDrive: other}
 
 	write := func(name string, b []byte) string {
 		path := filepath.Join(dir, name)
