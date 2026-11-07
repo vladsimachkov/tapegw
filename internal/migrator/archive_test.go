@@ -301,7 +301,10 @@ VALUES ('TST-MIG', 'active', 1, 'L8', 'L8', 1000) ON CONFLICT (label) DO NOTHING
 		t.Fatal(err)
 	}
 	return &Archiver{Meta: m, Put: pm, Spec: "pool:archive", Format: 1,
-		WorkerID: "test-host/mover-" + uuid.NewString(), ClaimTTL: 30 * time.Second}, pm
+		WorkerID: "test-host/mover-" + uuid.NewString(), ClaimTTL: 30 * time.Second,
+		// Явно: meta отказывается на нуле, «забыли проброс» должен быть красным,
+		// а не молчаливым GREATEST(online_until, now()).
+		LandingMinRetention: time.Hour}, pm
 }
 
 // С8: во время вызова mover транзакция Postgres не открыта.

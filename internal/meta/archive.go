@@ -127,8 +127,13 @@ func (m *Meta) FinishPackArchive(ctx context.Context, packID uuid.UUID, placemen
 	if workerID == "" {
 		return fmt.Errorf("meta: завершение пачки без workerID")
 	}
-	if minRetention < 0 {
-		return fmt.Errorf("meta: landing_min_retention %v, должно быть >= 0", minRetention)
+	// > 0, а не >= 0: ноль — это «забыли пробросить настройку», и он молча
+	// превращает продление в GREATEST(online_until, now()), то есть
+	// архивированный объект с истёкшим сроком вытесняется на ближайшем
+	// проходе janitor — ровно та ошибка, которую продление и чинит.
+	// Конфиг эту настройку требует как обязательную, бэкенд не слабее.
+	if minRetention <= 0 {
+		return fmt.Errorf("meta: landing_min_retention %v, должно быть > 0", minRetention)
 	}
 	if len(sha256) != 32 {
 		return fmt.Errorf("meta: сумма копии %d байт, ждали 32", len(sha256))
@@ -556,8 +561,10 @@ func (m *Meta) ArchivePackWhenCopiesDone(ctx context.Context, packID uuid.UUID, 
 	if workerID == "" {
 		return false, fmt.Errorf("meta: завершение пачки без workerID")
 	}
-	if minRetention < 0 {
-		return false, fmt.Errorf("meta: landing_min_retention %v, должно быть >= 0", minRetention)
+	// См. то же правило в FinishPackArchive: ноль — забытый проброс, а не
+	// «продлевать не надо».
+	if minRetention <= 0 {
+		return false, fmt.Errorf("meta: landing_min_retention %v, должно быть > 0", minRetention)
 	}
 	missing, err := m.MissingCopySpecs(ctx, packID, specs)
 	if err != nil {
