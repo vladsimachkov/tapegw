@@ -618,3 +618,30 @@ phobos put <тот же oid>          → succeeded
   его на `ci-dir` бесполезно; на ленте оно ожидается (задача 1a-3);
 - «неполная копия» для `dir` = объект есть + экстентов нет + данные на носителе
   частично. Так же устроена неполная копия в `store/fake`.
+### `phobos drive unlock` отвечает «No such device or address»
+
+**Симптом:** `stand-status` показывает `устройство в failed: tape 00XYZZY_A1`;
+`phobos drive unlock -L mhvtl 00XYZZY_A1` даёт `Failed to unlock device(s) …
+(No such device or address)` (ENXIO), рестарт `phobosd` не помогает.
+
+**Причина:** `-L` — это **имя библиотеки из DSS**, а не название модуля ядра.
+В DSS библиотека называется `vtllib`, а `mhvtl` — только модуль. С чужим именем
+Phobos ищет устройство в несуществующей библиотеке и отвечает ENXIO, что
+похоже на «устройство мертво».
+
+**Что делать:** взять имя библиотеки из DSS и разблокировать им:
+
+```bash
+psql -h 127.0.0.1 -U phobos -d phobos_test -At -c \
+  "SELECT id, adm_status, library FROM device WHERE family='tape'"
+phobos drive unlock -L vtllib 00XYZZY_A1     # 1 device(s) unlocked
+systemctl restart phobosd                    # LRS перечитывает состояние
+```
+
+Проверка: `stand-status` → «ни одного устройства в failed».
+
+Диагностика, что с самим устройством всё в порядке (отказ был только в админ-
+состоянии Phobos): `sg_inq /dev/sg4` отвечает на INQUIRY с `PQual=0`,
+`/dev/tape/by-id/scsi-00XYZZY_A1` указывает на существующий `st0`. Юнита
+`mhvtl.service` на стенде **нет** — mhVTL поднят модулем ядра и `mktape`
+вручную, поэтому «перезапустить mhVTL как службу» невозможно в принципе.
