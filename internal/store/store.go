@@ -125,18 +125,6 @@ type PutOptions struct {
 	NoSplit bool
 }
 
-// Location — где объект лежит на ленте. Нужен recaller-у, чтобы отсортировать
-// батч по ленте и смещению и не мотать каретку туда-сюда.
-//
-// Locate в TLC-протоколе нет (спайк M0-04), поэтому реализация обязана
-// возвращать ErrNotSupported, а носитель узнаётся при архивации через
-// extent list (ADR-0008).
-type Location struct {
-	TapeID    string
-	Offset    int64
-	DriveHint string
-}
-
 // Meta — метаданные объекта на стороне Phobos.
 //
 // Complete отдельен, а не «Size > 0»: phobos_getmd возвращает объект и при
@@ -171,9 +159,6 @@ type Store interface {
 	// objects.phobos_medium после архивации и после repack (ADR-0008).
 	// Может вернуть ErrNotSupported.
 	Extents(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]string, error)
-
-	// Locate может вернуть ErrNotSupported — в TLC-протоколе Locate нет.
-	Locate(ctx context.Context, ids []uuid.UUID) ([]Location, error)
 
 	io.Closer
 }

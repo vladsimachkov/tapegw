@@ -457,10 +457,3 @@ func (s *Store) Extents(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]s
 	}
 	return out, nil
 }
-
-// Locate в протоколе TLC отсутствует (спайк M0-04): переместить ленту по
-// запросу из libphobos нельзя. Возвращаем явный отказ — «молча сделать
-// ничего» здесь означало бы, что воркер посчитал операцию выполненной.
-func (s *Store) Locate(context.Context, []uuid.UUID) ([]store.Location, error) {
-	return nil, store.ErrNotSupported
-}

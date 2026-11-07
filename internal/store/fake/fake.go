@@ -50,7 +50,6 @@ type Store struct {
 	nextMedia []string
 	calls     map[string]int
 	faults    map[string]*Fault
-	Locate_   func(ids []uuid.UUID) ([]store.Location, error)
 	Extents_  func(ids []uuid.UUID) (map[uuid.UUID][]string, error)
 }
 
@@ -343,13 +342,6 @@ func (s *Store) Extents(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]s
 		out[id] = append([]string(nil), b.media...)
 	}
 	return out, nil
-}
-
-func (s *Store) Locate(ctx context.Context, ids []uuid.UUID) ([]store.Location, error) {
-	if s.Locate_ == nil {
-		return nil, store.ErrNotSupported
-	}
-	return s.Locate_(ids)
 }
 
 func (s *Store) Close() error { return nil }

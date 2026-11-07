@@ -303,15 +303,8 @@ func TestDeleteIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestLocateDefaultsToUnsupported(t *testing.T) {
-	s := fake.New()
-	if _, err := s.Locate(context.Background(), nil); !errors.Is(err, store.ErrNotSupported) {
-		t.Errorf("ожидали ErrNotSupported, получили %v", err)
-	}
-}
-
-// Extents — то, чем закрыли отсутствие Locate: носитель узнаётся при
-// архивации (ADR-0008).
+// Extents — единственный способ узнать носитель: Locate в TLC-протоколе нет,
+// носитель сообщается при архивации (ADR-0008).
 func TestExtentsReportsMedia(t *testing.T) {
 	s := fake.New()
 	id := uuid.New()
