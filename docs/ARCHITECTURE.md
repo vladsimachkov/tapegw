@@ -275,9 +275,10 @@ CREATE TABLE upload_parts (
 **RestoreObject**
 
 - Объект не архивный → вернуть ошибку как AWS для не-Glacier объекта (`InvalidObjectState`).
-- Нет записи в `restores` → вставить `requested` с `days`, `tier`; ответ 202.
-- Уже `restored` → продлить `expires_at = now() + days`; ответ 200.
-- `requested` / `in_progress` → `RestoreAlreadyInProgress` (409).
+- Нет записи в `restores` → вставить `requested` с `days`, `tier`; успех — 200 (ADR-0001, 202 из AWS недостижим без патча versitygw).
+- Уже `restored` и срок не истёк → продлить `expires_at = max(expires_at, now() + days)`; успех — 200. Продление только растёт: повторный запрос на 7 дней не укорачивает обещанные 30.
+- В `restores` стоит `requested` / `in_progress` → `RestoreAlreadyInProgress` (409), без побочных эффектов.
+- У объекта живая дисковая копия (`landing=true`) → в очередь recaller'а НЕ ставится, только продление `online_until = max(online_until, now() + days)`: гонять Phobos за данными, которые и так на диске, смысла нет.
 - Код успеха задать нельзя: `backend.Backend.RestoreObject` возвращает только `error`, а контроллер не заполняет `MetaOptions.Status`, поэтому успех — всегда 200. См. ADR-0001, спайк M0 по этой теме не нужен.
 
 **Recaller**

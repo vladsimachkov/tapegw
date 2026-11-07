@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -505,18 +506,41 @@ func (t *TapeGW) buildGetOutput(ctx context.Context, tenant meta.TenantID, obj *
 	return out, nil
 }
 
-// restoreHeader — x-amz-restore по ADR-0003. nil, если запроса восстановления
-// не было: для онлайнового объекта заголовок не нужен, а фиктивная дата
-// (как делал scoutfs через 2050 год) обещала бы доступность, которой нет.
+// restoreHeader — x-amz-restore по ADR-0003. Правила поверх одной колонки
+// objects.online_until:
+//
+//   - restore идёт (`requested`/`in_progress`) — ongoing-request="true";
+//   - дисковая копия есть (landing живой или restore выдан и не истёк) —
+//     ongoing-request="false", expiry-date = показанный срок;
+//   - копии нет и запроса нет — заголовка нет.
+//
+// Показанная дата — всегда online_until (для pending/archiving — не раньше
+// now()+landing_min_retention, чтобы дата «не усыхала» под глазами клиента до
+// конца архивации), а не restores.expires_at: вытесняет janitor именно по
+// online_until, и обещание в заголовке не может быть позже реального удаления
+// файла. Фиктивная дата 2050 из scoutfs ломалась ровно так (ADR-0003).
 func (t *TapeGW) restoreHeader(ctx context.Context, tenant meta.TenantID, obj *meta.Object) (*string, error) {
 	r, err := t.meta.GetRestore(ctx, tenant, obj.ID)
-	if errors.Is(err, meta.ErrNotFound) {
-		return nil, nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, meta.ErrNotFound) {
 		return nil, fmt.Errorf("restore для %s: %w", obj.ID, err)
 	}
-	return r.HeaderValue(), nil
+	if r != nil && r.Ongoing() {
+		v := `ongoing-request="true"`
+		return &v, nil
+	}
+	now := time.Now()
+	if obj.ReadableFromDisk(now) || (r != nil && r.Active(now)) {
+		until := obj.OnlineUntil
+		if obj.State == "pending" || obj.State == "archiving" {
+			if floor := now.Add(t.cfg.Spool.LandingMinRetention); floor.After(until) {
+				until = floor
+			}
+		}
+		v := fmt.Sprintf(`ongoing-request="false", expiry-date=%q`,
+			until.UTC().Format(http.TimeFormat))
+		return &v, nil
+	}
+	return nil, nil
 }
 
 // str — распаковать *string из структур versitygw: там каждое поле указатель.

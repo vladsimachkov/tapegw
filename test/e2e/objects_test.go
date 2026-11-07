@@ -66,10 +66,13 @@ func TestObjectPutHeadGet(t *testing.T) {
 	if head.StorageClass != types.StorageClassGlacier {
 		t.Errorf("storage class = %v, хотели GLACIER", head.StorageClass)
 	}
-	// Онлайновый объект без restore не должен нести x-amz-restore: фиктивная
-	// дата (2050 у scoutfs) сделала бы обещание доступности ложным.
-	if head.Restore != nil {
-		t.Errorf("x-amz-restore у онлайнового объекта: %q", *head.Restore)
+	// ADR-0003 (редакция S4): дисковая копия есть → объект показан как
+	// восстановленный с реальным сроком: ongoing-request="false" и expiry-date
+	// из online_until. Фиктивной даты 2050 (как у scoutfs) быть не должно.
+	if head.Restore == nil || !strings.HasPrefix(*head.Restore, `ongoing-request="false"`) {
+		t.Errorf("онлайновый объект обязан показывать ongoing-request=\"false\", получили %v", head.Restore)
+	} else if strings.Contains(*head.Restore, "2050") {
+		t.Errorf("в заголовке фиктивная дата 2050: %v", *head.Restore)
 	}
 
 	get, err := c.GetObject(ctx, &s3.GetObjectInput{

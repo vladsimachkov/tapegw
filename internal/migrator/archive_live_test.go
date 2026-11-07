@@ -39,6 +39,8 @@ VALUES ('TST-LIVE', 'active', 1, 'L8', 'L8', 100000) ON CONFLICT (label) DO NOTH
 		Specs:    []string{"side:left", "side:right"},
 		SpecTags: map[string][]string{"side:left": {"side:left"}, "side:right": {"side:right"}},
 		WorkerID: "live-host/mover-1", ClaimTTL: 30 * time.Second,
+		// Явно: нулевой retention meta не примет (см. архивный тест-фикстуру).
+		LandingMinRetention: time.Hour,
 	}
 
 	plan, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil)

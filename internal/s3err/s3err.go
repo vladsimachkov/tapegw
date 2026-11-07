@@ -57,6 +57,19 @@ func InvalidStorageClass(class string) error {
 	}
 }
 
+// RestoreAlreadyInProgress — 409 на повторный RestoreObject, когда запрос уже
+// стоит в очереди или выполняется. В s3err у versitygw v1.10.0 такой
+// константы нет (проверено по всему пакету), поэтому собираем APIError
+// напрямую — тот же приём, что с InvalidStorageClass. AWS отдаёт именно этот
+// код (Glacier API), и клиенты бэкап-софта на него ветвятся.
+func RestoreAlreadyInProgress(bucket string) error {
+	return s3err.APIError{
+		Code:           "RestoreAlreadyInProgress",
+		Description:    "Restore request is already in progress for object in bucket " + bucket,
+		HTTPStatusCode: http.StatusConflict,
+	}
+}
+
 // Retryable сообщает, стоит ли воркеру ретраить ошибку store. ErrBusy и
 // ErrNoSpace — временные, всё остальное фатально для конкретного объекта.
 func Retryable(err error) bool {

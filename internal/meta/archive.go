@@ -10,6 +10,20 @@ import (
 	"time"
 )
 
+// archiveObjectSQL — переход участника в archived (общий для FinishPackArchive
+// и ArchivePackWhenCopiesDone: один текст на два пути, чтобы правило нельзя
+// было забыть в одном из них).
+//
+// online_until продлевается до max(online_until, now() + landing_min_retention)
+// по ADR-0003: HEAD объекта в pending показывает expiry-date не раньше
+// now()+landing_min_retention, и после архивации janitor не имеет права
+// вытеснить копию раньше показанной даты. Без продления обещание в заголовке
+// нарушалось бы ровно на разницу между датой PUT и датой архивации.
+const archiveObjectSQL = `
+UPDATE objects SET state = 'archived', archived_at = now(),
+       online_until = GREATEST(online_until, now() + $4 * interval '1 millisecond')
+WHERE id = $3 AND pack_id = $1 AND pack_offset = $2 AND state = 'archiving'`
+
 // Placement — где участник лежит внутри пачки. Ставится в objects одной
 // транзакцией с переходом в archived.
 type Placement struct {
@@ -109,9 +123,17 @@ WHERE id = ANY($1::uuid[]) AND pack_id IS NULL AND state IN ('pending', 'archivi
 // workerID — кто завершает. Пачку завершает только её текущий владелец:
 // иначе процесс, который опоздал и уже потерял захват, переведёт объекты в
 // 'archived' поверх чужой работы.
-func (m *Meta) FinishPackArchive(ctx context.Context, packID uuid.UUID, placements []Placement, spec, phobosOID string, version, format int, sha256 []byte, mediumID int64, workerID string) error {
+func (m *Meta) FinishPackArchive(ctx context.Context, packID uuid.UUID, placements []Placement, spec, phobosOID string, version, format int, sha256 []byte, mediumID int64, workerID string, minRetention time.Duration) error {
 	if workerID == "" {
 		return fmt.Errorf("meta: завершение пачки без workerID")
+	}
+	// > 0, а не >= 0: ноль — это «забыли пробросить настройку», и он молча
+	// превращает продление в GREATEST(online_until, now()), то есть
+	// архивированный объект с истёкшим сроком вытесняется на ближайшем
+	// проходе janitor — ровно та ошибка, которую продление и чинит.
+	// Конфиг эту настройку требует как обязательную, бэкенд не слабее.
+	if minRetention <= 0 {
+		return fmt.Errorf("meta: landing_min_retention %v, должно быть > 0", minRetention)
 	}
 	if len(sha256) != 32 {
 		return fmt.Errorf("meta: сумма копии %d байт, ждали 32", len(sha256))
@@ -144,10 +166,8 @@ VALUES ($1, $2, $3, $4, $5, '%s', $6, NULLIF($7, 0), %s)`, state, doneAt),
 	// Адреса участников уже стоят (SealPack, до отправки). Здесь только переход
 	// в 'archived': данные на ленте и копия учтена.
 	for _, pl := range placements {
-		tag, err := tx.Exec(ctx, `
-UPDATE objects SET state = 'archived', archived_at = now()
-WHERE id = $3 AND pack_id = $1 AND pack_offset = $2 AND state = 'archiving'`,
-			packID, pl.Offset, pl.Version)
+		tag, err := tx.Exec(ctx, archiveObjectSQL, packID, pl.Offset, pl.Version,
+			minRetention.Milliseconds())
 		if err != nil {
 			return fmt.Errorf("meta: перевести в archived: %w", err)
 		}
@@ -537,9 +557,14 @@ WHERE NOT EXISTS (
 // ArchivePackWhenCopiesDone переводит пачку и участников в 'archived', только
 // когда все нужные копии записаны. Возвращает false, если копий не хватает:
 // это не ошибка, а «ещё не готово» — остальное догонит следующий проход.
-func (m *Meta) ArchivePackWhenCopiesDone(ctx context.Context, packID uuid.UUID, placements []Placement, specs []string, workerID string) (bool, error) {
+func (m *Meta) ArchivePackWhenCopiesDone(ctx context.Context, packID uuid.UUID, placements []Placement, specs []string, workerID string, minRetention time.Duration) (bool, error) {
 	if workerID == "" {
 		return false, fmt.Errorf("meta: завершение пачки без workerID")
+	}
+	// См. то же правило в FinishPackArchive: ноль — забытый проброс, а не
+	// «продлевать не надо».
+	if minRetention <= 0 {
+		return false, fmt.Errorf("meta: landing_min_retention %v, должно быть > 0", minRetention)
 	}
 	missing, err := m.MissingCopySpecs(ctx, packID, specs)
 	if err != nil {
@@ -555,10 +580,8 @@ func (m *Meta) ArchivePackWhenCopiesDone(ctx context.Context, packID uuid.UUID, 
 	defer tx.Rollback(ctx)
 
 	for _, pl := range placements {
-		tag, err := tx.Exec(ctx, `
-UPDATE objects SET state = 'archived', archived_at = now()
-WHERE id = $3 AND pack_id = $1 AND pack_offset = $2 AND state = 'archiving'`,
-			packID, pl.Offset, pl.Version)
+		tag, err := tx.Exec(ctx, archiveObjectSQL, packID, pl.Offset, pl.Version,
+			minRetention.Milliseconds())
 		if err != nil {
 			return false, fmt.Errorf("meta: перевести в archived: %w", err)
 		}

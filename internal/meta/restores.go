@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,33 +32,10 @@ func (r *Restore) Active(now time.Time) bool {
 	return r.State == "restored" && r.ExpiresAt != nil && r.ExpiresAt.After(now)
 }
 
-// HeaderValue — содержимое заголовка x-amz-restore.
-//
-// Формат совпадает с scoutfs (backend/scoutfs/scoutfs_compat.go), откуда и взято
-// поведение Glacier-семантики: ongoing-request="true" во время восстановления и
-// ongoing-request="false", expiry-date="..." когда копия выдана.
-//
-// Ключевое отличие от scoutfs: дата берётся из реального срока, а не подставляется
-// фиктивная 2050. Прежний механизм обещал доступность до 2050, объект архивировался,
-// копия вытеснялась, и GET через час отдавал InvalidObjectState. См. ADR-0003.
-//
-// nil означает «заголовка не будет»: объекта без запроса восстановления это не
-// касается, а выдумывать заголовок — значит врать клиенту.
-func (r *Restore) HeaderValue() *string {
-	if r == nil {
-		return nil
-	}
-	if r.Ongoing() {
-		v := `ongoing-request="true"`
-		return &v
-	}
-	if r.State != "restored" || r.ExpiresAt == nil {
-		return nil
-	}
-	v := fmt.Sprintf(`ongoing-request="false", expiry-date=%q`,
-		r.ExpiresAt.UTC().Format(http.TimeFormat))
-	return &v
-}
+// Формирование заголовка x-amz-restore живёт в бэкенде
+// (backend.restoreHeader): по ADR-0003 показанная дата берётся из
+// objects.online_until, а не из restores.expires_at, поэтому одного
+// Restore для её сборки мало — нужен ещё и объект. Здесь только состояние.
 
 // GetRestore возвращает активный запрос восстановления объекта того же
 // тенанта. ErrNotFound — запроса нет, и это норма для большинства объектов.

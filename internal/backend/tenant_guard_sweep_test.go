@@ -131,7 +131,7 @@ var backendMethodCases = map[string]guardCase{
 	"PutObjectLockConfiguration":    {class: guarded, reason: "этап V: включает Object Lock бакета"},
 	"PutObjectRetention":            {class: guarded, reason: "этап V: ставит retention версии"},
 	"PutObjectTagging":              {class: unimplemented, reason: "теги объектов появятся с M3"},
-	"RestoreObject":                 {class: unimplemented, reason: "восстановление с ленты появится с M5"},
+	"RestoreObject":                 {class: guarded, reason: "S4: запрос восстановления — по бакету объекта"},
 	"UploadPart":                    {class: guarded, reason: "T2 PR#2: запись части — по бакету загрузки"},
 	"UploadPartCopy":                {class: guarded, reason: "T2 PR#2: копия в часть — под стражом оба бакета: загрузки (GetUpload) и источника (GetObject)"},
 	// Отказ доставляется внутри потока ответов, error в сигнатуре нет.
