@@ -93,10 +93,14 @@ func TestPutGetObjectRoundTrip(t *testing.T) {
 	if get.StorageClass != types.StorageClassGlacier {
 		t.Errorf("storage class = %v", get.StorageClass)
 	}
-	// Онлайновый объект не обязан врать про восстановление: у scoutfs тут
-	// подставлена дата 2050 года, из-за чего обещание было ложным.
-	if get.Restore != nil {
-		t.Errorf("у онлайнового объекта не должно быть x-amz-restore, получили %q", *get.Restore)
+	// ADR-0003 (в редакции S4): дисковая копия есть → объект показан как
+	// восстановленный с РЕАЛЬНЫМ сроком из online_until. Фиктивной даты 2050
+	// (как у scoutfs) здесь быть не должно — обещание обязано выполняться.
+	if get.Restore == nil || !strings.HasPrefix(*get.Restore, `ongoing-request="false"`) {
+		t.Errorf("онлайновый объект обязан показывать ongoing-request=\"false\", получили %v", get.Restore)
+	}
+	if get.Restore != nil && strings.Contains(*get.Restore, "2050") {
+		t.Errorf("в заголовке снова фиктивная дата 2050: %v", *get.Restore)
 	}
 }
 
@@ -539,8 +543,10 @@ func TestPendingSurvivesExpiredDate(t *testing.T) {
 	}
 }
 
-// x-amz-restore по ADR-0003: во время восстановления ongoing-request="true",
-// после — реальный срок из restores.expires_at.
+// x-amz-restore по ADR-0003: во время восстановления ongoing-request="true";
+// показанная дата — всегда online_until, а не restores.expires_at: вытеснение
+// идёт по online_until, и обещание в заголовке не может быть позже реального
+// удаления файла.
 func TestRestoreHeader(t *testing.T) {
 	be, m, _ := newBackend(t)
 	ctx := testCtx()
@@ -569,30 +575,50 @@ func TestRestoreHeader(t *testing.T) {
 		}
 	}
 
-	insert("requested", "")
-	head, err := be.HeadObject(ctx, &s3.HeadObjectInput{Bucket: ptr("b"), Key: ptr("k")})
-	if err != nil {
-		t.Fatalf("HeadObject: %v", err)
-	}
-	if head.Restore == nil || *head.Restore != `ongoing-request="true"` {
-		t.Errorf("во время восстановления заголовок = %v", head.Restore)
+	head := func() *string {
+		t.Helper()
+		h, err := be.HeadObject(ctx, &s3.HeadObjectInput{Bucket: ptr("b"), Key: ptr("k")})
+		if err != nil {
+			t.Fatalf("HeadObject: %v", err)
+		}
+		return h.Restore
 	}
 
-	insert("restored", "2030-01-02T03:04:05Z")
-	head, err = be.HeadObject(ctx, &s3.HeadObjectInput{Bucket: ptr("b"), Key: ptr("k")})
-	if err != nil {
-		t.Fatalf("HeadObject: %v", err)
+	insert("requested", "")
+	if v := head(); v == nil || *v != `ongoing-request="true"` {
+		t.Errorf("во время восстановления заголовок = %v", v)
 	}
-	if head.Restore == nil || !strings.Contains(*head.Restore, `ongoing-request="false"`) {
-		t.Fatalf("заголовок = %v", head.Restore)
+
+	// restored: показанная дата — online_until (2030), а не restores.expires_at
+	// (2031). Фиктивная дата 2050 — тот самый баг scoutfs, его тоже быть не
+	// должно: обещание доступности обязано выполняться.
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE objects SET online_until = '2030-01-02T03:04:05Z'`); err != nil {
+		t.Fatalf("online_until: %v", err)
 	}
-	// Дата обязана быть реальной. Фиктивная 2050 — тот самый баг, из-за которого
-	// обещание доступности становилось ложным.
-	if strings.Contains(*head.Restore, "2050") {
-		t.Errorf("в заголовке снова 2050 год: %v", head.Restore)
+	insert("restored", "2031-06-07T08:09:10Z")
+	v := head()
+	if v == nil || !strings.Contains(*v, `ongoing-request="false"`) {
+		t.Fatalf("заголовок = %v", v)
 	}
-	if !strings.Contains(*head.Restore, "2030") {
-		t.Errorf("ожидали срок из expires_at, получили %v", head.Restore)
+	if !strings.Contains(*v, "2030") || strings.Contains(*v, "2031") {
+		t.Errorf("показанная дата обязана браться из online_until: %v", *v)
+	}
+	if strings.Contains(*v, "2050") {
+		t.Errorf("в заголовке снова 2050 год: %v", *v)
+	}
+
+	// Копии нет и запроса нет — заголовка нет: врать про доступность нельзя.
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE objects SET state='archived', landing=false,
+		        online_until = now() - interval '1 hour'`); err != nil {
+		t.Fatalf("вытесненное состояние: %v", err)
+	}
+	if _, err := m.Pool.Exec(ctx, `TRUNCATE restores`); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if v := head(); v != nil {
+		t.Errorf("у вытесненного объекта без restore заголовка быть не должно, получили %q", *v)
 	}
 }
 
