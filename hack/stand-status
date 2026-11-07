@@ -44,6 +44,12 @@ ok()   { echo "ok:   $*"; }
 # место, где путь к конфигу назван — раньше порт и DSN читались из хардкода.
 phobos_conf=${PHOBOS_CONF:-/etc/phobos.conf}
 
+# Файл для stderr psql. 2>&1 в переменную результата смешивает предупреждения
+# с данными: «WARNING ...» попало бы в список устройств и стало бы ложным
+# «устройство в failed: WARNING ...». stderr смотрим только при ненулевом коде.
+psql_err=$(mktemp) || { echo "FAIL: не создал временный файл для stderr psql"; exit 1; }
+trap 'rm -f "$psql_err"' EXIT
+
 # --- 1. процессы Phobos и их принадлежность systemd -------------------------
 found_proc=0
 for pid in $(pgrep -x phobosd; pgrep -x phobos_tlc); do
@@ -94,7 +100,9 @@ fi
 # ничего не проверил. Неверный DSN обязан давать красный, а не «упущено».
 dsn=$(sed -n 's/^[[:space:]]*connect_string[[:space:]]*=[[:space:]]*\(.*\)/\1/p' "$phobos_conf" | head -1)
 if [ -n "$dsn" ]; then
-    if bad=$(psql "$dsn" -At -c "SELECT family || ' ' || id FROM device WHERE adm_status = 'failed'" 2>&1); then
+    # -w: без него psql при DSN с password-required молча встанет на запрос
+    # пароля — проверка не «красная», а висящая.
+    if bad=$(psql -w "$dsn" -At -c "SELECT family || ' ' || id FROM device WHERE adm_status = 'failed'" 2>"$psql_err"); then
         if [ -n "$bad" ]; then
             while IFS= read -r d; do
                 fail "устройство в failed: $d — LRS его не рассматривает; снять: phobos <family> unlock (или drive unlock) + рестарт"
@@ -103,7 +111,7 @@ if [ -n "$dsn" ]; then
             ok "ни одного устройства в failed"
         fi
     else
-        fail "DSS недоступен, состояние устройств не проверено: $(printf '%s' "$bad" | head -1)"
+        fail "DSS недоступен, состояние устройств не проверено: $(head -1 "$psql_err")"
     fi
 else
     fail "не удалось прочитать dss.connect_string из $phobos_conf — состояние устройств не проверено"
@@ -116,7 +124,7 @@ fi
 # столбце put читается и как «разрешено», и как «закрыто», и обе ошибки
 # выглядели уверенными.
 if [ -n "$dsn" ]; then
-    if nowrite=$(psql "$dsn" -At -c "SELECT library FROM media WHERE family = 'tape' GROUP BY library HAVING NOT bool_or(put AND adm_status = 'unlocked')" 2>&1); then
+    if nowrite=$(psql -w "$dsn" -At -c "SELECT library FROM media WHERE family = 'tape' GROUP BY library HAVING NOT bool_or(put AND adm_status = 'unlocked')" 2>"$psql_err"); then
         if [ -n "$nowrite" ]; then
             while IFS= read -r lib; do
                 fail "запись в библиотеку $lib невозможна: нет ни одной разблокированной ленты с разрешённой записью (put)"
@@ -125,7 +133,7 @@ if [ -n "$dsn" ]; then
             ok "в каждой ленточной библиотеке есть лента, доступная для записи"
         fi
     else
-        fail "DSS недоступен, возможность записи не проверена: $(printf '%s' "$nowrite" | head -1)"
+        fail "DSS недоступен, возможность записи не проверена: $(head -1 "$psql_err")"
     fi
 else
     fail "connect_string не прочитан — возможность записи не проверена"
