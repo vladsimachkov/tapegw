@@ -66,7 +66,7 @@ func restoreState(t *testing.T, m *meta.Meta, id uuid.UUID) (state string, attem
 
 // Запрошенный архивный объект берётся в работу со всеми полями, нужными для
 // чтения и сверки; повторный claim ничего не берёт (строка уже in_progress).
-func TestClaimRestoreBatchQueued(t *testing.T) {
+func TestClaimRestorePackQueued(t *testing.T) {
 	m := testdb.Connect(t)
 	testdb.Clean(t, m)
 	ctx := context.Background()
@@ -76,7 +76,7 @@ func TestClaimRestoreBatchQueued(t *testing.T) {
 	packID, _ := recallFixture(t, m, id, 10)
 	requestRestore(t, m, id, 7, "Expedited")
 
-	items, err := m.ClaimRestoreBatch(ctx, 10, time.Minute, 5)
+	items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestClaimRestoreBatchQueued(t *testing.T) {
 	}
 
 	// Повтор: 'in_progress' с действующим lease не берётся.
-	again, err := m.ClaimRestoreBatch(ctx, 10, time.Minute, 5)
+	again, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,8 +105,11 @@ func TestClaimRestoreBatchQueued(t *testing.T) {
 	}
 }
 
-// Порядок выборки: Expedited раньше Standard независимо от порядка запросов.
-func TestClaimRestoreBatchOrder(t *testing.T) {
+// Захват — по одной пачке: первая выборка берёт пачку самой приоритетной
+// готовой строки и только её; чужие пачки остаются нетронутыми до следующего
+// прохода. Это и есть ответ на «lease на батч из 500 объектов»: второй воркер
+// не ждёт, пока первый прочитает чужие пачки.
+func TestClaimRestorePackOrder(t *testing.T) {
 	m := testdb.Connect(t)
 	testdb.Clean(t, m)
 	ctx := context.Background()
@@ -115,6 +118,7 @@ func TestClaimRestoreBatchOrder(t *testing.T) {
 	plain, fast := ids[0], ids[1]
 	setEvictState(t, m, plain, "archived", false, "-1 hour")
 	setEvictState(t, m, fast, "archived", false, "-1 hour")
+	// Разные пачки: каждая — отдельное чтение ленты.
 	recallFixture(t, m, plain, 10)
 	recallFixture(t, m, fast, 10)
 
@@ -123,18 +127,64 @@ func TestClaimRestoreBatchOrder(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	requestRestore(t, m, fast, 7, "Expedited")
 
-	items, err := m.ClaimRestoreBatch(ctx, 10, time.Minute, 5)
+	items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 2 || items[0].ObjectID != fast || items[1].ObjectID != plain {
-		t.Errorf("порядок выборки не по приоритету: %+v", items)
+	if len(items) != 1 || items[0].ObjectID != fast {
+		t.Fatalf("первый захват %+v, ждали только пачку срочного запроса", items)
+	}
+	// Пачка обычного запроса не тронута и берётся следующим проходом.
+	if st, att, _ := restoreState(t, m, plain); st != "requested" || att != 0 {
+		t.Errorf("чужая пачка тронута: %s attempts=%d", st, att)
+	}
+	items, err = m.ClaimRestorePack(ctx, 10, time.Minute, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ObjectID != plain {
+		t.Errorf("второй захват %+v, ждали пачку обычного запроса", items)
+	}
+}
+
+// Все готовые строки пачки уходят одним захватом: одно чтение ленты закрывает
+// их целиком, а не по строке на проход.
+func TestClaimRestorePackTakesWholePack(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+
+	ids := tenantWithObjects(t, m, 2, "cwp", 10, 2)
+	a, b := ids[0], ids[1]
+	setEvictState(t, m, a, "archived", false, "-1 hour")
+	setEvictState(t, m, b, "archived", false, "-1 hour")
+	packID, _ := recallFixture(t, m, a, 10)
+	// b — второй участник той же пачки.
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE objects SET pack_id = $2, pack_offset = 10, pack_length = 10, file_bytes = 10
+		 WHERE id = $1`, b, packID); err != nil {
+		t.Fatal(err)
+	}
+	requestRestore(t, m, a, 7, "Standard")
+	requestRestore(t, m, b, 7, "Standard")
+
+	items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("захвачено %d, ждали обоих участников пачки", len(items))
+	}
+	for _, it := range items {
+		if it.PackID != packID {
+			t.Errorf("в захват попала чужая пачка %s", it.PackID)
+		}
 	}
 }
 
 // Просроченный захват возвращается в работу с засчитанной попыткой; на
 // исчерпании max_attempts — 'failed' и никому не отдаётся.
-func TestClaimRestoreBatchLeaseExpiry(t *testing.T) {
+func TestClaimRestorePackLeaseExpiry(t *testing.T) {
 	m := testdb.Connect(t)
 	testdb.Clean(t, m)
 	ctx := context.Background()
@@ -144,7 +194,7 @@ func TestClaimRestoreBatchLeaseExpiry(t *testing.T) {
 	recallFixture(t, m, id, 10)
 	requestRestore(t, m, id, 7, "Standard")
 
-	if items, err := m.ClaimRestoreBatch(ctx, 10, time.Minute, 2); err != nil || len(items) != 1 {
+	if items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 2); err != nil || len(items) != 1 {
 		t.Fatalf("первый claim: %d шт., %v", len(items), err)
 	}
 	// Lease «истёк» — строка возвращается, попытка засчитана.
@@ -152,7 +202,7 @@ func TestClaimRestoreBatchLeaseExpiry(t *testing.T) {
 		`UPDATE restores SET next_try_at = now() - interval '1 second' WHERE object_id = $1`, id); err != nil {
 		t.Fatal(err)
 	}
-	if items, err := m.ClaimRestoreBatch(ctx, 10, time.Minute, 2); err != nil || len(items) != 1 {
+	if items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 2); err != nil || len(items) != 1 {
 		t.Fatalf("повторный claim после lease: %d шт., %v", len(items), err)
 	}
 	if st, att, _ := restoreState(t, m, id); st != "in_progress" || att != 1 {
@@ -164,7 +214,7 @@ func TestClaimRestoreBatchLeaseExpiry(t *testing.T) {
 		`UPDATE restores SET next_try_at = now() - interval '1 second' WHERE object_id = $1`, id); err != nil {
 		t.Fatal(err)
 	}
-	if items, err := m.ClaimRestoreBatch(ctx, 10, time.Minute, 2); err != nil || len(items) != 0 {
+	if items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 2); err != nil || len(items) != 0 {
 		t.Fatalf("просроченный на исчерпании отдан: %d шт., %v", len(items), err)
 	}
 	if st, _, _ := restoreState(t, m, id); st != "failed" {
@@ -173,7 +223,7 @@ func TestClaimRestoreBatchLeaseExpiry(t *testing.T) {
 }
 
 // Не берутся: не-archived, без координат пачки, раньше next_try_at.
-func TestClaimRestoreBatchSkips(t *testing.T) {
+func TestClaimRestorePackSkips(t *testing.T) {
 	m := testdb.Connect(t)
 	testdb.Clean(t, m)
 	ctx := context.Background()
@@ -201,7 +251,7 @@ func TestClaimRestoreBatchSkips(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	items, err := m.ClaimRestoreBatch(ctx, 10, time.Minute, 5)
+	items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +274,7 @@ func TestMarkRestoreRestored(t *testing.T) {
 	for _, id := range ids {
 		recallFixture(t, m, id, 10)
 		requestRestore(t, m, id, 7, "Standard")
-		if _, err := m.ClaimRestoreBatch(ctx, 10, time.Minute, 5); err != nil {
+		if _, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -273,7 +323,7 @@ func TestMarkRestoreFailure(t *testing.T) {
 	setEvictState(t, m, id, "archived", false, "-1 hour")
 	recallFixture(t, m, id, 10)
 	requestRestore(t, m, id, 7, "Standard")
-	if _, err := m.ClaimRestoreBatch(ctx, 10, time.Minute, 3); err != nil {
+	if _, err := m.ClaimRestorePack(ctx, 10, time.Minute, 3); err != nil {
 		t.Fatal(err)
 	}
 
@@ -295,7 +345,7 @@ func TestMarkRestoreFailure(t *testing.T) {
 		 WHERE object_id = $1`, id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.ClaimRestoreBatch(ctx, 10, time.Minute, 3); err != nil {
+	if _, err := m.ClaimRestorePack(ctx, 10, time.Minute, 3); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.MarkRestoreFailure(ctx, id, 3, 30*time.Second, "лента всё ещё легла"); err != nil {

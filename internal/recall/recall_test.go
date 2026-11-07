@@ -296,6 +296,8 @@ func TestRecallPackSumMismatch(t *testing.T) {
 // Байт внутри шифротекста испорчен, но сумма пачки соответствует испорченному
 // потоку: сверка пачки проходит, и именно расшифрование обязано поймать
 // подмену (AEAD — та «сумма, сохранённая при записи», что требует ревью).
+// Повтор здесь бессилен — байты на ленте именно те, что записывали, — поэтому
+// строка уходит в 'failed' сразу, без раскрутки ленты до max_attempts.
 func TestRecallTamperedCiphertext(t *testing.T) {
 	f := newFixture(t)
 	plain := []byte("данные, которые нельзя отдавать испорченными")
@@ -315,8 +317,8 @@ func TestRecallTamperedCiphertext(t *testing.T) {
 	if f.cache.Exists(id) {
 		t.Error("испорченный файл опубликован в cache")
 	}
-	if st, att := f.restoreRow(t, id); st != "requested" || att != 1 {
-		t.Errorf("строка %s attempts=%d, ждали requested/1", st, att)
+	if st, att := f.restoreRow(t, id); st != "failed" || att != 1 {
+		t.Errorf("строка %s attempts=%d, ждали failed/1 (повтор прочитал бы те же байты)", st, att)
 	}
 }
 
@@ -340,8 +342,10 @@ func TestRecallETagMismatch(t *testing.T) {
 	if n != 0 {
 		t.Errorf("восстановлено %d при несовпадении ETag", n)
 	}
-	if st, _ := f.restoreRow(t, id); st != "requested" {
-		t.Errorf("строка %s, ждали requested", st)
+	// Как и с испорченным шифротекстом: повтор прочитает те же байты, поэтому
+	// сразу 'failed', а не очередь ретраев.
+	if st, att := f.restoreRow(t, id); st != "failed" || att != 1 {
+		t.Errorf("строка %s attempts=%d, ждали failed/1", st, att)
 	}
 }
 
@@ -407,6 +411,63 @@ func TestRecallTwoMembersOnePack(t *testing.T) {
 	}
 }
 
+// blockingGetter — «лента, которая не возвращается»: воркер стоит в чтении
+// своей пачки, как на настоящей загрузке/позиционировании драйва.
+type blockingGetter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingGetter) Get(op, id uuid.UUID, w io.Writer) (*mover.Result, error) {
+	close(b.started)
+	<-b.release
+	return nil, fmt.Errorf("лента отпущена в конце теста")
+}
+
+// Lease покрывает одно чтение ленты, а не батч (ревью S5, major 1): воркер,
+// вставший на своей пачке, не должен блокировать второй. Второй обязан сразу
+// взять вторую пачку, не тронув ни строки, ни попытки первой. С захватом
+// батчем первый забрал бы всю очередь, и этот тест красный.
+func TestRecallSecondWorkerTakesOtherPack(t *testing.T) {
+	f := newFixture(t)
+
+	// Пачка A — читается и стоит.
+	packA := f.pack(t)
+	idA, memberA := f.object(t, packA, 0, 0, []byte("зависшая пачка"))
+	f.replaceStream(t, packA, memberA)
+
+	// Пачка B — свободна, её берёт второй воркер.
+	packB := f.pack(t)
+	idB, memberB := f.object(t, packB, 1, 0, []byte("свободная пачка"))
+	f.replaceStream(t, packB, memberB)
+
+	block := &blockingGetter{started: make(chan struct{}), release: make(chan struct{})}
+	defer close(block.release)
+	rcA := &recall.Recall{
+		Meta: f.m, Get: block, Cache: f.cache, Keys: f.vault,
+		BatchMax: 10, ClaimTTL: time.Minute, MaxAttempts: 3, RetryBackoff: time.Second,
+	}
+	go func() { _, _ = rcA.Once(f.ctx) }()
+	<-block.started // A захватил свою пачку и стоит в Get
+
+	n, err := f.rc.Once(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("второй воркер восстановил %d, ждали 1 — его пачка не должна ждать чужую", n)
+	}
+	if !f.cache.Exists(idB) {
+		t.Error("пачка B не восстановлена вторым воркером")
+	}
+	if st, att := f.restoreRow(t, idB); st != "restored" || att != 0 {
+		t.Errorf("пачка B: %s attempts=%d, ждали restored/0", st, att)
+	}
+	if st, att := f.restoreRow(t, idA); st != "in_progress" || att != 0 {
+		t.Errorf("чужая пачка тронута: %s attempts=%d, ждали in_progress/0", st, att)
+	}
+}
+
 // Длина файла не совпала с обещанной в БД — участник не принимается.
 func TestRecallSizeMismatch(t *testing.T) {
 	f := newFixture(t)
@@ -430,6 +491,11 @@ func TestRecallSizeMismatch(t *testing.T) {
 	}
 	if f.cache.Exists(id) {
 		t.Error("файл неверной длины опубликован")
+	}
+	// Отказ проверки при совпавшей сумме пачки — терминальный: повтор прочитает
+	// те же байты, лента не раскручивается.
+	if st, att := f.restoreRow(t, id); st != "failed" || att != 1 {
+		t.Errorf("строка %s attempts=%d, ждали failed/1", st, att)
 	}
 }
 

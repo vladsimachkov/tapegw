@@ -128,14 +128,7 @@ func runRecaller(ctx context.Context, deps RecallerDeps, t MoverTarget, id strin
 	// отправки мигратора.
 	sendCtx := context.WithoutCancel(ctx)
 
-	for first := true; ; first = false {
-		if !first {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(cfg.Recaller.BatchMaxWait):
-			}
-		}
+	for {
 		if ctx.Err() != nil {
 			return
 		}
@@ -166,10 +159,19 @@ func runRecaller(ctx context.Context, deps RecallerDeps, t MoverTarget, id strin
 		cli.Close()
 		if err != nil {
 			log.Error("recaller: проход", slog.String("слот", id), slog.String("err", err.Error()))
-			continue
-		}
-		if n > 0 {
+		} else if n > 0 {
 			log.Info("recaller: восстановлено объектов", slog.String("слот", id), slog.Int("объектов", n))
+		}
+		// Что-то восстановлено — сразу следующая пачка: очередь не обязана
+		// ждать batch_max_wait между пачками, lease покрывает одно чтение.
+		// Пусто или сбой — пауза: без неё пустой проход превратился бы в
+		// горячий цикл по БД.
+		if n == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(cfg.Recaller.BatchMaxWait):
+			}
 		}
 	}
 }

@@ -19,6 +19,11 @@
 //
 // Флаг landing recaller не трогает: восстановленная копия живёт в cache и
 // вытесняется по своему основанию — истечению online_until (janitor).
+//
+// Захват очереди — по одной пачке на проход: lease claim_ttl покрывает одно
+// чтение ленты, а не серию. Отказ участника при совпавшей сумме пачки —
+// терминальный ('failed'): лента не раскручивается ради повтора, который
+// прочитает те же байты.
 package recall
 
 import (
@@ -72,36 +77,25 @@ func (r *Recall) logger() *slog.Logger {
 	return r.Log
 }
 
-// Once — один проход: выборка очереди, затем по пачке на одно чтение ленты.
-// Возвращает число восстановленных объектов. Ошибка — только сбой выборки или
-// БД; ошибки отдельных пачек уже учтены в очереди (ретрах/failed).
+// Once — один проход: захватить одну пачку и прочитать её. Возвращает число
+// восстановленных объектов. Ошибка — только сбой выборки или БД; ошибки
+// пачки уже учтены в очереди (ретрай/failed).
+//
+// Одна пачка на проход — не деталь реализации, а условие корректности:
+// lease захвата (claim_ttl) обязан покрывать одно чтение ленты. Захват
+// серии пачек оставил бы непрочитанные строки с истекающим lease, и второй
+// драйв перехватывал бы их посреди чтения той же ленты.
 func (r *Recall) Once(ctx context.Context) (int, error) {
-	items, err := r.Meta.ClaimRestoreBatch(ctx, r.BatchMax, r.ClaimTTL, r.MaxAttempts)
+	items, err := r.Meta.ClaimRestorePack(ctx, r.BatchMax, r.ClaimTTL, r.MaxAttempts)
 	if err != nil {
 		return 0, err
 	}
 	if len(items) == 0 {
 		return 0, nil
 	}
-
-	// Группировка по пачке: участники одной пачки читаются одним потоком с
-	// ленты. Порядок пачек — по первому участнику, внутри — по смещению.
-	var order []uuid.UUID
-	byPack := map[uuid.UUID][]meta.RestoreItem{}
-	for _, it := range items {
-		if _, ok := byPack[it.PackID]; !ok {
-			order = append(order, it.PackID)
-		}
-		byPack[it.PackID] = append(byPack[it.PackID], it)
-	}
-
-	n := 0
-	for _, packID := range order {
-		group := byPack[packID]
-		sort.Slice(group, func(i, j int) bool { return group[i].PackOffset < group[j].PackOffset })
-		n += r.recallPack(ctx, packID, group)
-	}
-	return n, nil
+	packID := items[0].PackID // выборка отдаёт строки одной пачки
+	sort.Slice(items, func(i, j int) bool { return items[i].PackOffset < items[j].PackOffset })
+	return r.recallPack(ctx, packID, items), nil
 }
 
 // recallPack — одна пачка: чтение потока с ленты, извлечение участников,
@@ -182,10 +176,14 @@ func (r *Recall) recallPack(ctx context.Context, packID uuid.UUID, group []meta.
 		if err := r.verify(ctx, it, s.f); err != nil {
 			// Громкая ошибка и в журнал, и в строку: данные с ленты пришли
 			// непригодными — это не «клиенту отказать», это оператору смотреть.
+			//
+			// Здесь сразу 'failed', без повторов: сумма пачки совпала, значит
+			// с ленты пришли ровно те байты, что легли при архивации, —
+			// повтор прочитает то же и только потратит ленту.
 			log.Error("recaller: участник не прошёл проверку",
 				slog.String("key", it.Key), slog.String("id", it.ObjectID.String()),
 				slog.String("pack", packID.String()), slog.String("err", err.Error()))
-			r.fail(ctx, it, "проверка участника: "+err.Error())
+			r.corrupt(ctx, it, "проверка участника: "+err.Error())
 			continue
 		}
 		// Publish закрывает файл и записывает его на место (fsync → rename →
@@ -201,7 +199,11 @@ func (r *Recall) recallPack(ctx context.Context, packID uuid.UUID, group []meta.
 		}
 		if err := r.Meta.MarkRestoreRestored(ctx, it.ObjectID, it.Days); err != nil {
 			if errors.Is(err, meta.ErrRestoreLost) {
-				log.Info("recaller: объект удалён во время восстановления, файл останется сиротой до сборки мусора",
+				// Строка уже не 'in_progress': объект удалили или строку
+				// перехватил другой воркер (узкая гонка двух выборок).
+				// Файл в cache по этому id безвреден: повторное восстановление
+				// перезапишет его по тому же пути, а не разобранное снимет GC.
+				log.Info("recaller: restore-строка уже не in_progress (объект удалён или работу перехватили), файл останется до сборки мусора",
 					slog.String("id", it.ObjectID.String()))
 			} else {
 				log.Error("recaller: переход в restored",
@@ -278,6 +280,15 @@ func (r *Recall) verify(ctx context.Context, it meta.RestoreItem, f *os.File) er
 func (r *Recall) fail(ctx context.Context, it meta.RestoreItem, reason string) {
 	if err := r.Meta.MarkRestoreFailure(ctx, it.ObjectID, r.MaxAttempts, r.RetryBackoff, reason); err != nil {
 		r.logger().Error("recaller: учёт попытки",
+			slog.String("id", it.ObjectID.String()), slog.String("err", err.Error()))
+	}
+}
+
+// corrupt — отказ проверки при совпавшей сумме пачки: повтор бессилен
+// (байты те же, что записаны при архивации), строка уходит в 'failed' сразу.
+func (r *Recall) corrupt(ctx context.Context, it meta.RestoreItem, reason string) {
+	if err := r.Meta.MarkRestoreCorrupt(ctx, it.ObjectID, reason); err != nil {
+		r.logger().Error("recaller: учёт испорченного участника",
 			slog.String("id", it.ObjectID.String()), slog.String("err", err.Error()))
 	}
 }

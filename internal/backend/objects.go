@@ -382,14 +382,15 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 		fromCache := false
 		if !obj.ReadableFromDisk(now) {
 			// Landing-копии нет — но в cache могла жить восстановленная
-			// копия (S5): 'restored' и срок не истёк. То же условие, что в
-			// заголовке x-amz-restore: дата в заголовке и решение о чтении
-			// не могут разойтись.
+			// копия (S5). Решает одна колонка objects.online_until — та же,
+			// что в заголовке x-amz-restore и по которой janitor снимает
+			// файл (ADR-0003): обещание в заголовке и решение о чтении не
+			// могут разойтись.
 			r, err := t.meta.GetRestore(ctx, tenant, obj.ID)
 			if err != nil && !errors.Is(err, meta.ErrNotFound) {
 				return nil, fmt.Errorf("restore для %s: %w", obj.ID, err)
 			}
-			if r == nil || !r.Active(now) {
+			if !restoreReadable(r, obj.OnlineUntil, now) {
 				return nil, s3err.GetBucketErr(s3err.ErrInvalidObjectState, bucket)
 			}
 			fromCache = true
@@ -447,11 +448,12 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 			freshNow := time.Now()
 			readable := rerr == nil && fresh.ReadableFromDisk(freshNow)
 			if !readable && fromCache {
-				// Для cache-копии «ещё читаемо» — это активный restore:
-				// janitor снимает строку и файл вместе, но между commit
-				// выборки и unlink GET мог зайти сюда.
+				// Для cache-копии «ещё читаемо» — это 'restored' с живым
+				// online_until (та же колонка, что в первом решении и в
+				// заголовке): janitor снимает строку и файл вместе, но между
+				// commit выборки и unlink GET мог зайти сюда.
 				r2, gerr := t.meta.GetRestore(ctx, tenant, obj.ID)
-				readable = gerr == nil && r2 != nil && r2.Active(freshNow)
+				readable = gerr == nil && restoreReadable(r2, fresh.OnlineUntil, freshNow)
 			}
 			if !readable {
 				return nil, s3err.GetBucketErr(s3err.ErrInvalidObjectState, bucket)
@@ -548,6 +550,17 @@ func (t *TapeGW) buildGetOutput(ctx context.Context, tenant meta.TenantID, obj *
 	return out, nil
 }
 
+// restoreReadable — восстановленная копия в cache читаема: строка 'restored'
+// и обещанный срок не истёк. Решает objects.online_until — одна колонка для
+// заголовка, чтения из cache и вытеснения janitor'ом (ADR-0003).
+// restores.expires_at — справочное поле: GREATEST в MarkRestoreRestored
+// допускает online_until > expires_at (больший срок запросили, пока лента
+// крутилась), и решение по expires_at отдало бы InvalidObjectState раньше
+// даты, показанной в заголовке, — ровно тот распад, от которого уходили.
+func restoreReadable(r *meta.Restore, onlineUntil, now time.Time) bool {
+	return r != nil && r.State == "restored" && onlineUntil.After(now)
+}
+
 // restoreHeader — x-amz-restore по ADR-0003. Правила поверх одной колонки
 // objects.online_until:
 //
@@ -571,7 +584,7 @@ func (t *TapeGW) restoreHeader(ctx context.Context, tenant meta.TenantID, obj *m
 		return &v, nil
 	}
 	now := time.Now()
-	if obj.ReadableFromDisk(now) || (r != nil && r.Active(now)) {
+	if obj.ReadableFromDisk(now) || restoreReadable(r, obj.OnlineUntil, now) {
 		until := obj.OnlineUntil
 		if obj.State == "pending" || obj.State == "archiving" {
 			if floor := now.Add(t.cfg.Spool.LandingMinRetention); floor.After(until) {

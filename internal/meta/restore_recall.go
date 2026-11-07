@@ -44,12 +44,21 @@ type RestoreItem struct {
 	Key        string // только для журнала
 }
 
-// ClaimRestoreBatch переводит следующую пачку запросов в 'in_progress' и
+// ClaimRestorePack переводит следующую пачку запросов в 'in_progress' и
 // возвращает участников вместе со всем, что нужно для чтения и сверки.
 //
-// Выборка идемпотентна (правило 7): переход `UPDATE ... WHERE state = ...`
-// с FOR UPDATE SKIP LOCKED, занятый рядом просто пропускается. Порядок —
-// priority (Expedited → Standard → Bulk), затем requested_at.
+// Захват — по одной пачке, а не батчем по очереди: lease обязан покрывать
+// одно чтение ленты, а не серию чтений. Батч на весь claim_ttl означал бы,
+// что один воркер забрал очередь и читает пачки по очереди, второй драйв
+// простаивает, а непрочитанные пачки после истечения lease перехватываются
+// посреди чтения — та же лента читается дважды, и каждый перехват засчитан
+// как попытка.
+//
+// Выборка: самая приоритетная готовая строка (priority, requested_at), затем
+// все готовые строки её пачки. Оба шага — FOR UPDATE SKIP LOCKED, занятый
+// ряд пропускается (правило 7). Гонка «два воркера делят одну пачку»
+// возможна в узком окне и безвредна: строки делятся непересекающе, худший
+// исход — лишнее чтение пачки с ленты.
 //
 // Lease claim_ttl пишется в next_try_at: у restores нет колонок воркера, а
 // next_try_at уже означает «не раньше этого момента брать в работу» — для
@@ -61,7 +70,7 @@ type RestoreItem struct {
 // Объект обязан быть archived и знать, где лежит (pack_id, pack_offset,
 // file_bytes): строка без них — не участник чтения, а рассинхрон, и брать
 // её в работу нечего.
-func (m *Meta) ClaimRestoreBatch(ctx context.Context, limit int, claimTTL time.Duration,
+func (m *Meta) ClaimRestorePack(ctx context.Context, limit int, claimTTL time.Duration,
 	maxAttempts int) ([]RestoreItem, error) {
 	if limit < 1 {
 		return nil, fmt.Errorf("meta: батч restore %d, должно быть >= 1", limit)
@@ -79,7 +88,7 @@ func (m *Meta) ClaimRestoreBatch(ctx context.Context, limit int, claimTTL time.D
 	rows, err := m.Pool.Query(ctx, claimRestoreSQL, limit,
 		claimTTL.Milliseconds(), maxAttempts)
 	if err != nil {
-		return nil, fmt.Errorf("meta: выборка restore-батча: %w", err)
+		return nil, fmt.Errorf("meta: выборка restore-пачки: %w", err)
 	}
 	defer rows.Close()
 
@@ -89,24 +98,44 @@ func (m *Meta) ClaimRestoreBatch(ctx context.Context, limit int, claimTTL time.D
 		if err := rows.Scan(&it.ObjectID, &it.TenantID, &it.Days,
 			&it.PackID, &it.PackOffset, &it.FileBytes,
 			&it.Size, &it.ETag, &it.WrappedDEK, &it.Key); err != nil {
-			return nil, fmt.Errorf("meta: выборка restore-батча: %w", err)
+			return nil, fmt.Errorf("meta: выборка restore-пачки: %w", err)
 		}
 		out = append(out, it)
 	}
 	return out, rows.Err()
 }
 
+// restoreReady — «строка готова к захвату»: архивный объект с координатами
+// пачки и запрос, которому можно идти в работу ('requested' по наступлении
+// next_try_at или 'in_progress' с просроченным lease). Предикат используется
+// дважды в одном запросе (шаг head и шаг pick), поэтому он один в переменной,
+// а не переписанный дважды.
+const restoreReady = `
+       o.state = 'archived'
+   AND o.pack_id IS NOT NULL AND o.pack_offset IS NOT NULL AND o.file_bytes IS NOT NULL
+   AND (
+         (r.state = 'requested'   AND (r.next_try_at IS NULL OR r.next_try_at <= now()))
+      OR (r.state = 'in_progress' AND r.next_try_at IS NOT NULL AND r.next_try_at <= now())
+   )`
+
 const claimRestoreSQL = `
-WITH pick AS (
+WITH head AS (
+    -- самая приоритетная готовая строка: её пачка и есть следующая на чтение
+    SELECT o.pack_id
+      FROM restores r
+      JOIN objects o ON o.id = r.object_id
+     WHERE ` + restoreReady + `
+     ORDER BY r.priority, r.requested_at
+     LIMIT 1
+     FOR UPDATE OF r SKIP LOCKED
+),
+pick AS (
+    -- все готовые строки этой пачки: одно чтение ленты закрывает их все
     SELECT r.object_id, r.state
       FROM restores r
       JOIN objects o ON o.id = r.object_id
-     WHERE o.state = 'archived'
-       AND o.pack_id IS NOT NULL AND o.pack_offset IS NOT NULL AND o.file_bytes IS NOT NULL
-       AND (
-             (r.state = 'requested'   AND (r.next_try_at IS NULL OR r.next_try_at <= now()))
-          OR (r.state = 'in_progress' AND r.next_try_at IS NOT NULL AND r.next_try_at <= now())
-       )
+      JOIN head h ON h.pack_id = o.pack_id
+     WHERE ` + restoreReady + `
      ORDER BY r.priority, r.requested_at
      LIMIT $1
      FOR UPDATE OF r SKIP LOCKED
@@ -137,8 +166,10 @@ SELECT u.object_id, u.tenant_id, u.days,
 //
 // GREATEST обязателен: RequestRestore уже продлил срок от запроса, а запрос
 // на больший срок мог прийти, пока лента крутилась, — обещание не укорачивается.
-// expires_at ставится теми же now(), что и restored_at, и в той же транзакции:
-// дата в x-amz-restore и дата вытеснения не могут разойтись.
+// Решает именно online_until: по нему показывают дату (x-amz-restore), читают
+// cache и вытесняют janitor — одна колонка (ADR-0003). expires_at ставится
+// теми же now() в той же транзакции и остаётся справочным полем: из-за
+// GREATEST он может быть меньше online_until, и по нему решение не принимается.
 //
 // Оба UPDATE под защитой состояния (правило 7): ноль затронутых строк —
 // объект удалили или перехватили, — это ErrRestoreLost, а не тихий успех.
@@ -205,6 +236,27 @@ func (m *Meta) MarkRestoreFailure(ctx context.Context, objectID uuid.UUID,
 	return nil
 }
 
+// MarkRestoreCorrupt — участник не прошёл проверку при совпавшей сумме пачки.
+// Повтор здесь бесполезен и дорог: сумма пачки доказывает, что с ленты пришли
+// ровно те байты, что легли при архивации, — повторное чтение даст тот же
+// результат и потратит до max_attempts прогонов ленты. Поэтому попытку
+// засчитываем (правило 7 — переход под защитой 'in_progress'), но сразу в
+// 'failed', без backoff-повторов. Ретраи остаются для ошибок чтения и
+// несовпадения суммы пачки.
+func (m *Meta) MarkRestoreCorrupt(ctx context.Context, objectID uuid.UUID, reason string) error {
+	_, err := m.Pool.Exec(ctx, `
+		UPDATE restores
+		   SET attempts = attempts + 1,
+		       last_error = $2,
+		       state = 'failed',
+		       next_try_at = NULL
+		 WHERE object_id = $1 AND state = 'in_progress'`, objectID, reason)
+	if err != nil {
+		return fmt.Errorf("meta: учёт испорченного участника: %w", err)
+	}
+	return nil
+}
+
 // PackCopy — готовая копия пачки: объект Phobos и сумма потока, записанные
 // при архивации. Recaller читает по phobos_oid (у первой копии он равен id
 // пачки, у последующих — свой) и сверяет отданные байты с sha256 копии:
@@ -244,10 +296,12 @@ func (m *Meta) PackCopy(ctx context.Context, packID uuid.UUID) (*PackCopy, error
 // вытеснении landing (ADR-0004): сначала строка перестала обещать копию,
 // потом unlink.
 //
-// Условие — online_until < now(), а не expires_at: показанная клиенту дата и
-// реальное удаление файла не должны расходиться (ADR-0003), а инвариант
-// online_until >= expires_at держат RequestRestore и MarkRestoreRestored
-// (GREATEST в обе стороны).
+// Условие — online_until < now(), а не expires_at: по online_until решают
+// и заголовок x-amz-restore, и чтение из cache — одна колонка на все три
+// решения (ADR-0003). restores.expires_at остаётся справочным полем:
+// GREATEST в MarkRestoreRestored допускает online_until > expires_at
+// (запрос на больший срок пришёл, пока лента крутилась), и решение по
+// expires_at разошлось бы с показанной клиенту датой.
 func (m *Meta) ClaimCacheEvictBatch(ctx context.Context, limit int) ([]uuid.UUID, error) {
 	if limit < 1 {
 		return nil, fmt.Errorf("meta: батч вытеснения cache %d, должно быть >= 1", limit)
