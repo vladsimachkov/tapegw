@@ -287,14 +287,22 @@ func (s *Store) Stat(ctx context.Context, id uuid.UUID) (store.Meta, error) {
 		Complete: b.complete,
 		Attrs:    cloneAttrs(b.attrs),
 	}
-	if b.pending {
-		// Явно включённое ленточное состояние: экстент виден, но не sync.
+	switch {
+	case b.pending:
+		// см. MarkPending
 		media := ""
 		if len(b.media) > 0 {
 			media = b.media[0]
 		}
 		m.Extents = []store.Extent{{Size: int64(len(b.data)), Media: media, State: "pending"}}
 		m.Complete = false
+	case b.complete:
+		// Целая копия обязана сообщать экстенты: их сверяет migrator, и
+		// настоящий Phobos их отдаёт. Без этого набор storetest проходил бы
+		// на fake и падал на стенде.
+		for _, md := range b.media {
+			m.Extents = append(m.Extents, store.Extent{Size: int64(len(b.data)), Media: md, State: "sync"})
+		}
 	}
 	return m, nil
 }
