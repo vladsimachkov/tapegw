@@ -468,6 +468,9 @@ func TestValidateMoverRequiredFields(t *testing.T) {
 		{"staging", func(c *Config) { c.Phobos.Mover.StagingDir = "" }, "staging_dir"},
 		{"buffer", func(c *Config) { c.Phobos.Mover.BufferBytes = 0 }, "buffer_bytes"},
 		{"library", func(c *Config) { c.Phobos.Library = "" }, "phobos.library"},
+		// chunk больше потолка кадра данных на проводе — put падал бы
+		// молча на первом полном кадре, отказ обязан быть на старте.
+		{"chunk больше потолка", func(c *Config) { c.Phobos.Mover.ChunkSize = 8 << 20 }, "chunk_size"},
 	}
 	for _, tc := range cases {
 		cfg := moverValidCfg()
@@ -489,6 +492,36 @@ func TestValidateMoverOpTimeoutAboveInactivity(t *testing.T) {
 	err := cfg.ValidateMover()
 	if err == nil || !strings.Contains(err.Error(), "op_timeout") {
 		t.Fatalf("op_timeout <= inactivity не отклонён: %v", err)
+	}
+}
+
+// repl_count обязан быть "1" (ADR-0022): встроенные реплики запрещены.
+// Отдельный тест, а не строка в RequiredFields: отказывает не пустое значение,
+// а любое другое — включая «оператор задал свою карту layout_params и потерял
+// repl_count», и про каждый случай надо сказать своим текстом.
+func TestValidateMoverRequiresReplCountOne(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rc   map[string]string
+	}{
+		{"нет ключа", map[string]string{"other": "x"}},
+		{"пустая карта", map[string]string{}},
+		{"nil", nil},
+		{"две реплики", map[string]string{"repl_count": "2"}},
+	} {
+		cfg := moverValidCfg()
+		cfg.Phobos.LayoutParams = tc.rc
+		err := cfg.ValidateMover()
+		if err == nil || !strings.Contains(err.Error(), "repl_count") {
+			t.Errorf("%s: отказ не про repl_count: %v", tc.name, err)
+		}
+	}
+	// И наоборот: "1" с посторонним параметром проходит — требовать «ровно
+	// одну пару» значило бы мешать оператору добавлять безвредные параметры.
+	cfg := moverValidCfg()
+	cfg.Phobos.LayoutParams = map[string]string{"repl_count": "1", "stripe_size": "64K"}
+	if err := cfg.ValidateMover(); err != nil {
+		t.Errorf("repl_count=1 с посторонним параметром отклонён: %v", err)
 	}
 }
 

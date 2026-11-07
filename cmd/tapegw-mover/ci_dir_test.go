@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -157,6 +158,110 @@ func waitStaged(t *testing.T, staging string, op uuid.UUID) {
 	t.Fatal("реестр не записал принятые байты — возобновлять нечего")
 }
 
+// freeAddr — свободный порт: процесс mover'а стартует по уже известному
+// адресу, чтобы клиент подключался к тому же адресу между запусками.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	return addr
+}
+
+// moverBin собирает бинарь из этого же пакета: проверяется артефакт, который
+// ставят в продакшн, а не пересказ сборки внутри теста.
+func moverBin(t *testing.T, dir string) string {
+	t.Helper()
+	bin := filepath.Join(dir, "tapegw-mover")
+	build := exec.Command("go", "build", "-tags", "phobos", "-o", bin, ".")
+	build.Stderr = os.Stderr
+	if err := build.Run(); err != nil {
+		t.Fatalf("сборка бинаря mover'а: %v", err)
+	}
+	return bin
+}
+
+// moverConfig пишет конфиг процесса под стенд ci-dir.
+func moverConfig(t *testing.T, dir, addr, staging, buffer string, p movertest.PKI) string {
+	t.Helper()
+	cfgPath := filepath.Join(dir, "mover.yaml")
+	cfgYAML := fmt.Sprintf(`phobos:
+  family: dir
+  library: dirlib
+  layout: raid1
+  layout_params: {repl_count: "1"}
+  mover:
+    listen: %q
+    drive: %q
+    role: migrator
+    tls: {cert: %q, key: %q, ca: %q}
+    staging_dir: %q
+    buffer_bytes: %s
+    chunk_size: 64KiB
+    inactivity_timeout: 2m
+    op_timeout: 10m
+`, addr, p.Drive, p.ServerCert, p.ServerKey, p.CA, staging, buffer)
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return cfgPath
+}
+
+// startMover запускает процесс и ждёт, пока адрес начнёт слушаться.
+func startMover(t *testing.T, bin, cfgPath, addr string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(bin, "-config", cfgPath)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("запуск mover'а: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, time.Second)
+		if err == nil {
+			c.Close()
+			return cmd
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("mover не слушает %s", addr)
+	return cmd
+}
+
+// waitWriting ждёт, пока реестр на диске не перейдёт в state=writing: это
+// окно между «буфер принят и сверен» и «phobos_put вернулся». Сигнал
+// остановки шлётся именно в него — иначе тест проверял бы остановку простоя.
+func waitWriting(t *testing.T, staging string, op uuid.UUID) {
+	t.Helper()
+	meta := filepath.Join(staging, op.String()+".json")
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(meta)
+		if err == nil {
+			var rec struct {
+				State string `json:"state"`
+			}
+			if json.Unmarshal(b, &rec) == nil {
+				switch rec.State {
+				case "writing":
+					return
+				case "done", "failed":
+					t.Fatal("операция завершилась раньше, чем поймался state=writing — окно слишком узкое для теста")
+				}
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("state=writing так и не наступил")
+}
+
 // Вторая половина замечания про остановку: после обрыва mover обязан
 // подниматься корректно. Процесс убивается по-настоящему (SIGKILL — без
 // обработки сигналов и cleanup), посреди put, на том же staging-каталоге,
@@ -170,67 +275,10 @@ func TestMoverKilledMidPutRecovers(t *testing.T) {
 	dir := t.TempDir()
 	staging := filepath.Join(dir, "staging")
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
-
-	cfgPath := filepath.Join(dir, "mover.yaml")
-	cfgYAML := fmt.Sprintf(`phobos:
-  family: dir
-  library: dirlib
-  layout: raid1
-  layout_params: {repl_count: "1"}
-  mover:
-    listen: %q
-    drive: %q
-    role: migrator
-    tls: {cert: %q, key: %q, ca: %q}
-    staging_dir: %q
-    buffer_bytes: 16MiB
-    chunk_size: 64KiB
-    inactivity_timeout: 2m
-    op_timeout: 10m
-`, addr, p.Drive, p.ServerCert, p.ServerKey, p.CA, staging)
-	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// Бинарь собирается из этого же пакета: проверяется артефакт, который
-	// ставят в продакшн, а не пересказ сборки внутри теста.
-	bin := filepath.Join(dir, "tapegw-mover")
-	build := exec.Command("go", "build", "-tags", "phobos", "-o", bin, ".")
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		t.Fatalf("сборка бинаря mover'а: %v", err)
-	}
-
-	start := func() *exec.Cmd {
-		cmd := exec.Command(bin, "-config", cfgPath)
-		cmd.Stderr = os.Stderr
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("запуск mover'а: %v", err)
-		}
-		t.Cleanup(func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		})
-		return cmd
-	}
-	waitListen := func(who string) {
-		deadline := time.Now().Add(30 * time.Second)
-		for time.Now().Before(deadline) {
-			c, err := net.DialTimeout("tcp", addr, time.Second)
-			if err == nil {
-				c.Close()
-				return
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-		t.Fatalf("mover (%s) не слушает %s", who, addr)
-	}
+	addr := freeAddr(t)
+	bin := moverBin(t, dir)
+	cfgPath := moverConfig(t, dir, addr, staging, "16MiB", p)
+	start := func() *exec.Cmd { return startMover(t, bin, cfgPath, addr) }
 
 	op := uuid.New()
 	full := bytes.Repeat([]byte("kill-mid-put "), 100_000) // ~1.3 MiB
@@ -238,7 +286,6 @@ func TestMoverKilledMidPutRecovers(t *testing.T) {
 	const partial = 400 << 10
 
 	proc := start()
-	waitListen("первый запуск")
 	cliTLS, err := mover.ClientTLS(p.ClientCert, p.ClientKey, p.CA, p.Drive)
 	if err != nil {
 		t.Fatal(err)
@@ -263,7 +310,6 @@ func TestMoverKilledMidPutRecovers(t *testing.T) {
 	// а отмены у клиента нет (ADR-0021). Соединение умерло вместе с процессом.
 
 	proc2 := start()
-	waitListen("после обрыва")
 	c2, _, err := mover.DialAs(context.Background(), addr, cliTLS, mover.RoleMigrator)
 	if err != nil {
 		t.Fatalf("подключение после обрыва: %v", err)
@@ -293,5 +339,85 @@ func TestMoverKilledMidPutRecovers(t *testing.T) {
 	}
 	if !bytes.Equal(got.Bytes(), full) {
 		t.Fatal("после возобновления на ленте (dir) лежат другие байты")
+	}
+}
+
+// Третья грань остановки — штатная: SIGTERM посреди настоящего phobos_put.
+// Механизм («Close ждёт обработчик с активным вызовом, fini — после»)
+// детерминированно проверен TestCloseWaitsForInFlightCall на fake; здесь —
+// настоящий Phobos и настоящий процесс: сигнал ловится в окне state=writing,
+// процесс выходит нулём только после возврата put, а после рестарта копия
+// целая — то есть прерванной записи нет. Если бы phobos_fini встал перед
+// незавершённым phobos_put, копия осталась бы неполной или нулевой.
+func TestMoverStoppedMidPutRecovers(t *testing.T) {
+	if os.Getenv("TAPEGW_PHOBOS_TEST") != "1" {
+		t.Skip("нужен настоящий Phobos: TAPEGW_PHOBOS_TEST=1 и стенд ci-dir")
+	}
+	p := movertest.NewPKI(t)
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	addr := freeAddr(t)
+	bin := moverBin(t, dir)
+	cfgPath := moverConfig(t, dir, addr, staging, "64MiB", p)
+
+	// 48 MiB: phobos_put на dir идёт заметно дольше интервала опроса реестра,
+	// окно writing не должен успевать закрыться между проверками.
+	full := bytes.Repeat([]byte("sigterm-mid-put "), 3_000_000)
+	sum := sha256.Sum256(full)
+	op := uuid.New()
+
+	proc := startMover(t, bin, cfgPath, addr)
+	cliTLS, err := mover.ClientTLS(p.ClientCert, p.ClientKey, p.CA, p.Drive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1, err := mover.Dial(context.Background(), addr, cliTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putDone := make(chan error, 1)
+	go func() {
+		_, err := c1.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(full)),
+			SHA256: hex.EncodeToString(sum[:]), Body: bytes.NewReader(full)})
+		putDone <- err
+	}()
+
+	waitWriting(t, staging, op)
+	if err := proc.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	// Выход — ноль: «остановились корректно, дождавшись операции». Ненулевой
+	// код означал бы, что остановка споткнулась о собственный cleanup.
+	if err := proc.Wait(); err != nil {
+		t.Fatalf("mover завершился нештатно после SIGTERM посреди put: %v", err)
+	}
+	select {
+	case <-putDone:
+		// код не проверяем: кадр результата мог не успеть уйти до закрытия
+		// соединения — это нормальный исход штатной остановки.
+	case <-time.After(10 * time.Second):
+		t.Fatal("клиентский Put не вернулся после остановки сервера")
+	}
+	c1.Close()
+
+	// proc2 убирает t.Cleanup из startMover.
+	startMover(t, bin, cfgPath, addr)
+	c2, _, err := mover.DialAs(context.Background(), addr, cliTLS, mover.RoleMigrator)
+	if err != nil {
+		t.Fatalf("подключение после остановки: %v", err)
+	}
+	defer c2.Close()
+
+	st, err := c2.StatObject(op)
+	if err != nil || st.Code != mover.CodeOK {
+		t.Fatalf("Stat после штатной остановки: %v / %v — копия не целая", err, st)
+	}
+	var got bytes.Buffer
+	gres, err := c2.Get(uuid.New(), op, &got)
+	if err != nil || gres.Code != mover.CodeOK {
+		t.Fatalf("Get после штатной остановки: %v / %v", err, gres)
+	}
+	if !bytes.Equal(got.Bytes(), full) {
+		t.Fatal("после штатной остановки на dir лежат другие байты")
 	}
 }

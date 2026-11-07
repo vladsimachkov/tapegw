@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/vladsimachkov/tapegw/internal/mover"
 )
 
 // Config — корень конфигурации. Теги yaml задают имя поля в файле, теги env —
@@ -837,7 +839,10 @@ func (c *Config) Validate() error {
 			add("phobos.movers.%s.node обязателен: по нему определяется локальная передача (Ф0.4)", name)
 		}
 		if mv.Library == "" {
-			add("phobos.movers.%s.library обязателен: входит в SAN-URI сертификата mover'а", name)
+			// Идентичность mover'а — имя драйва в SAN-URI (ADR-0021), а не
+			// библиотека: библиотека нужна для маршрутизации, по ней
+			// планировщик выбирает mover'ы своей библиотеки.
+			add("phobos.movers.%s.library обязателен: по нему планировщик выбирает mover'ы своей библиотеки", name)
 		}
 	}
 
@@ -889,6 +894,10 @@ func (c *Config) ValidateMover() error {
 	if m.ChunkSize <= 0 {
 		add("phobos.mover.chunk_size: %d, должно быть > 0", int64(m.ChunkSize))
 	}
+	if m.ChunkSize > mover.MaxDataBytes-16 {
+		add("phobos.mover.chunk_size: %v, не больше %d байт — потолок кадра данных на проводе (ADR-0021)",
+			int64(m.ChunkSize), mover.MaxDataBytes-16)
+	}
 	if m.Inactivity <= 0 {
 		add("phobos.mover.inactivity_timeout: %v, должно быть > 0", m.Inactivity)
 	}
@@ -903,6 +912,17 @@ func (c *Config) ValidateMover() error {
 	// library put падает с -ENODEV без внятной ошибки (ADR-0007, M0-02).
 	if c.Phobos.Library == "" {
 		add("phobos.library обязателен: API Phobos не читает профиль (ADR-0007)")
+	}
+	// Встроенные реплики Phobos запрещены (ADR-0022): копии — отдельные
+	// объекты tapegw, каждая со своими тегами, а raid1 с repl_count > 1
+	// пишет молча одинаковые реплики с одними тегами. Дефолт repl_count="1"
+	// задан в Default(), но оператор, задающий свои layout_params, заменяет
+	// карту целиком — и дефолт исчезает вместе с repl_count. Тогда Phobos
+	// берёт свои две реплики: на ci-dir это уже давало ENODEV с одним
+	// носителем и тихие две реплики с двумя. Отказ на старте, не в первом put.
+	if rc := c.Phobos.LayoutParams["repl_count"]; rc != "1" {
+		add(`phobos.layout_params.repl_count = %q, обязано быть "1": встроенные реплики Phobos запрещены, `+
+			"копии — отдельные объекты tapegw (ADR-0022)", rc)
 	}
 	return errors.Join(errs...)
 }

@@ -206,7 +206,10 @@ func (s *Server) handle(conn net.Conn) {
 		if f == nil {
 			s.touch(tconn)
 			var err error
-			f, err = ReadFrame(tconn, MaxFrameBytes)
+			// MaxDataBytes: в диспетчер может прийти и кадр данных (например,
+			// объявление новой операции посреди передачи — оно возвращается
+			// через carry), поэтому потолок данных, а не только JSON.
+			f, err = ReadFrame(tconn, MaxDataBytes)
 			if err != nil {
 				if !errors.Is(err, io.EOF) {
 					s.log.Debug("mover: соединение закрыто", "err", err)
@@ -396,7 +399,7 @@ func (s *Server) handlePut(conn net.Conn, p *Put) *Frame {
 	received := offset
 	for received < p.Size {
 		s.touch(conn)
-		fr, err := ReadFrame(conn, MaxFrameBytes)
+		fr, err := ReadFrame(conn, MaxDataBytes)
 		if err != nil {
 			return nil
 		}

@@ -278,7 +278,7 @@ func (c *Client) Get(op, id uuid.UUID, w io.Writer) (*Result, error) {
 			}
 			crc += cr
 		}
-		f, err := ReadFrame(c.conn, MaxFrameBytes)
+		f, err := ReadFrame(c.conn, MaxDataBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -318,10 +318,17 @@ func (c *Client) Get(op, id uuid.UUID, w io.Writer) (*Result, error) {
 			return nil, err
 		}
 		seen += int64(n)
-		// Приняли байты — вернули кредиты: буфер освободился.
+		// Приняли байты — вернули кредиты: буфер освободился. Свою оценку
+		// окна пополняем тем же числом: crc — это «сколько серверу ещё
+		// разрешено», а не «сколько мы выдержим»; отдали кредиты — разрешение
+		// вернулось. Без этого get объекта больше window (chunk*4) умирал на
+		// первом же ожидании: crc обнулялся, waitCredit ждал кадр кредитов,
+		// а в направлении get кредиты шлёт только клиент — приходил кадр
+		// данных и «ждали кредиты, пришёл кадр данных».
 		if err := WriteJSON(c.conn, Credit{Type: "credit", Op: op, Credits: int64(n)}); err != nil {
 			return nil, err
 		}
+		crc += int64(n)
 	}
 }
 

@@ -26,6 +26,38 @@ func (poisonReader) Read([]byte) (int, error) { return 0, errPoison }
 
 func sum(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 
+// get объекта больше клиентского окна (chunk*4 = 16 MiB) обязан проходить:
+// принимая байты, клиент возвращает кредиты серверу и обязан пополнить свою
+// же оценку окна. До правки любой get больше 16 MiB умирал со «ждали кредиты,
+// пришёл кадр данных»: в направлении get кредиты шлёт только клиент, а его
+// waitCredit ждал кадра, которого в этом направлении не бывает. Тест держит
+// границу: объект ровно на гребне окна не проверял бы ничего — окно
+// расходуется целиком только выше него.
+func TestGetLargerThanClientWindow(t *testing.T) {
+	e := startEnv(t, 48<<20)
+	c := e.dial(t)
+
+	body := bytes.Repeat([]byte("окно кредитов "), 700_000) // ~17.4 MiB > 16 MiB окна
+	if int64(len(body)) <= 16<<20 {
+		t.Fatalf("объект %d байт не больше окна — тест ничего не проверяет", len(body))
+	}
+	op := uuid.New()
+	if _, err := c.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(body)), SHA256: sum(body), Body: bytes.NewReader(body)}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	var got bytes.Buffer
+	res, err := c.Get(uuid.New(), op, &got)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if res.Code != mover.CodeOK {
+		t.Fatalf("Get: код %s", res.Code)
+	}
+	if !bytes.Equal(got.Bytes(), body) {
+		t.Fatalf("вернулись другие байты: %d против %d", got.Len(), len(body))
+	}
+}
+
 // Копия пишется из буфера источника: клиент не отправляет ни байта тела.
 func TestLocalTransferSendsNoBytes(t *testing.T) {
 	e := startEnv(t, 1<<20)
