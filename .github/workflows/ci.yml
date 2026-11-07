@@ -190,6 +190,14 @@ jobs:
           spool:
             landing: /tmp/spool/landing
             cache: /tmp/spool/cache
+          # Phobos в CI нет, mover подключить нечем. migrator по умолчанию
+          # включён, а его старт-гейт (PlanMigrators) роняет процесс на
+          # «включено, но некому»: с #119 стенд не поднимал шлюз вовсе, и весь
+          # e2e был красным. Стенд выключает его явно — молчание здесь
+          # означало бы «включено». S6 даёт стенду Phobos dir и mover, и
+          # выключение снимается. janitor ленту не требует — пусть работает.
+          migrator:
+            enabled: false
           YAML
           /tmp/tapegw -config /tmp/ci.yaml &
           for i in $(seq 1 30); do
