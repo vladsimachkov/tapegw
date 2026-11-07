@@ -82,9 +82,9 @@ func decodeRecord(b []byte) (Record, int, error) {
 	off += 8
 	r.PlainLen = binary.BigEndian.Uint64(b[off:])
 	off += 8
-	r.CipherOff = binary.BigEndian.Uint64(b[off:])
+	r.FileOff = binary.BigEndian.Uint64(b[off:])
 	off += 8
-	r.CipherLen = binary.BigEndian.Uint64(b[off:])
+	r.FileLen = binary.BigEndian.Uint64(b[off:])
 	off += 8
 	dekLen := int(binary.BigEndian.Uint16(b[off:]))
 	off += 2
@@ -106,13 +106,18 @@ func decodeRecord(b []byte) (Record, int, error) {
 
 // MemberHeader — участник, опознанный по заголовку pax: то, что удаётся
 // узнать без индекса.
+//
+// FileLen — длина файла участника целиком (шифротекст + манифест + футер):
+// это hdr.Size, то есть ровно то число байт, которое читатель получит из tar.
+// Открытый размер здесь взять неоткуда — он лежит в манифесте внутри самого
+// файла, и восстановитель читает его оттуда, а не из заголовка.
 type MemberHeader struct {
 	Version    [16]byte
 	Tenant     uint64
 	VersionSeq uint64
 	KekVersion uint64
 	WrappedDEK []byte
-	PlainLen   uint64
+	FileLen    uint64
 }
 
 // Walk обходит пачку по заголовкам tar, **не пользуясь индексом**. Это не
@@ -136,7 +141,7 @@ func Walk(r io.Reader, fn func(MemberHeader, io.Reader) error) error {
 		if err != nil {
 			return fmt.Errorf("pack: имя участника %q: %w", hdr.Name, err)
 		}
-		mh := MemberHeader{Version: v, PlainLen: uint64(hdr.Size)}
+		mh := MemberHeader{Version: v, FileLen: uint64(hdr.Size)}
 		pax := hdr.PAXRecords
 		if mh.Tenant, err = paxUint(pax, "TAPEGW.tenant"); err != nil {
 			return fmt.Errorf("pack: участник %s: %w", hdr.Name, err)

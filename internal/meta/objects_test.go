@@ -27,10 +27,13 @@ func mustBucket(t *testing.T, m *meta.Meta, name string) {
 
 func putInput(bucket, key string) meta.PutObjectInput {
 	return meta.PutObjectInput{
-		ID:          uuid.New(),
-		Bucket:      bucket,
-		Key:         key,
-		Size:        11,
+		ID:     uuid.New(),
+		Bucket: bucket,
+		Key:    key,
+		Size:   11,
+		// Тело в этих тестах не пишется, но длина файла обязательна (ADR-0020:
+		// участник пачки — файл целиком, длину объявляет писавший).
+		FileBytes:   64,
 		ETag:        "5d41402abc4b2a76b9719d911017c592",
 		UserMeta:    map[string]string{"author": "tester"},
 		OnlineUntil: time.Now().Add(24 * time.Hour),

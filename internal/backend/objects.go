@@ -227,6 +227,7 @@ func (t *TapeGW) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		Bucket:       bucket,
 		Key:          key,
 		Size:         info.Size,
+		FileBytes:    info.DiskBytes,
 		ETag:         info.MD5Hex,
 		Checksums:    checksumMap(algo, info.Checksum),
 		ContentType:  po.ContentType,

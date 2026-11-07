@@ -285,7 +285,7 @@ func itemsFor(ids []uuid.UUID) []Item {
 			PlainLen:   uint64(len(body)),
 			KekVersion: 1,
 			WrappedDEK: []byte("wrapped-dek"),
-			CipherLen:  uint64(len(body)),
+			FileLen:    uint64(len(body)),
 			Open:       func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil },
 		})
 	}

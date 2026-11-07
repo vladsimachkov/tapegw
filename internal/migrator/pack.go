@@ -37,12 +37,14 @@ type Item struct {
 	WrappedDEK []byte
 	Flags      uint8
 
-	// CipherLen объявляется заранее: он есть в БД, и без него tar не может
-	// выставить размер в заголовке, а значит поток нельзя читать по
+	// FileLen — длина файла участника целиком: шифротекст + манифест + футер
+	// (ADR-0019). Объявляется заранее из БД (objects.file_bytes): без неё tar
+	// не может выставить размер в заголовке, а значит поток нельзя читать по
 	// заголовкам без индекса.
-	CipherLen uint64
+	FileLen uint64
 
-	// Open открывает шифротекст участника на чтение с начала.
+	// Open открывает файл участника на чтение с начала — ровно тот файл, что
+	// лежит в landing, ничего не отрезая и не дописывая.
 	Open func() (io.ReadCloser, error)
 }
 
@@ -58,7 +60,7 @@ func (it Item) member() (pack.Member, error) {
 		KekVersion: it.KekVersion,
 		WrappedDEK: it.WrappedDEK,
 		Flags:      it.Flags,
-		CipherLen:  it.CipherLen,
+		FileLen:    it.FileLen,
 	}, nil
 }
 
@@ -150,7 +152,7 @@ func buildIndexed(w io.Writer, items []Item, sum hash.Hash) ([]Placement, int64,
 		if err != nil {
 			return nil, 0, fmt.Errorf("migrator: открыть участник %s: %w", it.Version, err)
 		}
-		m.Cipher = rc
+		m.File = rc
 		off, err := tw.AddMember(m)
 		rc.Close()
 		if err != nil {
@@ -158,7 +160,7 @@ func buildIndexed(w io.Writer, items []Item, sum hash.Hash) ([]Placement, int64,
 		}
 		// Смещение возвращает сборщик, а не вызывающий: ошибка на единицу
 		// читает чужие байты и выглядит как повреждение ключа.
-		placements = append(placements, Placement{Version: it.Version, Offset: off, Length: m.CipherLen})
+		placements = append(placements, Placement{Version: it.Version, Offset: off, Length: m.FileLen})
 	}
 	if _, err := tw.Close(); err != nil {
 		return nil, 0, err

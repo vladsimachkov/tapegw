@@ -4,9 +4,13 @@
 //
 //	[ tar(pax): member_1 … member_N ][ индекс ][ футер ]
 //
-// Имя участника tar — UUID версии, содержимое — шифротекст этого объекта как
-// есть. pax выбран ради свойства: поток читается по заголовкам слева направо
-// без индекса, а заголовок несёт обёртку DEK — без неё запасной путь пустой.
+// Имя участника tar — UUID версии, содержимое — файл объекта целиком:
+// шифротекст + зашифрованный манифест + футер (ADR-0019). Не только
+// шифротекст: соль частей, по которой строится nonce каждого сегмента (#38),
+// имя бакета и ключа, ETag и метаданные живут в манифесте, а в pax их нет —
+// без манифеста участник с ленты не расшифровать. pax выбран ради свойства:
+// поток читается по заголовкам слева направо без индекса, а заголовок несёт
+// обёртку DEK — без неё запасной путь пустой.
 //
 // Пакет чистый, без cgo и Phobos (правило 2): migrator собирает пачку в файл на
 // staging, а mover потом кладёт байты на ленту.
@@ -33,7 +37,7 @@ var magicFooter = [4]byte{'T', 'P', 'K', 'F'}
 const (
 	// FooterSize — размер футера пачки.
 	FooterSize = 64
-	// 16 (version) + 5×8 (tenant, seq, plain_len, cipher_off, cipher_len)
+	// 16 (version) + 5×8 (tenant, seq, plain_len, file_off, file_len)
 	// + 2 (dek_len)
 	indexRecHead = 16 + 5*8 + 2
 	maxDEKLen    = math.MaxUint8
@@ -66,16 +70,19 @@ type Member struct {
 	WrappedDEK []byte
 	Flags      uint8
 
-	// CipherLen — объявленная длина шифротекста. Она известна из БД
-	// (object_parts / objects.size после шифрования), и без неё tar не может
-	// выставить размер заголовка, а значит поток нельзя читать по заголовкам.
-	// Сборщик проверяет, что фактическая длина совпала.
-	CipherLen uint64
+	// FileLen — объявленная длина файла участника: шифротекст + зашифрованный
+	// манифест + футер (ADR-0019). Она известна из БД (objects.file_bytes —
+	// её пишет PUT в той же транзакции, что и строку объекта), и без неё tar не
+	// может выставить размер заголовка, а значит поток нельзя читать по
+	// заголовкам. Сборщик сверяет фактическую длину в обе стороны: короче —
+	// манифест обрезан, длиннее — следующий участник начался бы с середины
+	// данных.
+	FileLen uint64
 
-	// Cipher — шифротекст участника. Читается потоком, целиком в память не
+	// File — файл участника целиком. Читается потоком, целиком в память не
 	// кладется: пачку предполагается собирать в два прохода (ADR-0021), и
 	// буферизовать по 25 МБ на участника при каждом проходе незачем.
-	Cipher io.Reader
+	File io.Reader
 }
 
 // Record — запись индекса.
@@ -84,8 +91,8 @@ type Record struct {
 	Tenant     uint64
 	VersionSeq uint64
 	PlainLen   uint64
-	CipherOff  uint64
-	CipherLen  uint64
+	FileOff    uint64
+	FileLen    uint64
 	WrappedDEK []byte
 	Flags      uint8
 }
@@ -137,7 +144,7 @@ func NewWriter(w io.Writer) *Writer {
 	return &Writer{counted: cw, tw: tar.NewWriter(cw)}
 }
 
-// AddMember добавляет участника и возвращает смещение его шифротекста.
+// AddMember добавляет участника и возвращает смещение его файла в пачке.
 func (w *Writer) AddMember(m Member) (uint64, error) {
 	if w.closed {
 		return 0, ErrClosed
@@ -145,14 +152,14 @@ func (w *Writer) AddMember(m Member) (uint64, error) {
 	if len(m.WrappedDEK) > maxDEKLen {
 		return 0, fmt.Errorf("%w: %d байт", ErrDEKTooLong, len(m.WrappedDEK))
 	}
-	if m.CipherLen > math.MaxInt64 {
-		return 0, fmt.Errorf("pack: участник %d байт не помещается в заголовок tar", m.CipherLen)
+	if m.FileLen > math.MaxInt64 {
+		return 0, fmt.Errorf("pack: участник %d байт не помещается в заголовок tar", m.FileLen)
 	}
 
 	hdr := &tar.Header{
 		Name:   uuidString(m.Version),
 		Mode:   0400,
-		Size:   int64(m.CipherLen),
+		Size:   int64(m.FileLen),
 		Format: tar.FormatPAX,
 		// POSIX требует vendor-ключей вида VENDOR.keyword. Эти четыре поля —
 		// то же, что лежит в индексе, и без них запасной путь пустой: в самом
@@ -169,19 +176,19 @@ func (w *Writer) AddMember(m Member) (uint64, error) {
 		return 0, fmt.Errorf("pack: заголовок участника: %w", err)
 	}
 	// Смещение данных — уже после заголовка: именно отсюда читатель будет
-	// брать шифротекст, не разбирая tar.
+	// брать файл участника, не разбирая tar.
 	off := w.counted.n
-	n, err := io.CopyN(w.tw, m.Cipher, int64(m.CipherLen))
+	n, err := io.CopyN(w.tw, m.File, int64(m.FileLen))
 	if err != nil && !errors.Is(err, io.EOF) {
 		return 0, fmt.Errorf("pack: данные участника: %w", err)
 	}
-	if uint64(n) != m.CipherLen {
+	if uint64(n) != m.FileLen {
 		return 0, fmt.Errorf("pack: участник %s короче объявленного: %d из %d байт",
-			uuidString(m.Version), n, m.CipherLen)
+			uuidString(m.Version), n, m.FileLen)
 	}
 	// Лишние байты — тоже ошибка, а не «запишем сколько дали»: заголовок
-	// обещает CipherLen, и следующий участник начался бы с середины данных.
-	if extra, err := m.Cipher.Read([]byte{0}); err != io.EOF || extra != 0 {
+	// обещает FileLen, и следующий участник начался бы с середины данных.
+	if extra, err := m.File.Read([]byte{0}); err != io.EOF || extra != 0 {
 		return 0, fmt.Errorf("pack: участник %s длиннее объявленного", uuidString(m.Version))
 	}
 	if err := w.tw.Flush(); err != nil {
@@ -190,7 +197,7 @@ func (w *Writer) AddMember(m Member) (uint64, error) {
 
 	w.index = append(w.index, Record{
 		Version: m.Version, Tenant: m.Tenant, VersionSeq: m.VersionSeq,
-		PlainLen: m.PlainLen, CipherOff: off, CipherLen: m.CipherLen,
+		PlainLen: m.PlainLen, FileOff: off, FileLen: m.FileLen,
 		WrappedDEK: m.WrappedDEK, Flags: m.Flags,
 	}.encode()...)
 	w.count++
@@ -237,8 +244,8 @@ func (r Record) encode() []byte {
 	b = binary.BigEndian.AppendUint64(b, r.Tenant)
 	b = binary.BigEndian.AppendUint64(b, r.VersionSeq)
 	b = binary.BigEndian.AppendUint64(b, r.PlainLen)
-	b = binary.BigEndian.AppendUint64(b, r.CipherOff)
-	b = binary.BigEndian.AppendUint64(b, r.CipherLen)
+	b = binary.BigEndian.AppendUint64(b, r.FileOff)
+	b = binary.BigEndian.AppendUint64(b, r.FileLen)
 	b = binary.BigEndian.AppendUint16(b, uint16(len(r.WrappedDEK)))
 	b = append(b, r.WrappedDEK...)
 	b = append(b, r.Flags)

@@ -19,11 +19,11 @@ func member(t testing.TB, tenant, seq uint64, body string) pack.Member {
 		Tenant:     tenant,
 		VersionSeq: seq,
 		PlainLen:   uint64(len(body)) * 3,
-		CipherLen:  uint64(len(body)),
+		FileLen:    uint64(len(body)),
 		KekVersion: 7,
 		WrappedDEK: []byte("wrapped-dek-" + body),
 		Flags:      0,
-		Cipher:     bytes.NewReader([]byte(body)),
+		File:       bytes.NewReader([]byte(body)),
 	}
 }
 
@@ -33,14 +33,14 @@ func build(t *testing.T, members ...pack.Member) (*bytes.Reader, pack.Summary, [
 	w := pack.NewWriter(&buf)
 	var bodies [][]byte
 	for _, m := range members {
-		body, ok := m.Cipher.(*bytes.Reader)
+		body, ok := m.File.(*bytes.Reader)
 		if !ok {
 			t.Fatal("ожидается bytes.Reader")
 		}
 		data, _ := io.ReadAll(body)
 		bodies = append(bodies, data)
-		m.Cipher = bytes.NewReader(data)
-		m.CipherLen = uint64(len(data))
+		m.File = bytes.NewReader(data)
+		m.FileLen = uint64(len(data))
 		if _, err := w.AddMember(m); err != nil {
 			t.Fatalf("AddMember: %v", err)
 		}
@@ -97,8 +97,8 @@ func TestRoundTrip(t *testing.T) {
 		}
 		// Смещение обязано указывать ровно на шифротекст: читатель берёт отсюда
 		// байты, не разбирая tar, и ошибка на единицу читает чужие данные.
-		data := make([]byte, rec.CipherLen)
-		if _, err := r.ReadAt(data, int64(rec.CipherOff)); err != nil {
+		data := make([]byte, rec.FileLen)
+		if _, err := r.ReadAt(data, int64(rec.FileOff)); err != nil {
 			t.Fatalf("участник %d: читать по смещению: %v", i, err)
 		}
 		if !bytes.Equal(data, bodies[i]) {
@@ -255,8 +255,8 @@ func TestBuildIsDeterministic(t *testing.T) {
 		w := pack.NewWriter(&buf)
 		for _, sp := range specs {
 			m := sp.Member
-			m.Cipher = bytes.NewReader([]byte(sp.body))
-			m.CipherLen = uint64(len(sp.body))
+			m.File = bytes.NewReader([]byte(sp.body))
+			m.FileLen = uint64(len(sp.body))
 			if _, err := w.AddMember(m); err != nil {
 				t.Fatalf("AddMember: %v", err)
 			}
@@ -290,7 +290,7 @@ func TestMemberLengthMustMatchDeclared(t *testing.T) {
 	var buf bytes.Buffer
 	w := pack.NewWriter(&buf)
 	m := member(t, 10, 1, "short")
-	m.CipherLen = 100
+	m.FileLen = 100
 	if _, err := w.AddMember(m); err == nil {
 		t.Error("участник короче объявленного принят: заголовок врёт о размере")
 	}
@@ -298,7 +298,7 @@ func TestMemberLengthMustMatchDeclared(t *testing.T) {
 	// Длинный участник: лишние байты сдвинули бы следующий участник.
 	w2 := pack.NewWriter(&buf)
 	m2 := member(t, 10, 1, "short")
-	m2.CipherLen = 2
+	m2.FileLen = 2
 	if _, err := w2.AddMember(m2); err == nil {
 		t.Error("участник длиннее объявленного принят: следующий начался бы с середины данных")
 	}
@@ -320,8 +320,8 @@ func FuzzReadFooter(f *testing.F) {
 	var buf bytes.Buffer
 	w := pack.NewWriter(&buf)
 	m := member(f, 10, 1, "seed")
-	m.Cipher = bytes.NewReader([]byte("seed"))
-	m.CipherLen = 4
+	m.File = bytes.NewReader([]byte("seed"))
+	m.FileLen = 4
 	if _, err := w.AddMember(m); err != nil {
 		f.Fatal(err)
 	}
@@ -359,8 +359,8 @@ func FuzzWalk(f *testing.F) {
 	var buf bytes.Buffer
 	w := pack.NewWriter(&buf)
 	m := member(f, 10, 1, "seed")
-	m.Cipher = bytes.NewReader([]byte("seed"))
-	m.CipherLen = 4
+	m.File = bytes.NewReader([]byte("seed"))
+	m.FileLen = 4
 	if _, err := w.AddMember(m); err != nil {
 		f.Fatal(err)
 	}
