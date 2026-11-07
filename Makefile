@@ -36,3 +36,10 @@ mutate:
 	MODE="$(MODE)" DROP_SCHEMA="$(DROP_SCHEMA)" PSQL="$(PSQL)" ./hack/mutate.sh "$(FILE)" "$(EXPR)" "$(PKG)" $(ARGS)
 
 .PHONY: check mutate
+
+# Стендовые скрипты не правим на ВМ: обновляем одной командой из репозитория,
+# иначе копия на ВМ расходится с тем, что в git, и вывод перестаёт что-то значить.
+STAND_HOST ?= root@192.168.1.144
+STAND_DIR  ?= /root/tapegw-src
+stand-sync:
+	scp hack/stand-status hack/stand-up $(STAND_HOST):$(STAND_DIR)/hack/
