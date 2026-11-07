@@ -42,4 +42,8 @@ mutate:
 STAND_HOST ?= root@192.168.1.144
 STAND_DIR  ?= /root/tapegw-src
 stand-sync:
-	scp hack/stand-status hack/stand-up $(STAND_HOST):$(STAND_DIR)/hack/
+	@mkdir -p .build
+	@ver=$$(git rev-parse --short HEAD); \
+	  if [ -n "$$(git status --porcelain -- hack)" ]; then ver="$$ver-dirty"; fi; \
+	  printf '%s\n' "$$ver" > .build/VERSION
+	scp hack/stand-status hack/stand-up .build/VERSION $(STAND_HOST):$(STAND_DIR)/hack/

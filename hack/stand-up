@@ -11,6 +11,21 @@
 #   4. проверить себя тем же stand-status, которым пользуется каждый прогон.
 set -uo pipefail
 
+# --- 0. какая версия скрипта выполняется ------------------------------------
+# Тот же класс ошибки, что «проверяли не тот объект»: прогнать на ВМ старую
+# копию и прочитать её вывод как результат починки.
+root=$(cd "$(dirname "$0")/.." && pwd)
+if git -C "$root" rev-parse --short HEAD >/dev/null 2>&1; then
+    ver=$(git -C "$root" rev-parse --short HEAD)
+    [ -n "$(git -C "$root" status --porcelain -- hack)" ] && ver="$ver-dirty"
+elif [ -f "$(dirname "$0")/VERSION" ]; then
+    ver="копия из $(cat "$(dirname "$0")/VERSION")"
+else
+    ver="вне git и без VERSION; mtime $(date -r "$0" +%Y-%m-%dT%H:%M:%S)"
+fi
+echo "### stand-up @ $ver ($root)"
+
+
 here=$(cd "$(dirname "$0")" && pwd)
 
 echo "== 1. останавливаем демоны"

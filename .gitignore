@@ -27,3 +27,4 @@ coverage.*
 # Spikes are developed outside the main tree (docs/ARCHITECTURE.md, M0)
 /spikes/
 .build/
+.build/VERSION

@@ -19,8 +19,12 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 if git -C "$root" rev-parse --short HEAD >/dev/null 2>&1; then
     ver=$(git -C "$root" rev-parse --short HEAD)
     [ -n "$(git -C "$root" status --porcelain -- hack)" ] && ver="$ver-dirty"
+elif [ -f "$(dirname "$0")/VERSION" ]; then
+    # Копия вне git, но скопирована стендовой целью: она знает, из какого
+    # коммита её взяли.
+    ver="копия из $(cat "$(dirname "$0")/VERSION")"
 else
-    ver="вне git; mtime $(date -r "$0" +%Y-%m-%dT%H:%M:%S)"
+    ver="вне git и без VERSION; mtime $(date -r "$0" +%Y-%m-%dT%H:%M:%S)"
 fi
 echo "### stand-status @ $ver ($root)"
 rc=0
