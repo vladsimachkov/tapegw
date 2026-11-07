@@ -70,8 +70,13 @@ type RestoreItem struct {
 // Объект обязан быть archived и знать, где лежит (pack_id, pack_offset,
 // file_bytes): строка без них — не участник чтения, а рассинхрон, и брать
 // её в работу нечего.
-func (m *Meta) ClaimRestorePack(ctx context.Context, limit int, claimTTL time.Duration,
-	maxAttempts int) ([]RestoreItem, error) {
+//
+// workerID — идентичность воркера (узел/слот, как у migrator): строка
+// закрепляется за ним (claimed_by), продлевать захват и завершать переход
+// может только владелец. Без владельца продление неотличимо от чужого
+// захвата, а чтение ленты длится дольше lease.
+func (m *Meta) ClaimRestorePack(ctx context.Context, workerID string, limit int,
+	claimTTL time.Duration, maxAttempts int) ([]RestoreItem, error) {
 	if limit < 1 {
 		return nil, fmt.Errorf("meta: батч restore %d, должно быть >= 1", limit)
 	}
@@ -84,9 +89,14 @@ func (m *Meta) ClaimRestorePack(ctx context.Context, limit int, claimTTL time.Du
 	if maxAttempts < 1 {
 		return nil, fmt.Errorf("meta: max_attempts %d, должно быть >= 1", maxAttempts)
 	}
+	// Пустой workerID закрепил бы строку за «никем»: продление и переходы
+	// не отличали бы своего захват от чужого.
+	if workerID == "" {
+		return nil, fmt.Errorf("meta: пустой workerID в ClaimRestorePack: строку нельзя закрепить")
+	}
 
 	rows, err := m.Pool.Query(ctx, claimRestoreSQL, limit,
-		claimTTL.Milliseconds(), maxAttempts)
+		claimTTL.Milliseconds(), maxAttempts, workerID)
 	if err != nil {
 		return nil, fmt.Errorf("meta: выборка restore-пачки: %w", err)
 	}
@@ -148,7 +158,8 @@ upd AS (
            last_error = CASE WHEN p.state = 'in_progress'
                              THEN 'захват истёк (claim_ttl): восстановление начато заново'
                              ELSE r.last_error END,
-           next_try_at = now() + $2 * interval '1 millisecond'
+           next_try_at = now() + $2 * interval '1 millisecond',
+           claimed_by = $4
       FROM pick p
      WHERE r.object_id = p.object_id
      RETURNING r.object_id, r.tenant_id, r.days, r.state AS rstate
@@ -158,6 +169,38 @@ SELECT u.object_id, u.tenant_id, u.days,
   FROM upd u
   JOIN objects o ON o.id = u.object_id
  WHERE u.rstate = 'in_progress'`
+
+// RenewRestoreClaim продлевает захват строк, занятых этим воркером: короткий
+// UPDATE вне всякой транзакции чтения (правило 13), раз в треть срока.
+// Возвращает false, если продлено не всё: строки уже чужие (lease истёк и их
+// перехватили) или сняты — вызывающий обязан не публиковать результат,
+// пачкой занимается другой.
+//
+// Продление нужно потому, что чтение пачки — ожидание драйва, монтирование и
+// передача гигабайт (ADR-0021): срок, выставленный один раз при захвате,
+// истёк бы посреди чтения, и второй воркер крутил бы ту же ленту второй раз,
+// а медленное восстановление дошло бы до failed с причиной «захват истёк».
+func (m *Meta) RenewRestoreClaim(ctx context.Context, objectIDs []uuid.UUID,
+	workerID string, ttl time.Duration) (bool, error) {
+	if workerID == "" {
+		return false, fmt.Errorf("meta: пустой workerID в RenewRestoreClaim")
+	}
+	if ttl <= 0 {
+		return false, fmt.Errorf("meta: claim_ttl %v, должно быть > 0", ttl)
+	}
+	if len(objectIDs) == 0 {
+		return false, fmt.Errorf("meta: RenewRestoreClaim без списка объектов")
+	}
+	tag, err := m.Pool.Exec(ctx, `
+		UPDATE restores
+		   SET next_try_at = now() + $3 * interval '1 millisecond'
+		 WHERE claimed_by = $1 AND state = 'in_progress' AND object_id = ANY($2)`,
+		workerID, objectIDs, ttl.Milliseconds())
+	if err != nil {
+		return false, fmt.Errorf("meta: продлить захват restore: %w", err)
+	}
+	return tag.RowsAffected() == int64(len(objectIDs)), nil
+}
 
 // MarkRestoreRestored завершает восстановление: строка в 'restored', срок
 // отсчитывается от завершения (критерий ревью S5):
@@ -171,19 +214,26 @@ SELECT u.object_id, u.tenant_id, u.days,
 // теми же now() в той же транзакции и остаётся справочным полем: из-за
 // GREATEST он может быть меньше online_until, и по нему решение не принимается.
 //
-// Оба UPDATE под защитой состояния (правило 7): ноль затронутых строк —
-// объект удалили или перехватили, — это ErrRestoreLost, а не тихий успех.
-func (m *Meta) MarkRestoreRestored(ctx context.Context, objectID uuid.UUID, days int) error {
+// Оба UPDATE под защитой состояния (правило 7) и владельца: ноль затронутых
+// строк — объект удалили или захват перешёл к другому воркеру (наше чтение
+// шло дольше lease и продление не успело), — это ErrRestoreLost, а не тихий
+// успех. Завершать переход вправе только текущий владелец claimed_by.
+func (m *Meta) MarkRestoreRestored(ctx context.Context, objectID uuid.UUID, days int,
+	workerID string) error {
 	if days < 1 {
 		return fmt.Errorf("meta: days=%d в MarkRestoreRestored, должно быть >= 1", days)
+	}
+	if workerID == "" {
+		return fmt.Errorf("meta: пустой workerID в MarkRestoreRestored")
 	}
 	return m.inTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE restores
 			   SET state = 'restored', restored_at = now(),
 			       expires_at = now() + $2 * interval '1 day',
-			       next_try_at = NULL, last_error = NULL
-			 WHERE object_id = $1 AND state = 'in_progress'`, objectID, days)
+			       next_try_at = NULL, last_error = NULL, claimed_by = NULL
+			 WHERE object_id = $1 AND state = 'in_progress' AND claimed_by = $3`,
+			objectID, days, workerID)
 		if err != nil {
 			return fmt.Errorf("meta: переход restore в restored: %w", err)
 		}
@@ -206,14 +256,18 @@ func (m *Meta) MarkRestoreRestored(ctx context.Context, objectID uuid.UUID, days
 
 // MarkRestoreFailure — ошибка одной попытки: attempts+1, backoff как у
 // migrator (экспонента от base, потолок сутки), на исчерпании max_attempts —
-// 'failed'. Переход под защитой 'in_progress' (правило 7).
+// 'failed'. Переход под защитой 'in_progress' и владельца (правило 7): чужая
+// строка (перехвачена) не трогается.
 func (m *Meta) MarkRestoreFailure(ctx context.Context, objectID uuid.UUID,
-	maxAttempts int, base time.Duration, reason string) error {
+	maxAttempts int, base time.Duration, reason, workerID string) error {
 	if maxAttempts < 1 {
 		return fmt.Errorf("meta: max_attempts %d, должно быть >= 1", maxAttempts)
 	}
 	if base <= 0 {
 		return fmt.Errorf("meta: base backoff %v, должно быть > 0", base)
+	}
+	if workerID == "" {
+		return fmt.Errorf("meta: пустой workerID в MarkRestoreFailure")
 	}
 	secs := int64(base / time.Second)
 	if secs < 1 {
@@ -227,9 +281,10 @@ func (m *Meta) MarkRestoreFailure(ctx context.Context, objectID uuid.UUID,
 		       state = (CASE WHEN attempts + 1 >= $3 THEN 'failed' ELSE 'requested' END)::restore_state,
 		       next_try_at = CASE WHEN attempts + 1 >= $3 THEN NULL
 		                          ELSE now() + make_interval(secs => `+exp+`)::interval
-		                     END
-		 WHERE object_id = $1 AND state = 'in_progress'`,
-		objectID, reason, maxAttempts)
+		                     END,
+		       claimed_by = NULL
+		 WHERE object_id = $1 AND state = 'in_progress' AND claimed_by = $4`,
+		objectID, reason, maxAttempts, workerID)
 	if err != nil {
 		return fmt.Errorf("meta: учёт попытки restore: %w", err)
 	}
@@ -240,17 +295,22 @@ func (m *Meta) MarkRestoreFailure(ctx context.Context, objectID uuid.UUID,
 // Повтор здесь бесполезен и дорог: сумма пачки доказывает, что с ленты пришли
 // ровно те байты, что легли при архивации, — повторное чтение даст тот же
 // результат и потратит до max_attempts прогонов ленты. Поэтому попытку
-// засчитываем (правило 7 — переход под защитой 'in_progress'), но сразу в
-// 'failed', без backoff-повторов. Ретраи остаются для ошибок чтения и
+// засчитываем (правило 7 — переход под защитой 'in_progress' и владельца), но
+// сразу в 'failed', без backoff-повторов. Ретраи остаются для ошибок чтения и
 // несовпадения суммы пачки.
-func (m *Meta) MarkRestoreCorrupt(ctx context.Context, objectID uuid.UUID, reason string) error {
+func (m *Meta) MarkRestoreCorrupt(ctx context.Context, objectID uuid.UUID, reason,
+	workerID string) error {
+	if workerID == "" {
+		return fmt.Errorf("meta: пустой workerID в MarkRestoreCorrupt")
+	}
 	_, err := m.Pool.Exec(ctx, `
 		UPDATE restores
 		   SET attempts = attempts + 1,
 		       last_error = $2,
 		       state = 'failed',
-		       next_try_at = NULL
-		 WHERE object_id = $1 AND state = 'in_progress'`, objectID, reason)
+		       next_try_at = NULL, claimed_by = NULL
+		 WHERE object_id = $1 AND state = 'in_progress' AND claimed_by = $3`,
+		objectID, reason, workerID)
 	if err != nil {
 		return fmt.Errorf("meta: учёт испорченного участника: %w", err)
 	}

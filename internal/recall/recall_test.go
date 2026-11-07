@@ -93,6 +93,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	f.rc = &recall.Recall{
 		Meta: m, Get: f.get, Cache: cache, Keys: f.vault,
+		WorkerID: "test/1",
 		BatchMax: 10, ClaimTTL: time.Minute, MaxAttempts: 3, RetryBackoff: time.Second,
 	}
 	return f
@@ -445,6 +446,7 @@ func TestRecallSecondWorkerTakesOtherPack(t *testing.T) {
 	defer close(block.release)
 	rcA := &recall.Recall{
 		Meta: f.m, Get: block, Cache: f.cache, Keys: f.vault,
+		WorkerID: "test/A",
 		BatchMax: 10, ClaimTTL: time.Minute, MaxAttempts: 3, RetryBackoff: time.Second,
 	}
 	go func() { _, _ = rcA.Once(f.ctx) }()
@@ -500,11 +502,92 @@ func TestRecallSizeMismatch(t *testing.T) {
 }
 
 // Нулевой claim_ttl — ошибка сборки прохода, а не «lease истёк сразу»:
-// те же грабли, что с landing_min_retention в архивации.
+// те же грабли, что с landing_min_retention в архивации. Пустой WorkerID —
+// та же категория: строку нельзя закрепить, а значит и продлить.
 func TestRecallGuardsZeroConfig(t *testing.T) {
 	f := newFixture(t)
 	f.rc.ClaimTTL = 0
 	if _, err := f.rc.Once(f.ctx); err == nil || !strings.Contains(err.Error(), "claim_ttl") {
 		t.Errorf("нулевой claim_ttl: %v, ждали ошибку про claim_ttl", err)
+	}
+	f.rc.ClaimTTL = time.Minute
+	f.rc.WorkerID = ""
+	if _, err := f.rc.Once(f.ctx); err == nil || !strings.Contains(err.Error(), "WorkerID") {
+		t.Errorf("пустой WorkerID: %v, ждали ошибку про WorkerID", err)
+	}
+}
+
+// slowGetter — «лента, которая читается дольше lease»: ждёт delay и отдаёт
+// поток, как fakeGetter. Так выглядит позиционирование драйва и передача
+// гигабайт (ADR-0021), на которых срок, выставленный один раз, истёк бы.
+type slowGetter struct {
+	stream  []byte
+	delay   time.Duration
+	started chan struct{}
+}
+
+func (s *slowGetter) Get(op, id uuid.UUID, w io.Writer) (*mover.Result, error) {
+	close(s.started)
+	time.Sleep(s.delay)
+	if _, err := w.Write(s.stream); err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(s.stream)
+	return &mover.Result{Code: mover.CodeOK, State: mover.StateDone, SHA256: hex.EncodeToString(sum[:])}, nil
+}
+
+// Чтение ленты длится дольше lease (ревью S5): воркер продлевает захват
+// каждую треть срока, и за всё чтение второй воркер не получает пачку,
+// attempts не растёт, итог — restored. Без продления lease истёк бы посреди
+// чтения: второй воркер перехватил бы строку (попытка +1, та же лента
+// читается дважды), а первый потерял бы право публиковать результат.
+// Два параллельных воркера здесь обязательны: свойство про них двоих.
+func TestRecallLeaseRenewalBlocksSecondWorker(t *testing.T) {
+	f := newFixture(t)
+
+	packID := f.pack(t)
+	id, member := f.object(t, packID, 0, 0, []byte("долгое чтение ленты"))
+	f.replaceStream(t, packID, member)
+
+	// lease 300 мс, чтение 700 мс — больше двух сроков; heartbeat тикает
+	// раз в треть срока (100 мс) и удерживает строку за A.
+	slow := &slowGetter{stream: member, delay: 700 * time.Millisecond, started: make(chan struct{})}
+	rcA := &recall.Recall{
+		Meta: f.m, Get: slow, Cache: f.cache, Keys: f.vault,
+		WorkerID: "test/A", BatchMax: 10, ClaimTTL: 300 * time.Millisecond,
+		MaxAttempts: 3, RetryBackoff: time.Second,
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		n, err := rcA.Once(f.ctx)
+		if err != nil {
+			t.Errorf("проход A: %v", err)
+		}
+		done <- n
+	}()
+	<-slow.started // A захватил пачку и стоит в чтении
+
+	// Пока A читает, второй воркер ходит по очереди и не находит ничего:
+	// несколько попыток покрывают весь срок чтения, а не один тик.
+	for i := 0; i < 5; i++ {
+		time.Sleep(100 * time.Millisecond)
+		n, err := f.rc.Once(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("второй воркер восстановил %d во время чужого чтения — захват не продлевается", n)
+		}
+	}
+
+	if n := <-done; n != 1 {
+		t.Fatalf("A восстановил %d, ждали 1", n)
+	}
+	if st, att := f.restoreRow(t, id); st != "restored" || att != 0 {
+		t.Errorf("итог %s attempts=%d, ждали restored/0", st, att)
+	}
+	if !f.cache.Exists(id) {
+		t.Error("файла нет в cache после восстановления")
 	}
 }

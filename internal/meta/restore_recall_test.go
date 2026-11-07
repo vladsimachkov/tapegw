@@ -76,7 +76,7 @@ func TestClaimRestorePackQueued(t *testing.T) {
 	packID, _ := recallFixture(t, m, id, 10)
 	requestRestore(t, m, id, 7, "Expedited")
 
-	items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5)
+	items, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestClaimRestorePackQueued(t *testing.T) {
 	}
 
 	// Повтор: 'in_progress' с действующим lease не берётся.
-	again, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5)
+	again, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestClaimRestorePackOrder(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	requestRestore(t, m, fast, 7, "Expedited")
 
-	items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5)
+	items, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestClaimRestorePackOrder(t *testing.T) {
 	if st, att, _ := restoreState(t, m, plain); st != "requested" || att != 0 {
 		t.Errorf("чужая пачка тронута: %s attempts=%d", st, att)
 	}
-	items, err = m.ClaimRestorePack(ctx, 10, time.Minute, 5)
+	items, err = m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestClaimRestorePackTakesWholePack(t *testing.T) {
 	requestRestore(t, m, a, 7, "Standard")
 	requestRestore(t, m, b, 7, "Standard")
 
-	items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5)
+	items, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestClaimRestorePackLeaseExpiry(t *testing.T) {
 	recallFixture(t, m, id, 10)
 	requestRestore(t, m, id, 7, "Standard")
 
-	if items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 2); err != nil || len(items) != 1 {
+	if items, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 2); err != nil || len(items) != 1 {
 		t.Fatalf("первый claim: %d шт., %v", len(items), err)
 	}
 	// Lease «истёк» — строка возвращается, попытка засчитана.
@@ -202,7 +202,7 @@ func TestClaimRestorePackLeaseExpiry(t *testing.T) {
 		`UPDATE restores SET next_try_at = now() - interval '1 second' WHERE object_id = $1`, id); err != nil {
 		t.Fatal(err)
 	}
-	if items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 2); err != nil || len(items) != 1 {
+	if items, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 2); err != nil || len(items) != 1 {
 		t.Fatalf("повторный claim после lease: %d шт., %v", len(items), err)
 	}
 	if st, att, _ := restoreState(t, m, id); st != "in_progress" || att != 1 {
@@ -214,11 +214,94 @@ func TestClaimRestorePackLeaseExpiry(t *testing.T) {
 		`UPDATE restores SET next_try_at = now() - interval '1 second' WHERE object_id = $1`, id); err != nil {
 		t.Fatal(err)
 	}
-	if items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 2); err != nil || len(items) != 0 {
+	if items, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 2); err != nil || len(items) != 0 {
 		t.Fatalf("просроченный на исчерпании отдан: %d шт., %v", len(items), err)
 	}
 	if st, _, _ := restoreState(t, m, id); st != "failed" {
 		t.Errorf("состояние %s, ждали failed", st)
+	}
+}
+
+// Захват закрепляется за воркером (claimed_by), и только владелец продлевает
+// lease и завершает переходы. Без владельца продление неотличимо от чужого
+// захвата, а чтение ленты длится дольше lease: чужое продление вернуло бы в
+// работу строку, которой уже занимается другой, а чужой переход записал бы
+// результат, которого на диске нет.
+func TestRestoreClaimOwner(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+
+	id := tenantWithObjects(t, m, 2, "own1", 10, 1)[0]
+	setEvictState(t, m, id, "archived", false, "-1 hour")
+	recallFixture(t, m, id, 10)
+	requestRestore(t, m, id, 7, "Standard")
+
+	if _, err := m.ClaimRestorePack(ctx, "nodeA/1", 10, time.Minute, 5); err != nil {
+		t.Fatal(err)
+	}
+	claimedBy := func() string {
+		var s string
+		if err := m.Pool.QueryRow(ctx,
+			`SELECT COALESCE(claimed_by, '') FROM restores WHERE object_id = $1`, id).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	if claimedBy() != "nodeA/1" {
+		t.Fatalf("claimed_by = %q, ждали nodeA/1", claimedBy())
+	}
+
+	nextTry := func() time.Time {
+		var ts time.Time
+		if err := m.Pool.QueryRow(ctx,
+			`SELECT next_try_at FROM restores WHERE object_id = $1`, id).Scan(&ts); err != nil {
+			t.Fatal(err)
+		}
+		return ts
+	}
+	ids := []uuid.UUID{id}
+
+	// Чужое продление не проходит и ничего не сдвигает.
+	before := nextTry()
+	if ok, err := m.RenewRestoreClaim(ctx, ids, "nodeB/1", time.Hour); err != nil || ok {
+		t.Errorf("чужак продлил захват: ok=%v err=%v", ok, err)
+	}
+	if !nextTry().Equal(before) {
+		t.Errorf("чужое продление сдвинуло lease: %v → %v", before, nextTry())
+	}
+
+	// Владелец продлевает: lease уезжает в будущее.
+	if ok, err := m.RenewRestoreClaim(ctx, ids, "nodeA/1", time.Hour); err != nil || !ok {
+		t.Errorf("продление владельца: ok=%v err=%v", ok, err)
+	}
+	if d := time.Until(nextTry()); d < 55*time.Minute {
+		t.Errorf("после продления владельца lease через %v, ждали ~час", d)
+	}
+
+	// Чужие переходы не трогают строку: ни restored, ни попытка, ни corrupt.
+	if err := m.MarkRestoreRestored(ctx, id, 7, "nodeB/1"); err != meta.ErrRestoreLost {
+		t.Errorf("restored чужим воркером: %v, ждали ErrRestoreLost", err)
+	}
+	if err := m.MarkRestoreFailure(ctx, id, 5, time.Second, "чужой сбой", "nodeB/1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.MarkRestoreCorrupt(ctx, id, "чужая порча", "nodeB/1"); err != nil {
+		t.Fatal(err)
+	}
+	if st, att, _ := restoreState(t, m, id); st != "in_progress" || att != 0 {
+		t.Errorf("чужие переходы тронули строку: %s attempts=%d", st, att)
+	}
+
+	// Владелец завершает; захват снят — продлить «своё» больше нельзя.
+	if err := m.MarkRestoreRestored(ctx, id, 7, "nodeA/1"); err != nil {
+		t.Fatal(err)
+	}
+	if claimedBy() != "" {
+		t.Errorf("после restored claimed_by = %q, ждали NULL", claimedBy())
+	}
+	if ok, err := m.RenewRestoreClaim(ctx, ids, "nodeA/1", time.Hour); err != nil || ok {
+		t.Errorf("продление завершённой строки: ok=%v err=%v", ok, err)
 	}
 }
 
@@ -251,7 +334,7 @@ func TestClaimRestorePackSkips(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	items, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5)
+	items, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,12 +357,12 @@ func TestMarkRestoreRestored(t *testing.T) {
 	for _, id := range ids {
 		recallFixture(t, m, id, 10)
 		requestRestore(t, m, id, 7, "Standard")
-		if _, err := m.ClaimRestorePack(ctx, 10, time.Minute, 5); err != nil {
+		if _, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 5); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	if err := m.MarkRestoreRestored(ctx, past, 7); err != nil {
+	if err := m.MarkRestoreRestored(ctx, past, 7, "w1"); err != nil {
 		t.Fatal(err)
 	}
 	var expires time.Time
@@ -295,7 +378,7 @@ func TestMarkRestoreRestored(t *testing.T) {
 	}
 
 	// Больший существующий срок не укорачивается семидневным restore.
-	if err := m.MarkRestoreRestored(ctx, big, 7); err != nil {
+	if err := m.MarkRestoreRestored(ctx, big, 7, "w1"); err != nil {
 		t.Fatal(err)
 	}
 	if u := onlineUntil(t, m, big); time.Until(u) < 29*24*time.Hour {
@@ -303,11 +386,11 @@ func TestMarkRestoreRestored(t *testing.T) {
 	}
 
 	// Повтор: строка уже не 'in_progress' — переход не проходит (правило 7).
-	if err := m.MarkRestoreRestored(ctx, past, 7); err != meta.ErrRestoreLost {
+	if err := m.MarkRestoreRestored(ctx, past, 7, "w1"); err != meta.ErrRestoreLost {
 		t.Errorf("повтор вернул %v, ждали ErrRestoreLost", err)
 	}
 	// days < 1 — ошибка вызывающего, не тихий ноль.
-	if err := m.MarkRestoreRestored(ctx, past, 0); err == nil {
+	if err := m.MarkRestoreRestored(ctx, past, 0, "w1"); err == nil {
 		t.Error("days=0 принят")
 	}
 }
@@ -323,11 +406,11 @@ func TestMarkRestoreFailure(t *testing.T) {
 	setEvictState(t, m, id, "archived", false, "-1 hour")
 	recallFixture(t, m, id, 10)
 	requestRestore(t, m, id, 7, "Standard")
-	if _, err := m.ClaimRestorePack(ctx, 10, time.Minute, 3); err != nil {
+	if _, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 3); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := m.MarkRestoreFailure(ctx, id, 3, 30*time.Second, "лента легла"); err != nil {
+	if err := m.MarkRestoreFailure(ctx, id, 3, 30*time.Second, "лента легла", "w1"); err != nil {
 		t.Fatal(err)
 	}
 	st, att, next := restoreState(t, m, id)
@@ -345,10 +428,10 @@ func TestMarkRestoreFailure(t *testing.T) {
 		 WHERE object_id = $1`, id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.ClaimRestorePack(ctx, 10, time.Minute, 3); err != nil {
+	if _, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 3); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.MarkRestoreFailure(ctx, id, 3, 30*time.Second, "лента всё ещё легла"); err != nil {
+	if err := m.MarkRestoreFailure(ctx, id, 3, 30*time.Second, "лента всё ещё легла", "w1"); err != nil {
 		t.Fatal(err)
 	}
 	if st, att, next := restoreState(t, m, id); st != "failed" || att != 3 || next != nil {
@@ -356,7 +439,7 @@ func TestMarkRestoreFailure(t *testing.T) {
 	}
 
 	// Сбой у строки не в 'in_progress' — ничего не меняем (правило 7).
-	if err := m.MarkRestoreFailure(ctx, id, 3, 30*time.Second, "повтор сбоя"); err != nil {
+	if err := m.MarkRestoreFailure(ctx, id, 3, 30*time.Second, "повтор сбоя", "w1"); err != nil {
 		t.Fatal(err)
 	}
 	if st, att, _ := restoreState(t, m, id); st != "failed" || att != 3 {
@@ -364,7 +447,7 @@ func TestMarkRestoreFailure(t *testing.T) {
 	}
 
 	// Нулевой backoff — ошибка сборки вызова, а не «повтор в тот же момент».
-	if err := m.MarkRestoreFailure(ctx, id, 3, 0, "нет backoff"); err == nil {
+	if err := m.MarkRestoreFailure(ctx, id, 3, 0, "нет backoff", "w1"); err == nil {
 		t.Error("нулевой backoff принят")
 	}
 }

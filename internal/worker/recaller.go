@@ -21,8 +21,8 @@ import (
 // драйв recovery-пула, и он возит одну операцию за раз. Остановка — как у
 // мигратора: начатое чтение доходит до конца (контекст без отмены), а если
 // процесс всё-таки ушёл посреди чтения, строки 'in_progress' вернёт в работу
-// lease claim_ttl — колонок воркера у restores нет и продолжения по слоту,
-// как у пачек, здесь нет.
+// lease claim_ttl: чтение ленты идёт с продлением захвата (claimed_by), а
+// у упавшего процесса продление останавливается и lease истекает сам.
 
 // PlanRecallers — mover'ы роли recaller своей библиотеке.
 // Пусто при включённом воркере — ошибка на старте: очередь restore, которую
@@ -149,6 +149,7 @@ func runRecaller(ctx context.Context, deps RecallerDeps, t MoverTarget, id strin
 			Get:          cli,
 			Cache:        deps.Cache,
 			Keys:         deps.Keys,
+			WorkerID:     id,
 			BatchMax:     cfg.Recaller.BatchMaxObjects,
 			ClaimTTL:     cfg.Recaller.ClaimTTL,
 			MaxAttempts:  cfg.Recaller.MaxAttempts,

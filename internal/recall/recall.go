@@ -37,6 +37,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -62,6 +63,9 @@ type Recall struct {
 	Cache *spool.Spool
 	Keys  *keys.Vault
 
+	// WorkerID — идентичность воркера (узел/слот): строки закрепляются за ним,
+	// продление и переходы проверяют владельца. Как WorkerID у migrator.
+	WorkerID     string
 	BatchMax     int
 	ClaimTTL     time.Duration
 	MaxAttempts  int
@@ -86,7 +90,13 @@ func (r *Recall) logger() *slog.Logger {
 // серии пачек оставил бы непрочитанные строки с истекающим lease, и второй
 // драйв перехватывал бы их посреди чтения той же ленты.
 func (r *Recall) Once(ctx context.Context) (int, error) {
-	items, err := r.Meta.ClaimRestorePack(ctx, r.BatchMax, r.ClaimTTL, r.MaxAttempts)
+	if r.WorkerID == "" {
+		return 0, fmt.Errorf("recall: WorkerID не задан: строку нельзя закрепить")
+	}
+	if r.ClaimTTL <= 0 {
+		return 0, fmt.Errorf("recall: claim_ttl %v, должно быть > 0: захват нельзя продлить", r.ClaimTTL)
+	}
+	items, err := r.Meta.ClaimRestorePack(ctx, r.WorkerID, r.BatchMax, r.ClaimTTL, r.MaxAttempts)
 	if err != nil {
 		return 0, err
 	}
@@ -111,6 +121,17 @@ func (r *Recall) recallPack(ctx context.Context, packID uuid.UUID, group []meta.
 		r.failAll(ctx, group, reason)
 		return 0
 	}
+
+	// Lease покрывает всё чтения: heartbeat продлевает захват раз в треть
+	// срока коротким UPDATE вне транзакции (правило 13). Чтение пачки —
+	// ожидание драйва, монтирование и передача гигабайт (ADR-0021), и срок,
+	// выставленный один раз при захвате, истёк бы посреди чтения.
+	ids := make([]uuid.UUID, 0, len(group))
+	for _, it := range group {
+		ids = append(ids, it.ObjectID)
+	}
+	stopLease, leaseLost := r.heartbeat(ctx, ids)
+	defer stopLease()
 
 	// Временные файлы участников: tmp/ буфера — на той же ФС, что и cache,
 	// поэтому Publish поднимет файл rename'ом без EXDEV.
@@ -169,6 +190,15 @@ func (r *Recall) recallPack(ctx context.Context, packID uuid.UUID, group []meta.
 		return 0
 	}
 
+	// Продление не успело за чтением — строки уже чужие (их перехватили по
+	// истечении lease). Результат не публикуется и строки не трогаются:
+	// пачкой занимается другой владелец, у него своё чтение и свой учёт.
+	if leaseLost() {
+		log.Error("recaller: захват потерян во время чтения, результат не публикуется",
+			slog.String("pack", packID.String()))
+		return 0
+	}
+
 	n := 0
 	for i := range stagedItems {
 		s := &stagedItems[i]
@@ -197,7 +227,7 @@ func (r *Recall) recallPack(ctx context.Context, packID uuid.UUID, group []meta.
 			r.fail(ctx, it, "публикация в cache: "+err.Error())
 			continue
 		}
-		if err := r.Meta.MarkRestoreRestored(ctx, it.ObjectID, it.Days); err != nil {
+		if err := r.Meta.MarkRestoreRestored(ctx, it.ObjectID, it.Days, r.WorkerID); err != nil {
 			if errors.Is(err, meta.ErrRestoreLost) {
 				// Строка уже не 'in_progress': объект удалили или строку
 				// перехватил другой воркер (узкая гонка двух выборок).
@@ -278,7 +308,8 @@ func (r *Recall) verify(ctx context.Context, it meta.RestoreItem, f *os.File) er
 }
 
 func (r *Recall) fail(ctx context.Context, it meta.RestoreItem, reason string) {
-	if err := r.Meta.MarkRestoreFailure(ctx, it.ObjectID, r.MaxAttempts, r.RetryBackoff, reason); err != nil {
+	if err := r.Meta.MarkRestoreFailure(ctx, it.ObjectID, r.MaxAttempts, r.RetryBackoff,
+		reason, r.WorkerID); err != nil {
 		r.logger().Error("recaller: учёт попытки",
 			slog.String("id", it.ObjectID.String()), slog.String("err", err.Error()))
 	}
@@ -287,10 +318,44 @@ func (r *Recall) fail(ctx context.Context, it meta.RestoreItem, reason string) {
 // corrupt — отказ проверки при совпавшей сумме пачки: повтор бессилен
 // (байты те же, что записаны при архивации), строка уходит в 'failed' сразу.
 func (r *Recall) corrupt(ctx context.Context, it meta.RestoreItem, reason string) {
-	if err := r.Meta.MarkRestoreCorrupt(ctx, it.ObjectID, reason); err != nil {
+	if err := r.Meta.MarkRestoreCorrupt(ctx, it.ObjectID, reason, r.WorkerID); err != nil {
 		r.logger().Error("recaller: учёт испорченного участника",
 			slog.String("id", it.ObjectID.String()), slog.String("err", err.Error()))
 	}
+}
+
+// heartbeat продлевает захват занятых строк раз в треть срока. Возвращает
+// функцию остановки и проверку «захват потерян» — тот же договор, что у
+// migrator.heartbeat: продление — короткий UPDATE ... WHERE claimed_by = me
+// вне всякой транзакции чтения (правило 13), а если строки уже не наши,
+// дальше незачем: вызывающий обязан не публиковать результат.
+func (r *Recall) heartbeat(ctx context.Context, ids []uuid.UUID) (func(), func() bool) {
+	lost := false
+	done := make(chan struct{})
+	var mu sync.Mutex
+	interval := r.ClaimTTL / 3
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond // NewTicker на нуле паникует
+	}
+	go func() {
+		tick := time.NewTicker(interval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				ok, err := r.Meta.RenewRestoreClaim(ctx, ids, r.WorkerID, r.ClaimTTL)
+				if err != nil || !ok {
+					mu.Lock()
+					lost = true
+					mu.Unlock()
+					return
+				}
+			}
+		}
+	}()
+	return func() { close(done) }, func() bool { mu.Lock(); defer mu.Unlock(); return lost }
 }
 
 func (r *Recall) failAll(ctx context.Context, group []meta.RestoreItem, reason string) {
