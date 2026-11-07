@@ -7,8 +7,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -122,5 +127,171 @@ func TestMoverWritesAndReadsRealPhobos(t *testing.T) {
 	if !bytes.Equal(got.Bytes(), body) {
 		t.Fatalf("вернулись другие байты: %d байт, совпадение с исходными — %v",
 			got.Len(), bytes.Equal(got.Bytes(), body))
+	}
+}
+
+// blockingReader читается вечно: клиент передаёт тело, упирается в него и
+// висит — операция остаётся в staged с неполным буфером.
+type blockingReader struct{}
+
+func (blockingReader) Read([]byte) (int, error) { select {} }
+
+// waitStaged ждёт, пока реестр на диске не зафиксирует принятые байты
+// операции: именно они переживут убийство процесса и станут точкой возобновления.
+func waitStaged(t *testing.T, staging string, op uuid.UUID) {
+	t.Helper()
+	meta := filepath.Join(staging, op.String()+".json")
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(meta)
+		if err == nil {
+			var rec struct {
+				Received int64 `json:"received"`
+			}
+			if json.Unmarshal(b, &rec) == nil && rec.Received > 0 {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("реестр не записал принятые байты — возобновлять нечего")
+}
+
+// Вторая половина замечания про остановку: после обрыва mover обязан
+// подниматься корректно. Процесс убивается по-настоящему (SIGKILL — без
+// обработки сигналов и cleanup), посреди put, на том же staging-каталоге,
+// и повтор той же операции докачивается с принятого смещения. Реестр
+// переживает убийство потому, что persist идёт fsync-ом на каждом кадре.
+func TestMoverKilledMidPutRecovers(t *testing.T) {
+	if os.Getenv("TAPEGW_PHOBOS_TEST") != "1" {
+		t.Skip("нужен настоящий Phobos: TAPEGW_PHOBOS_TEST=1 и стенд ci-dir")
+	}
+	p := movertest.NewPKI(t)
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	cfgPath := filepath.Join(dir, "mover.yaml")
+	cfgYAML := fmt.Sprintf(`phobos:
+  family: dir
+  library: dirlib
+  layout: raid1
+  layout_params: {repl_count: "1"}
+  mover:
+    listen: %q
+    drive: %q
+    role: migrator
+    tls: {cert: %q, key: %q, ca: %q}
+    staging_dir: %q
+    buffer_bytes: 16MiB
+    chunk_size: 64KiB
+    inactivity_timeout: 2m
+    op_timeout: 10m
+`, addr, p.Drive, p.ServerCert, p.ServerKey, p.CA, staging)
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Бинарь собирается из этого же пакета: проверяется артефакт, который
+	// ставят в продакшн, а не пересказ сборки внутри теста.
+	bin := filepath.Join(dir, "tapegw-mover")
+	build := exec.Command("go", "build", "-tags", "phobos", "-o", bin, ".")
+	build.Stderr = os.Stderr
+	if err := build.Run(); err != nil {
+		t.Fatalf("сборка бинаря mover'а: %v", err)
+	}
+
+	start := func() *exec.Cmd {
+		cmd := exec.Command(bin, "-config", cfgPath)
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("запуск mover'а: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+		return cmd
+	}
+	waitListen := func(who string) {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			c, err := net.DialTimeout("tcp", addr, time.Second)
+			if err == nil {
+				c.Close()
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		t.Fatalf("mover (%s) не слушает %s", who, addr)
+	}
+
+	op := uuid.New()
+	full := bytes.Repeat([]byte("kill-mid-put "), 100_000) // ~1.3 MiB
+	sum := sha256.Sum256(full)
+	const partial = 400 << 10
+
+	proc := start()
+	waitListen("первый запуск")
+	cliTLS, err := mover.ClientTLS(p.ClientCert, p.ClientKey, p.CA, p.Drive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1, err := mover.Dial(context.Background(), addr, cliTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		_, _ = c1.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(full)),
+			SHA256: hex.EncodeToString(sum[:]),
+			Body:   io.MultiReader(bytes.NewReader(full[:partial]), blockingReader{})})
+	}()
+
+	waitStaged(t, staging, op)
+
+	if err := proc.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = proc.Wait()
+	// c1 не закрываем: Close ждёт мьютекс, который держит висящий на теле Put,
+	// а отмены у клиента нет (ADR-0021). Соединение умерло вместе с процессом.
+
+	proc2 := start()
+	waitListen("после обрыва")
+	c2, _, err := mover.DialAs(context.Background(), addr, cliTLS, mover.RoleMigrator)
+	if err != nil {
+		t.Fatalf("подключение после обрыва: %v", err)
+	}
+	defer c2.Close()
+	_ = proc2
+
+	// Тот же op, полное тело: сервер обязан ответить resume с принятым
+	// смещением, а не переписать с нуля и не отвергнуть операцию.
+	res, err := c2.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(full)),
+		SHA256: hex.EncodeToString(sum[:]), Body: bytes.NewReader(full)})
+	if err != nil {
+		t.Fatalf("повторный Put после обрыва: %v", err)
+	}
+	if res.Code != mover.CodeOK {
+		t.Fatalf("повторный Put: код %s (%s)", res.Code, res.State)
+	}
+
+	st, err := c2.StatObject(op)
+	if err != nil || st.Code != mover.CodeOK {
+		t.Fatalf("Stat после возобновления: %v / %v", err, st)
+	}
+	var got bytes.Buffer
+	gres, err := c2.Get(uuid.New(), op, &got)
+	if err != nil || gres.Code != mover.CodeOK {
+		t.Fatalf("Get после возобновления: %v / %v", err, gres)
+	}
+	if !bytes.Equal(got.Bytes(), full) {
+		t.Fatal("после возобновления на ленте (dir) лежат другие байты")
 	}
 }

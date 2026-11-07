@@ -414,6 +414,37 @@ func Default() *Config {
 //
 // Пустой path допустим: конфигурация целиком может приехать из окружения.
 func Load(path string) (*Config, error) {
+	cfg, err := loadRaw(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// LoadMover — то же чтение (тот же YAML, те же TAPEGW_*), но проверяется
+// только то, что нужно процессу tapegw-mover (ValidateMover).
+//
+// Отдельная точка входа нужна из-за топологии двух серверов (предложение 0012):
+// на сервере библиотеки у mover'а свой файл конфигурации, и требовать в нём
+// root-учётку S3, DSN Postgres или KEK — значит заставлять оператора
+// подставлять фиктивные значения. Механизм переопределения переменными
+// (правило 9) при этом общий: путь в YAML тот же.
+func LoadMover(path string) (*Config, error) {
+	cfg, err := loadRaw(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.ValidateMover(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// loadRaw — чтение без валидации: YAML поверх дефолтов + TAPEGW_*.
+func loadRaw(path string) (*Config, error) {
 	cfg := Default()
 
 	if path != "" {
@@ -438,10 +469,6 @@ func Load(path string) (*Config, error) {
 	}
 
 	if err := applyEnv(cfg); err != nil {
-		return nil, err
-	}
-
-	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -834,6 +861,11 @@ func (c *Config) ValidateMover() error {
 	}
 
 	m := c.Phobos.Mover
+	switch c.Phobos.Family {
+	case "tape", "dir":
+	default:
+		add("phobos.family: %q, ожидаются tape или dir", c.Phobos.Family)
+	}
 	if m.Listen == "" {
 		add("phobos.mover.listen обязателен")
 	}

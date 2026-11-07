@@ -503,3 +503,36 @@ func TestValidateIgnoresMoverSection(t *testing.T) {
 		t.Fatalf("Validate не должен требовать mover-секцию: %v", err)
 	}
 }
+
+// phobos.mover.* — обычная секция (не именованная коллекция): правило 9
+// распространяется на неё так же, имя переменной выводится из пути в YAML,
+// включая вложенности. Тест держит и скаляр, и размер с суффиксом, и duration,
+// и поле во вложенной структуре tls.
+func TestLoadEnvOverridesMoverSection(t *testing.T) {
+	path := writeConfig(t, "phobos:\n  mover:\n    drive: from-yaml\n")
+
+	t.Setenv("TAPEGW_ROOT_ACCESS", "a")
+	t.Setenv("TAPEGW_ROOT_SECRET", "b")
+	t.Setenv("TAPEGW_IAM_KEK_FILE", testKEKFile)
+	t.Setenv("TAPEGW_PHOBOS_MOVER_DRIVE", "from-env")
+	t.Setenv("TAPEGW_PHOBOS_MOVER_BUFFER_BYTES", "16GiB")
+	t.Setenv("TAPEGW_PHOBOS_MOVER_INACTIVITY_TIMEOUT", "90s")
+	t.Setenv("TAPEGW_PHOBOS_MOVER_TLS_CA", "/etc/tapegw/ca-env.crt")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Phobos.Mover.Drive != "from-env" {
+		t.Errorf("drive = %q, ждали из env", cfg.Phobos.Mover.Drive)
+	}
+	if cfg.Phobos.Mover.BufferBytes != 16*GiB {
+		t.Errorf("buffer_bytes = %v", cfg.Phobos.Mover.BufferBytes)
+	}
+	if cfg.Phobos.Mover.Inactivity != 90*time.Second {
+		t.Errorf("inactivity_timeout = %v", cfg.Phobos.Mover.Inactivity)
+	}
+	if cfg.Phobos.Mover.TLS.CA != "/etc/tapegw/ca-env.crt" {
+		t.Errorf("tls.ca = %q, вложенное поле из env не применено", cfg.Phobos.Mover.TLS.CA)
+	}
+}

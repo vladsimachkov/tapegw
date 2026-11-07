@@ -65,11 +65,11 @@ func run(args []string) error {
 		return nil
 	}
 
-	cfg, err := config.Load(*cfgPath)
+	// LoadMover, а не Load: на сервере библиотеки у mover'а свой конфиг
+	// (предложение 0012), и требовать в нём root S3 или DSN Postgres — значит
+	// плодить фиктивные значения.
+	cfg, err := config.LoadMover(*cfgPath)
 	if err != nil {
-		return err
-	}
-	if err := cfg.ValidateMover(); err != nil {
 		return err
 	}
 
