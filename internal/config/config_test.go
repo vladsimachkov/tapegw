@@ -672,3 +672,47 @@ func TestWorkerSettingsEnvOverrides(t *testing.T) {
 		t.Error("чужой воркер задет")
 	}
 }
+
+// --- S3: janitor ---
+
+func TestJanitorEnvOverrides(t *testing.T) {
+	t.Setenv("TAPEGW_JANITOR_ENABLED", "false")
+	t.Setenv("TAPEGW_JANITOR_INTERVAL", "30s")
+	t.Setenv("TAPEGW_JANITOR_BATCH_MAX_OBJECTS", "50")
+	t.Setenv("TAPEGW_JANITOR_SHUTDOWN_GRACE", "1m")
+	cfg := Default()
+	cfg.Root.Access, cfg.Root.Secret = "a", "b"
+	cfg.IAM.KEKFile = testKEKFile
+	if err := applyEnv(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Janitor.EnabledValue() {
+		t.Error("TAPEGW_JANITOR_ENABLED=false не применён")
+	}
+	if cfg.Janitor.Interval != 30*time.Second {
+		t.Errorf("interval = %v", cfg.Janitor.Interval)
+	}
+	if cfg.Janitor.BatchMaxObjects != 50 {
+		t.Errorf("batch_max_objects = %d", cfg.Janitor.BatchMaxObjects)
+	}
+	if cfg.Janitor.ShutdownGrace != time.Minute {
+		t.Errorf("shutdown_grace = %v", cfg.Janitor.ShutdownGrace)
+	}
+}
+
+func TestJanitorValidate(t *testing.T) {
+	for name, mut := range map[string]func(*Config){
+		"interval":      func(c *Config) { c.Janitor.Interval = 0 },
+		"batch":         func(c *Config) { c.Janitor.BatchMaxObjects = 0 },
+		"grace":         func(c *Config) { c.Janitor.ShutdownGrace = 0 },
+		"отрицательный": func(c *Config) { c.Janitor.Interval = -time.Second },
+	} {
+		cfg := Default()
+		cfg.Root.Access, cfg.Root.Secret = "a", "b"
+		cfg.IAM.KEKFile = testKEKFile
+		mut(cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("%s: ноль/минус прошёл валидацию", name)
+		}
+	}
+}

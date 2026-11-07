@@ -15,6 +15,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/google/uuid"
 	"github.com/versity/versitygw/auth"
 	vbackend "github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
@@ -40,7 +41,18 @@ type TapeGW struct {
 	// nil на этом месте не означает «пишем открытым текстом», а означает, что
 	//PutObject не сможет записать ни одного байта.
 	keys *keys.Vault
+
+	// evictHook — шов для теста окна гонки GET и вытеснения (блокер B1):
+	// вызывается между чтением строки и открытием файла. В бою nil, проверка
+	// != nil ничего не стоит. Тест выполняет в крючке полный проход janitor
+	// и получает окно «строку прочитали online, а открыли файл уже после
+	// unlink» детерминированно, без гонок по таймингам.
+	evictHook func(id uuid.UUID)
 }
+
+// SetEvictHookForTest — подставить крючок в окно между чтением строки и
+// открытием файла. Только для тестов; production-код шов не вызывает никогда.
+func (t *TapeGW) SetEvictHookForTest(fn func(id uuid.UUID)) { t.evictHook = fn }
 
 // compile-time check: не даём интерфейсу versitygw тихо уехать вперёд.
 var _ vbackend.Backend = (*TapeGW)(nil)

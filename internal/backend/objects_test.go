@@ -275,6 +275,80 @@ func TestGetOfflineObject(t *testing.T) {
 	}
 }
 
+// Блокер B1, третий расклад GET и вытеснения: строку прочитали, когда landing
+// ещё был true (и срок не наступил), а открыть файл пришли уже после того, как
+// janitor снял флаг и сделал unlink. Open отдаёт ENOENT, и только перечитывание
+// состояния (spool.evict_retries в objects.go) превращает это в
+// InvalidObjectState, а не в 500.
+//
+// Окно создаётся детерминированно, без гонок по таймингам: шов бэкенда
+// выполняет полный проход janitor ровно между чтением строки и spool.Open.
+func TestGetEvictedBetweenReadAndOpen(t *testing.T) {
+	be, m, land := newBackend(t)
+	ctx := testCtx()
+	mustBucket(t, be)
+	putBody(t, be, "b", "k", "данные")
+
+	var id uuid.UUID
+	if err := m.Pool.QueryRow(ctx, `SELECT id FROM objects WHERE key='k'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	// Читаемое состояние на момент первого чтения строки: archived, но копия
+	// на месте и срок ещё не наступил — иначе GET ушёл бы в InvalidObjectState
+	// до шва, и тест ничего не проверил бы.
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE objects SET state='archived', landing=true, archived_at=now(),
+		        online_until = now() + interval '1 hour' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if !land.Exists(id) {
+		t.Fatal("файла нет в landing — вытеснять нечего, тест ничего не проверит")
+	}
+
+	// Крючок: срок истёк между чтением строки и открытием файла, janitor
+	// отработал. ClaimEvictBatch снимает флаг в транзакции и возвращается уже
+	// после commit, unlink — вне транзакции (ADR-0004). Повтор прохода
+	// идемпотентен: ноль строк и Remove без файла — не ошибка.
+	var hookCalls int
+	var claimed map[uuid.UUID]bool
+	be.SetEvictHookForTest(func(uuid.UUID) {
+		hookCalls++
+		if _, err := m.Pool.Exec(ctx,
+			`UPDATE objects SET online_until = now() - interval '1 hour' WHERE id = $1`, id); err != nil {
+			t.Errorf("истечение срока в крючке: %v", err)
+			return
+		}
+		cands, err := m.ClaimEvictBatch(ctx, 10)
+		if err != nil {
+			t.Errorf("ClaimEvictBatch: %v", err)
+			return
+		}
+		claimed = map[uuid.UUID]bool{}
+		for _, c := range cands {
+			claimed[c.ID] = true
+			if err := land.Remove(c.ID); err != nil {
+				t.Errorf("unlink: %v", err)
+			}
+		}
+	})
+
+	_, err := be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k")})
+	if !isS3Code(err, s3err.ErrInvalidObjectState) {
+		t.Errorf("GET в окне вытеснения: %v, ждали InvalidObjectState, а не 500 и не ENOENT", err)
+	}
+	// Проверки окна: без них зелёный тест мог бы ничего не проверить —
+	// отказ пришёл бы до шва.
+	if hookCalls != 1 {
+		t.Errorf("шов сработал %d раз(а), ждали ровно один: окно не создано", hookCalls)
+	}
+	if !claimed[id] {
+		t.Errorf("крючок не вытеснил объект %v: claimed=%v", id, claimed)
+	}
+	if land.Exists(id) {
+		t.Error("файл остался на диске — окно «открыли после unlink» не создано")
+	}
+}
+
 // Blocker ревью PR #6: HEAD на вытесненный архивный объект обязан быть 200.
 // Клиенты опрашивают ongoing-request именно по HEAD, и если HEAD отдаёт ошибку,
 // весь сценарий restore для них сломан: объект «восстанавливается» выглядит

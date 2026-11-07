@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -107,6 +108,7 @@ s3: {listen: [%q], region: us-east-1}
 spool:
   landing: %q
   cache: %q
+  landing_min_retention: 2s
 phobos:
   family: dir
   library: dirlib
@@ -117,6 +119,8 @@ migrator:
   batch_max_wait: 1s
   claim_ttl: 30s
   shutdown_grace: 60s
+janitor:
+  interval: 1s
 metrics: {listen: %q}
 `, kek, dsn, s3Addr,
 		filepath.Join(dir, "landing"), filepath.Join(dir, "cache"),
@@ -211,6 +215,48 @@ metrics: {listen: %q}
 		t.Fatalf("phobos extent list %s: %v: %s", packID, err, out)
 	}
 	t.Logf("extent list: %s", out)
+
+	// --- S3: срок истёк (landing_min_retention=2s) — janitor сам убирает
+	// файл из landing, HEAD остаётся GLACIER без x-amz-restore, GET отвечает
+	// InvalidObjectState (не ENOENT и не 500) ---
+	var objID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM objects WHERE key = 'big.bin'`).Scan(&objID); err != nil {
+		t.Fatal(err)
+	}
+	landingFile := filepath.Join(dir, "landing", objID.String()[:2], objID.String())
+	waitGone := time.Now().Add(60 * time.Second)
+	for {
+		_, err := os.Stat(landingFile)
+		if os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(waitGone) {
+			t.Fatalf("файл landing не вытеснен за 60 с: err=%v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	head, err := cli.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String("slice"), Key: aws.String("big.bin"),
+	})
+	if err != nil {
+		t.Fatalf("HEAD после вытеснения: %v", err)
+	}
+	if head.StorageClass != "GLACIER" {
+		t.Errorf("storage class %q, ждали GLACIER", head.StorageClass)
+	}
+	if head.Restore != nil {
+		t.Errorf("x-amz-restore=%q, ждали пустой: restore в срезе ещё нет", *head.Restore)
+	}
+	if _, err := cli.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("slice"), Key: aws.String("big.bin"),
+	}); err == nil {
+		t.Fatal("GET вытесненного объекта прошёл — ждали InvalidObjectState")
+	} else {
+		var apiErr interface{ ErrorCode() string }
+		if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "InvalidObjectState" {
+			t.Errorf("GET вытесненного: %v, ждали InvalidObjectState", err)
+		}
+	}
 
 	// --- остановка по сигналу: чистый выход, не паника и не вешалка ---
 	if err := gw.Process.Signal(syscall.SIGTERM); err != nil {
