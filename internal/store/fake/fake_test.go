@@ -372,3 +372,59 @@ func TestGetTruncatesFile(t *testing.T) {
 		t.Errorf("в файле %q: хвост прошлых данных не обрезан", got)
 	}
 }
+
+// TestIncompleteMatchesDirSemantics — неполная копия в fake устроена так же,
+// как на семействе dir: объект есть, экстентов нет, Complete = false. Иначе
+// общий набор сценариев проверял бы на fake одно, а на настоящем Phobos — другое.
+func TestIncompleteMatchesDirSemantics(t *testing.T) {
+	ctx := context.Background()
+	s := fake.New()
+	s.InjectFault("put", &fake.Fault{FailOn: 1})
+
+	id := uuid.New()
+	res := s.Put(ctx, []store.PutItem{{ID: id, File: putFile(t, "abc"), Size: 3}},
+		store.PutOptions{Family: "dir"})
+	if res[0].Err == nil {
+		t.Fatal("ожидался обрыв")
+	}
+
+	meta, err := s.Stat(ctx, id)
+	if err != nil {
+		t.Fatalf("объект после обрыва обязан находиться: %v", err)
+	}
+	if meta.Complete {
+		t.Error("неполная копия помечена целой")
+	}
+	if len(meta.Extents) != 0 {
+		t.Errorf("экстенты неполной копии: %+v — на dir их нет вовсе", meta.Extents)
+	}
+}
+
+// TestMarkPendingIsExplicit — состояние «экстент есть, но не sync» на dir
+// невоспроизводимо, поэтому в fake оно включается явно и проверяется здесь,
+// а на ленте станет обычным сценарием в 1a-3.
+func TestMarkPendingIsExplicit(t *testing.T) {
+	ctx := context.Background()
+	s := fake.New()
+	id := uuid.New()
+	if res := s.Put(ctx, []store.PutItem{{ID: id, File: putFile(t, "abc"), Size: 3}},
+		store.PutOptions{Family: "dir"}); res[0].Err != nil {
+		t.Fatal(res[0].Err)
+	}
+
+	s.MarkPending(id)
+	meta, err := s.Stat(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Complete {
+		t.Error("pending-копия помечена целой")
+	}
+	if len(meta.Extents) != 1 || meta.Extents[0].State != "pending" {
+		t.Fatalf("экстенты: %+v", meta.Extents)
+	}
+	err = store.CheckExtents(meta.Extents, 3, 1)
+	if err == nil || !strings.Contains(err.Error(), "sync") {
+		t.Errorf("CheckExtents: %v — хотим отказ с указанием на sync", err)
+	}
+}
