@@ -346,7 +346,8 @@ func (t *TapeGW) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3
 	return out, nil
 }
 
-// GetObject читает содержимое с диска.
+// GetObject читает содержимое с диска: из landing, а если его нет — из cache
+// восстановленной копии (S5, «restored и не истёк → из cache»).
 //
 // Гонка с вытеснением решается по ADR-0004: мы могли решить, что объект онлайн,
 // а спул уже снял флаг и удаляет файл. Поэтому при ENOENT состояние перечитывается
@@ -377,8 +378,21 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 			}
 			return nil, t.objectErr(ctx, bucket, tenant, err)
 		}
-		if !obj.ReadableFromDisk(time.Now()) {
-			return nil, s3err.GetBucketErr(s3err.ErrInvalidObjectState, bucket)
+		now := time.Now()
+		fromCache := false
+		if !obj.ReadableFromDisk(now) {
+			// Landing-копии нет — но в cache могла жить восстановленная
+			// копия (S5): 'restored' и срок не истёк. То же условие, что в
+			// заголовке x-amz-restore: дата в заголовке и решение о чтении
+			// не могут разойтись.
+			r, err := t.meta.GetRestore(ctx, tenant, obj.ID)
+			if err != nil && !errors.Is(err, meta.ErrNotFound) {
+				return nil, fmt.Errorf("restore для %s: %w", obj.ID, err)
+			}
+			if r == nil || !r.Active(now) {
+				return nil, s3err.GetBucketErr(s3err.ErrInvalidObjectState, bucket)
+			}
+			fromCache = true
 		}
 
 		// Условные заголовки чтения. Контроллер versitygw их не вычисляет — он
@@ -406,7 +420,19 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 			t.evictHook(obj.ID)
 		}
 
-		f, err := t.spool.Open(obj.ID)
+		buf := t.spool
+		if fromCache {
+			buf = t.cache
+			if buf == nil {
+				// Restore активен, а буфера под него нет — это ошибка сборки
+				// процесса, а не состояние объекта: наружу отдаём 500, а не
+				// правдоподобный InvalidObjectState.
+				return nil, fmt.Errorf("restore активен у %s/%s (id %s), но cache не настроен",
+					bucket, key, obj.ID.String())
+			}
+		}
+
+		f, err := buf.Open(obj.ID)
 		if errors.Is(err, os.ErrNotExist) {
 			// Файл исчез между решением о читаемости и open. Перечитываем
 			// состояние: если объект вытеснили, это штатный InvalidObjectState.
@@ -418,7 +444,16 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 			// неудачного open: иначе вытеснение, закоммитившееся между чтением
 			// строки и открытием файла, было бы записано клиенту как 500.
 			fresh, _, rerr := t.readVersion(ctx, tenant, bucket, key, input.VersionId)
-			if rerr == nil && !fresh.ReadableFromDisk(time.Now()) {
+			freshNow := time.Now()
+			readable := rerr == nil && fresh.ReadableFromDisk(freshNow)
+			if !readable && fromCache {
+				// Для cache-копии «ещё читаемо» — это активный restore:
+				// janitor снимает строку и файл вместе, но между commit
+				// выборки и unlink GET мог зайти сюда.
+				r2, gerr := t.meta.GetRestore(ctx, tenant, obj.ID)
+				readable = gerr == nil && r2 != nil && r2.Active(freshNow)
+			}
+			if !readable {
 				return nil, s3err.GetBucketErr(s3err.ErrInvalidObjectState, bucket)
 			}
 			// Состояние обещает объект на диске, а файла нет. Это не штатный
@@ -426,6 +461,13 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 			// Промолчать и ответить InvalidObjectState — значит выдать потерю
 			// данных за нормальное состояние, поэтому при сомнении громкая
 			// ошибка: ERROR в журнал и InternalError (500) клиенту.
+			if fromCache {
+				slog.Error("файл cache отсутствует у объекта с активным restore",
+					"bucket", bucket, "key", key, "id", obj.ID.String(),
+					"state", obj.State, "reread_err", rerr, "open_err", err)
+				return nil, fmt.Errorf("cache file missing for restored object %s/%s (id %s): %w",
+					bucket, key, obj.ID.String(), err)
+			}
 			slog.Error("файл landing отсутствует у онлайн-объекта",
 				"bucket", bucket, "key", key, "id", obj.ID.String(),
 				"state", obj.State, "reread_err", rerr, "open_err", err)

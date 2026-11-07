@@ -74,6 +74,9 @@ type harness struct {
 	log  *slog.Logger
 	ctx  context.Context
 	land *spool.Spool
+	// cache — буфер восстановленных копий: janitor-тесты проверяют вытеснение
+	// истёкших restore, recaller-тесты — публикацию в него.
+	cache *spool.Spool
 }
 
 func newHarness(t *testing.T) *harness {
@@ -105,6 +108,10 @@ func newHarness(t *testing.T) *harness {
 	cfg.Migrator.ClaimTTL = 5 * time.Second
 	cfg.Migrator.ShutdownGrace = 10 * time.Second
 
+	cache, err := spool.Open(filepath.Join(t.TempDir(), "cache"))
+	if err != nil {
+		t.Fatalf("spool.Open(cache): %v", err)
+	}
 	land, err := spool.Open(filepath.Join(t.TempDir(), "landing"))
 	if err != nil {
 		t.Fatal(err)
@@ -116,9 +123,9 @@ func newHarness(t *testing.T) *harness {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	return &harness{
-		be: backend.New(m, land, cfg, keys.New(m, ring)),
+		be: backend.New(m, land, cache, cfg, keys.New(m, ring)),
 		m:  m, env: env, cfg: cfg, log: log,
-		ctx: context.Background(), land: land,
+		ctx: context.Background(), land: land, cache: cache,
 	}
 }
 

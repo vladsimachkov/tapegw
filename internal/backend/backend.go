@@ -37,6 +37,10 @@ type TapeGW struct {
 	meta  *meta.Meta
 	cfg   *config.Config
 	spool *spool.Spool
+	// cache — буфер восстановленных копий (S5): GET читает из него, когда
+	// landing-копии нет, а restore активен. Флаг landing recaller не трогает,
+	// поэтому два буфера различаются именно здесь, а не состоянием строки.
+	cache *spool.Spool
 	// keys — хранилище ключей шифрования (ADR-0014). Шифрование обязательное:
 	// nil на этом месте не означает «пишем открытым текстом», а означает, что
 	//PutObject не сможет записать ни одного байта.
@@ -60,13 +64,16 @@ var _ vbackend.Backend = (*TapeGW)(nil)
 // New собирает бэкенд. meta обязателен: без метаданных бэкенд не может
 // ответить ни на один запрос. spool — дисковый буфер landing; без него PutObject
 // некуда писать, поэтому nil на месте spool означает «объектные операции
-// выключены» и они честно вернут NotImplemented.
-func New(m *meta.Meta, s *spool.Spool, cfg *config.Config, vault *keys.Vault) *TapeGW {
+// выключены» и они честно вернут NotImplemented. cache — буфер восстановленных
+// копий (S5); nil на его месте не отключает restore молча: GET из cache
+// загремит ошибкой, а не притворится InvalidObjectState.
+func New(m *meta.Meta, s, cache *spool.Spool, cfg *config.Config, vault *keys.Vault) *TapeGW {
 	return &TapeGW{
 		BackendUnsupported: &vbackend.BackendUnsupported{},
 		meta:               m,
 		cfg:                cfg,
 		spool:              s,
+		cache:              cache,
 		keys:               vault,
 	}
 }

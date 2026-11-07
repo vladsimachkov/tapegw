@@ -40,6 +40,14 @@ func newBackend(t *testing.T) (*backend.TapeGW, *meta.Meta, *spool.Spool) {
 // например уменьшить s3.max_object_size, чтобы проверить EntityTooLarge.
 func newBackendWith(t *testing.T, mutate func(*config.Config)) (*backend.TapeGW, *meta.Meta, *spool.Spool) {
 	t.Helper()
+	be, m, land, _ := newBackendFull(t, mutate)
+	return be, m, land
+}
+
+// newBackendFull — тот же бэкенд, но возвращает и cache-буфер: тесты S5
+// кладут в него восстановленную копию и проверяют, что GET читает оттуда.
+func newBackendFull(t *testing.T, mutate func(*config.Config)) (*backend.TapeGW, *meta.Meta, *spool.Spool, *spool.Spool) {
+	t.Helper()
 	m := testdb.Connect(t)
 	testdb.Clean(t, m)
 
@@ -53,7 +61,11 @@ func newBackendWith(t *testing.T, mutate func(*config.Config)) (*backend.TapeGW,
 	if err != nil {
 		t.Fatalf("spool.Open: %v", err)
 	}
-	return backend.New(m, land, cfg, keys.New(m, testKeyRing(t))), m, land
+	cache, err := spool.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("spool.Open(cache): %v", err)
+	}
+	return backend.New(m, land, cache, cfg, keys.New(m, testKeyRing(t))), m, land, cache
 }
 
 // testKEK — фиксированный KEK всего пакета бэкенд-тестов.

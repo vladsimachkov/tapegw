@@ -157,8 +157,9 @@ CREATE TABLE upload_parts (
 | in\_progress | restored | recaller | файл в cache, размер и ETag сверены |
 | in\_progress | requested | recaller | ошибка и `attempts < max` |
 | in\_progress | failed | recaller | `attempts = max` |
+| in\_progress | in\_progress / failed | recaller | `claim_ttl` истёк (процесс умер посреди чтения): захват перехвачен, попытка засчитана |
 | restored | restored | backend | повторный RestoreObject продлевает `expires_at` |
-| restored | нет записи | janitor | `expires_at < now()`, файл удалён |
+| restored | нет записи | janitor | `online_until < now()` (обещанная дата, ADR-0003; инвариант `online_until >= expires_at`), строка удалена в транзакции, файл снят после commit |
 | любое | нет записи | backend | объект ушёл в `deleting`: строка `restores` удаляется в той же транзакции, иначе recaller вечно видит restore у удалённого объекта, а метрики очередей врут |
 
 ## Потоки запросов
@@ -227,8 +228,9 @@ CREATE TABLE upload_parts (
 | in\_progress | restored | recaller | файл в cache, размер и ETag сверены |
 | in\_progress | requested | recaller | ошибка и `attempts < max` |
 | in\_progress | failed | recaller | `attempts = max` |
+| in\_progress | in\_progress / failed | recaller | `claim_ttl` истёк (процесс умер посреди чтения): захват перехвачен, попытка засчитана |
 | restored | restored | backend | повторный RestoreObject продлевает `expires_at` |
-| restored | нет записи | janitor | `expires_at < now()`, файл удалён |
+| restored | нет записи | janitor | `online_until < now()` (обещанная дата, ADR-0003; инвариант `online_until >= expires_at`), строка удалена в транзакции, файл снят после commit |
 | любое | нет записи | backend | объект ушёл в `deleting`: строка `restores` удаляется в той же транзакции, иначе recaller вечно видит restore у удалённого объекта, а метрики очередей врут |
 
 ## Потоки запросов
@@ -283,11 +285,11 @@ CREATE TABLE upload_parts (
 
 **Recaller**
 
-1. Взять батч `requested` с `FOR UPDATE SKIP LOCKED`, порядок: `tier` (Expedited → Standard → Bulk), затем `requested_at`.
-2. Проверить место в кэше: если `cache.used + сумма размеров > cache.high_watermark`, сначала вытеснить истёкшие restore, иначе ждать (backpressure, не ошибка).
+1. Взять батч `requested` с `FOR UPDATE SKIP LOCKED`, порядок: приоритет tier (Expedited → Standard → Bulk), затем `requested_at`. Захват строки ограничен `recaller.claim_ttl` (lease в `next_try_at`): процесс, умерший посреди чтения ленты, не оставляет вечно длящий `in_progress` — просроченный захват перехватывается с засчитанной попыткой.
+2. Проверить место в кэше: если `cache.used + сумма размеров > cache.high_watermark`, сначала вытеснить истёкшие restore, иначе ждать (backpressure, не ошибка). *Пункт ещё не реализован — S5 читает без проверки watermark.*
 3. Если Phobos API отдаёт ленту и смещение объекта — отсортировать батч по (лента, смещение). Иначе положиться на переупорядочивание в LRS (спайк M0).
-4. `phobos_get` батчем в файлы `cache/tmp/<uuid>`, проверить размер и ETag (для одиночных PUT — md5), `fsync`, `rename` в `cache/<2 hex>/<uuid>`.
-5. Строка → `restored`, `restored_at`, `expires_at = restored_at + days`. Ошибки — ретраи как у migrator, затем `failed`.
+4. Участники одной пачки читаются одним потоком: `phobos_get` копии пачки (oid из `archive_copies`, сумма `sha256` той же строки сверяется с отданными байтами), участник извлекается в `cache/tmp/<uuid>`, затем проверяется по-своему: длина файла, полное расшифрование (AEAD-теги сегментов и манифеста, ADR-0019), открытый размер и ETag (md5 для одиночных PUT). Не прошёл — в `restored` не входим, ошибка в журнал.
+5. `fsync`, `rename` в `cache/<2 hex>/<uuid>` — и только потом строка → `restored`, `restored_at`, `expires_at = restored_at + days`, `online_until = max(online_until, restored_at + days)` (срок от завершения, ADR-0003). Порядок — ADR-0004 наоборот вытеснению: файл на диске раньше строки, которая на него ссылается. Ошибки — ретраи как у migrator (backoff `recaller.retry_backoff`), затем `failed`.
 
 **GetObject**
 
@@ -514,10 +516,13 @@ migrator:
   batch_max_bytes: 200GiB
   batch_max_wait: 15m
   max_attempts: 10
+  retry_backoff: 30s
 recaller:
   batch_max_objects: 500
   batch_max_wait: 5m
   max_attempts: 10
+  retry_backoff: 30s
+  claim_ttl: 30m                       # lease захвата строки restores: чтение пачки с ленты минутное
 metrics: {listen: ":9464"}
 ```
 
