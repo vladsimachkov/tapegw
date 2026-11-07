@@ -670,7 +670,7 @@ func TestFinishRequiresOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := m.FinishPackArchive(ctx, packID, []meta.Placement{{Version: ids[0], Offset: 0, Length: 10}},
-		"pool:archive", packID.String(), 1, 1, make([]byte, 32), 0, "не-владелец"); err == nil {
+		"pool:archive", packID.String(), 1, 1, make([]byte, 32), 0, "не-владелец", time.Hour); err == nil {
 		t.Error("пачку завершил не владелец захвата")
 	}
 }
@@ -1173,5 +1173,99 @@ func TestStatTwoReplicasBlocksReplCount(t *testing.T) {
 	}
 	if !strings.Contains(reason, "repl_count") {
 		t.Errorf("причина %q: хотим указание на repl_count, а не «размер не тот»", reason)
+	}
+}
+
+// ADR-0003: при переходе в archived online_until продлевается до
+// max(online_until, archived_at + landing_min_retention). Без продления
+// дата, которую HEAD показывал для pending-объекта («не раньше
+// now()+retention»), оказалась бы нарушена: janitor вытеснил бы копию по
+// исходной дате PUT, раньше обещанного.
+func TestFinishArchivedExtendsOnlineUntil(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "ext", 1)
+	a, _ := archiver(t, m, ids[0])
+	tx, packID, err := m.BeginPackArchive(ctx, 1, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SealPack(ctx, packID, []meta.Placement{{Version: ids[0], Offset: 0, Length: 10}},
+		4096, a.WorkerID, a.ClaimTTL); err != nil {
+		t.Fatal(err)
+	}
+	// Исходный срок уже истёк: migrator отстал дольше retention — ровно
+	// случай, где без продления janitor вытеснил бы сразу.
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE objects SET online_until = now() - interval '1 hour' WHERE id = $1`, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.FinishPackArchive(ctx, packID, []meta.Placement{{Version: ids[0], Offset: 0, Length: 10}},
+		"pool:archive", packID.String(), 1, 1, make([]byte, 32), 0, a.WorkerID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	var until time.Time
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT online_until FROM objects WHERE id = $1`, ids[0]).Scan(&until); err != nil {
+		t.Fatal(err)
+	}
+	if !until.After(time.Now().Add(55 * time.Minute)) {
+		t.Errorf("online_until %v не продлён на retention при архивации", until)
+	}
+
+	// И janitor обязан пройти мимо: объект archived, но срок не наступил.
+	got, err := m.ClaimEvictBatch(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range got {
+		if c.ID == ids[0] {
+			t.Error("объект взят на вытеснение сразу после архивации — обещанная дата нарушена")
+		}
+	}
+}
+
+// GREATEST: больший существующий срок не укорачивается меньшим retention.
+func TestFinishArchivedKeepsLargerOnlineUntil(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "ext2", 1)
+	a, _ := archiver(t, m, ids[0])
+	tx, packID, err := m.BeginPackArchive(ctx, 1, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SealPack(ctx, packID, []meta.Placement{{Version: ids[0], Offset: 0, Length: 10}},
+		4096, a.WorkerID, a.ClaimTTL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE objects SET online_until = now() + interval '30 days' WHERE id = $1`, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.FinishPackArchive(ctx, packID, []meta.Placement{{Version: ids[0], Offset: 0, Length: 10}},
+		"pool:archive", packID.String(), 1, 1, make([]byte, 32), 0, a.WorkerID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var until time.Time
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT online_until FROM objects WHERE id = $1`, ids[0]).Scan(&until); err != nil {
+		t.Fatal(err)
+	}
+	if !until.After(time.Now().Add(29 * 24 * time.Hour)) {
+		t.Errorf("срок укорочен часовым retention: %v", until)
 	}
 }

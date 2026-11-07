@@ -6,6 +6,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/valyala/fasthttp"
 	"github.com/versity/versitygw/s3err"
 
 	"github.com/vladsimachkov/tapegw/internal/meta"
@@ -19,11 +20,10 @@ import (
 // клиент видит по x-amz-restore в следующем HEAD.
 //
 // Версионирование: адрес версии — тот же путь readVersion, что у GET и HEAD
-// (включая versionId=null). Оговорка: контроллер versitygw v1.10.0
-// (s3api/controllers/object-post.go: RestoreObject) не переносит query
-// versionId в input, поэтому поверх HTTP запрос всегда адресует текущую
-// версию; поле input.VersionId при этом честно используется — если versitygw
-// добавит проброс, бэкенд уже готов.
+// (включая versionId=null). Контроллер versitygw v1.10.0 не переносит query
+// versionId в input, поэтому бэкенд дочитывает его из строки запроса сам
+// (restoreVersionID) — иначе restore нетекущей версии молча восстанавливал
+// бы текущую, а для бакетов с версионированием это основной сценарий.
 
 // Границы срока восстановления — протокольный предел AWS Glacier (1..365
 // дней), а не настройка развертывания, поэтому константы, а не конфиг
@@ -40,10 +40,17 @@ func (t *TapeGW) RestoreObject(ctx context.Context, input *s3.RestoreObjectInput
 		return err
 	}
 
+	// Контроллер versitygw не переносит versionId в input (проверено по
+	// s3api/controllers/object-post.go v1.10.0), поэтому читаем запрос напрямую
+	// — тот же приём, что с заголовком обхода governance в DeleteObject (#35).
+	// Без этого restore нетекущей версии отвечал бы 200 и молча ставил в
+	// очередь текущую версию: клиент ждал бы не те данные.
+	versionID := restoreVersionID(ctx, input)
+
 	// Страж раньше всего остального: чужой объект — AccessDenied, и ни кодом
 	// состояния, ни валидацией тела этого не перекрыть (ADR-0017).
-	byID := input.VersionId != nil && *input.VersionId != ""
-	obj, vid, err := t.readVersion(ctx, tenant, bucket, key, input.VersionId)
+	byID := versionID != nil && *versionID != ""
+	obj, vid, err := t.readVersion(ctx, tenant, bucket, key, versionID)
 	if err != nil {
 		if errors.Is(err, errDeleteMarker) {
 			_, _, merr := markerRead(vid, byID, bucket)
@@ -78,6 +85,27 @@ func (t *TapeGW) RestoreObject(ctx context.Context, input *s3.RestoreObjectInput
 		// (например, DELETE параллельно) — отвечаем тем же кодом, что и по
 		// прочитанной строке.
 		return s3err.GetBucketErr(s3err.ErrInvalidObjectState, bucket)
+	}
+	return nil
+}
+
+// restoreVersionID — версия из запроса: сначала input.VersionId (на случай,
+// когда versitygw добавит проброс), затем query versionId из исходного
+// запроса, иначе nil — текущая версия. Приём с raw-запросом — тот же, что в
+// bypassGovernanceRequested (delete.go, #35): бэкенду versitygw передаёт
+// контекстом именно *fasthttp.RequestCtx.
+func restoreVersionID(ctx context.Context, input *s3.RestoreObjectInput) *string {
+	if input.VersionId != nil && *input.VersionId != "" {
+		return input.VersionId
+	}
+	rc, ok := ctx.(*fasthttp.RequestCtx)
+	if !ok {
+		// Не HTTP-контекст (прямой вызов бэкенда): query читать негде,
+		// остаётся input — то есть текущая версия.
+		return nil
+	}
+	if v := string(rc.Request.URI().QueryArgs().Peek("versionId")); v != "" {
+		return &v
 	}
 	return nil
 }

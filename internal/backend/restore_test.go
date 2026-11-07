@@ -1,12 +1,15 @@
 package backend_test
 
 import (
+	"net"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
+	"github.com/valyala/fasthttp"
+	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
 )
 
@@ -207,5 +210,74 @@ func TestRestoreObjectVersionId(t *testing.T) {
 	in.VersionId = &foreign
 	if err := be.RestoreObject(ctx, in); !isS3Code(err, s3err.ErrNoSuchVersion) {
 		t.Errorf("restore по несуществующей версии: %v, ждали NoSuchVersion", err)
+	}
+}
+
+// Контроллер versitygw v1.10.0 не кладёт query versionId в input (проверено
+// по object-post.go), и без дочитывания запроса restore нетекущей версии
+// молча поставил бы в очередь текущую: 200 есть, а нужной версии в очереди
+// нет. Здесь ровно та картина, которую контроллер передаёт бэкенду:
+// input.VersionId == nil, а versionId — в строке запроса.
+//
+// Запрос идёт через in-process fasthttp-сервер: одиночный &fasthttp.RequestCtx{}
+// в бою не используется — его Done() паникует без сервера, а pgx зовёт Done()
+// на каждом запросе (та же причина, из-за которой не подделывался заголовок
+// в #35). Здесь контекст обработчика — настоящий. Сквозной вариант —
+// e2e TestRestoreVersionViaHTTPAddressesThatVersion.
+func TestRestoreObjectVersionIdFromQuery(t *testing.T) {
+	be, m, _ := newBackend(t)
+	ctx := testCtx()
+	mustBucket(t, be)
+	if err := be.PutBucketVersioning(ctx, "b", types.BucketVersioningStatusEnabled); err != nil {
+		t.Fatal(err)
+	}
+	putBody(t, be, "b", "k", "старые данные")
+	var oldID uuid.UUID
+	if err := m.Pool.QueryRow(ctx, `SELECT id FROM objects WHERE key='k'`).Scan(&oldID); err != nil {
+		t.Fatal(err)
+	}
+	putBody(t, be, "b", "k", "новые данные") // текущая версия — другая строка
+
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE objects SET state='archived', landing=false, archived_at=now(),
+		        online_until = now() - interval '1 hour' WHERE id=$1`, oldID); err != nil {
+		t.Fatal(err)
+	}
+
+	// input.VersionId пуст — как кладёт контроллер; версия только в query.
+	input := restoreInput("b", "k", 7, types.TierStandard)
+	errCh := make(chan error, 1)
+	srv := &fasthttp.Server{Handler: func(rc *fasthttp.RequestCtx) {
+		rc.SetUserValue("account", auth.Account{Access: "tester", Role: auth.RoleUser, ProjectID: testProjectID})
+		rc.SetUserValue("bucket-owner", auth.Account{Access: "tester", Role: auth.RoleUser, ProjectID: testProjectID})
+		errCh <- be.RestoreObject(rc, input)
+	}}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer ln.Close()
+
+	if _, _, err := fasthttp.GetTimeout(nil,
+		"http://"+ln.Addr().String()+"/b/k?restore&versionId="+oldID.String(), 10*time.Second); err != nil {
+		t.Fatalf("запрос: %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("restore по query versionId: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("обработчик не отработал")
+	}
+
+	var queued uuid.UUID
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT object_id FROM restores`).Scan(&queued); err != nil {
+		t.Fatalf("очередь пуста — проигнорирован versionId из запроса: %v", err)
+	}
+	if queued != oldID {
+		t.Errorf("в очереди %s, ждали запрошенную версию %s", queued, oldID)
 	}
 }

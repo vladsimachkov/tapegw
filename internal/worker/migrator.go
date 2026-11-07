@@ -191,11 +191,12 @@ func runMigrator(ctx context.Context, deps MigratorDeps, t MoverTarget, id strin
 			// Одна копия по тегу пула — временное состояние среза; политика
 			// из двух копий в боевом пути — пункт «Две копии в боевом пути»
 			// плана после среза.
-			Specs:    []string{copySpec},
-			SpecTags: attrs,
-			WorkerID: id,
-			ClaimTTL: cfg.Migrator.ClaimTTL,
-			Log:      log,
+			Specs:               []string{copySpec},
+			SpecTags:            attrs,
+			WorkerID:            id,
+			ClaimTTL:            cfg.Migrator.ClaimTTL,
+			LandingMinRetention: cfg.Spool.LandingMinRetention,
+			Log:                 log,
 		}
 
 		// Сначала продолжение запечатанных пачек этого слота: их участники уже

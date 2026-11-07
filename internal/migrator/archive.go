@@ -92,6 +92,11 @@ type Archiver struct {
 	// продолжения.
 	WorkerID string
 	ClaimTTL time.Duration
+
+	// LandingMinRetention — на сколько продлевается online_until при переходе
+	// в archived (ADR-0003): показанная в HEAD дата обязана выполняться и
+	// после архивации, иначе janitor вытеснит копию раньше обещания.
+	LandingMinRetention time.Duration
 }
 
 // sendPack — одна попытка put. Ошибка здесь означает «итог неизвестен», а не
@@ -373,7 +378,7 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 	if err := a.writeExtraCopies(ctx, packID, plan, attrs); err != nil {
 		return nil, err
 	}
-	done, err := a.Meta.ArchivePackWhenCopiesDone(ctx, packID, metaPlacements(placements), a.copySpecs(), a.WorkerID)
+	done, err := a.Meta.ArchivePackWhenCopiesDone(ctx, packID, metaPlacements(placements), a.copySpecs(), a.WorkerID, a.LandingMinRetention)
 	if err != nil {
 		return nil, err
 	}
