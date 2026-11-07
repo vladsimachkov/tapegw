@@ -206,6 +206,9 @@ func runMigrator(ctx context.Context, deps MigratorDeps, t MoverTarget, id strin
 			log.Info("migrator: продолжены пачки", slog.String("слот", id), slog.Int("пачек", n))
 		}
 
+		// Временно: единственный пул (meta.DefaultPoolID). При втором пуле
+		// (этап T2, ADR-0013) цикл обязан стать попульным — иначе объекты
+		// второго пула молча никогда не попадут в батч.
 		cands, err := deps.Meta.ClaimMigrationBatch(ctx, meta.DefaultPoolID, lim)
 		if err != nil {
 			log.Error("migrator: выборка батча", slog.String("слот", id), slog.String("err", err.Error()))
