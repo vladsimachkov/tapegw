@@ -1,0 +1,57 @@
+# systemd-юнит tapegw-mover — процесса, единственного в системе с cgo и
+# libphobos (ADR-0007). На сервере библиотеки; в топологии «один хост»
+# (предложение 0012) совпадает с юнитом tapegw по машине, но не по содержимому.
+#
+# Конфиг — та же YAML, секция phobos.mover (ADR-0021). Таймауты и буфер —
+# из неё, не из юнита.
+
+[Unit]
+Description=tapegw mover — Phobos data path worker
+Documentation=file:/usr/share/doc/tapegw/ARCHITECTURE.md
+After=network-online.target phobosd.service
+Requires=network-online.target phobosd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tapegw-mover -config /etc/tapegw/tapegw.yaml
+EnvironmentFile=-/etc/tapegw/tapegw-mover.env
+
+User=tapegw
+Group=tapegw
+
+# Остановка graceful: сервер перестает принимать новое и ждет текущие операции
+# Phobos — прерывать их нельзя (ADR-0021, отмены вызова нет).
+KillSignal=SIGTERM
+# Критично: TimeoutStopSec обязан превышать phobos.mover.op_timeout с запасом,
+# иначе systemd убьет запись, которую mover честно ждет (застрявшая лента или
+# ожидание драйва — минуты). op_timeout по умолчанию 30m, запас на get-поток и
+# fini — 35m. Поднимайте вместе с op_timeout в конфиге.
+TimeoutStopSec=35min
+
+Restart=on-failure
+RestartSec=5s
+
+# Core dump — это чужие данные (и потенциальный ключевой материал у соседей по
+# хосту) в файле вне всякого учёта (ADR-0014, M9).
+LimitCORE=0
+
+# Лог — JSON в stderr, его забирает journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tapegw-mover
+
+LimitNOFILE=65536
+
+# Песочница: запись только в staging-буфер (phobos.mover.staging_dir) и
+# сокет/конфиг Phobos. Каталог буфера обязан быть в ReadWritePaths.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/tapegw/mover
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

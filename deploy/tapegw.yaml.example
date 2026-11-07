@@ -86,10 +86,33 @@ spool:
 
 phobos:
   family: tape                     # dir — для CI и разработки без лент
+  library: tape_lib                # API Phobos не читает профиль: без явной
+                                   # library put падает с -ENODEV (ADR-0007)
   layout: raid1
   layout_params: {repl_count: "1"}
   tags: []
   max_inflight: 1                  # до подтверждения потокобезопасности libphobos (спайк M0-3)
+
+  # Конфигурация процесса tapegw-mover (ADR-0021). tapegw эти поля не читает;
+  # переменные выводятся как TAPEGW_PHOBOS_MOVER_*.
+  mover:
+    listen: ":7443"                # только mTLS, plaintext-режима нет
+    drive: drive1                  # SAN-URI сертификата: mover://drive1
+    role: migrator                 # migrator | recaller
+    # phobos_config: /etc/phobos.conf  # один файл и для libphobos, и для CLI
+    tls:
+      cert: /etc/tapegw/mover.crt
+      key: /etc/tapegw/mover.key
+      ca: /etc/tapegw/ca.crt
+    staging_dir: /srv/tapegw/mover # буфер: батч сначала принят и fsync-нут
+    buffer_bytes: 8GiB             # объект больше буфера не примут (no_buffer)
+    chunk_size: 4MiB
+    inactivity_timeout: 5m         # сколько ждём следующий кадр
+    op_timeout: 30m                # потолок одной операции Phobos; > inactivity
+    result_ttl: 1h                 # держим итог завершённой операции
+    op_ttl: 24h                    # срок незавершённой: брошенный буфер чистится
+    expire_interval: 1m
+    # phobos_version: "3.4.1"      # кладётся в hello, информационно
 
 migrator:
   batch_max_objects: 1000

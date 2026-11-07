@@ -44,6 +44,12 @@ const MaxFrameBytes = 1 << 20 // 1 MiB
 // чтобы не терять кадр на каждый килобайт.
 const ChunkSize = 4 << 20 // 4 MiB
 
+// MaxDataBytes — потолок кадра данных: chunk плюс 16 байт UUID операции в
+// префиксе. По ADR-0021 1 MiB (MaxFrameBytes) ограничивает только управляющие
+// JSON-кадры; данные разрешены до chunk_size. Раньше одним MaxFrameBytes
+// резали оба типа, и put объекта больше 1 MiB падал на первом же полном кадре.
+const MaxDataBytes = ChunkSize + 16
+
 // Коды итога. Замкнутый набор: mover не выдаёт кодов, которых здесь нет,
 // иначе воркер начнёт угадывать.
 type Code string
@@ -274,7 +280,7 @@ func WriteJSON(w io.Writer, v any) error {
 // не перестраховка: он делает кадр самораспознаваемым, и перепутать данные
 // двух операций невозможно даже если одна из них зависла.
 func WriteData(w io.Writer, op uuid.UUID, p []byte) error {
-	if len(p)+16 > MaxFrameBytes {
+	if len(p)+16 > MaxDataBytes {
 		return fmt.Errorf("%w: %d байт данных", ErrFrameTooLarge, len(p))
 	}
 	hdr := make([]byte, 5+16)
@@ -295,15 +301,21 @@ type Frame struct {
 	B    []byte    // тело: JSON для frameJSON, данные для frameData
 }
 
-// ReadFrame читает один кадр. max — потолок размера, чтобы испорченная длина
-// не заставила выделить память.
+// ReadFrame читает один кадр. max — потолок кадра данных, чтобы испорченная
+// длина не заставила выделить память; управляющие JSON-кадры этим потолком не
+// измеряются, для них свой предел — MaxFrameBytes (ADR-0021: 1 MiB ограничивает
+// JSON, данные разрешены до chunk_size).
 func ReadFrame(r io.Reader, max int) (*Frame, error) {
 	hdr := make([]byte, 5)
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return nil, err
 	}
 	n := int(binary.BigEndian.Uint32(hdr[1:]))
-	if n <= 0 || n > max {
+	limit := max
+	if hdr[0] == frameJSON {
+		limit = MaxFrameBytes
+	}
+	if n <= 0 || n > limit {
 		return nil, fmt.Errorf("%w: заявлено %d байт", ErrFrameTooLarge, n)
 	}
 	switch hdr[0] {

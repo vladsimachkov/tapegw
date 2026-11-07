@@ -28,6 +28,7 @@ type ServerConfig struct {
 	// PhobosFamily/Layout/LayoutParams приходят из конфига: без явных family и
 	// library вызов падает с -ENODEV, и из текста ошибки это не понять (M0-02).
 	Family       string
+	Library      string
 	Layout       string
 	LayoutParams map[string]string
 	Chunk        int
@@ -205,7 +206,10 @@ func (s *Server) handle(conn net.Conn) {
 		if f == nil {
 			s.touch(tconn)
 			var err error
-			f, err = ReadFrame(tconn, MaxFrameBytes)
+			// MaxDataBytes: в диспетчер может прийти и кадр данных (например,
+			// объявление новой операции посреди передачи — оно возвращается
+			// через carry), поэтому потолок данных, а не только JSON.
+			f, err = ReadFrame(tconn, MaxDataBytes)
 			if err != nil {
 				if !errors.Is(err, io.EOF) {
 					s.log.Debug("mover: соединение закрыто", "err", err)
@@ -395,7 +399,7 @@ func (s *Server) handlePut(conn net.Conn, p *Put) *Frame {
 	received := offset
 	for received < p.Size {
 		s.touch(conn)
-		fr, err := ReadFrame(conn, MaxFrameBytes)
+		fr, err := ReadFrame(conn, MaxDataBytes)
 		if err != nil {
 			return nil
 		}
@@ -506,7 +510,7 @@ func (s *Server) putReader(p *Put, f *os.File) Result {
 	defer s.phobosMu.Unlock()
 
 	opt := store.PutOptions{
-		Family: s.cfg.Family, Layout: s.cfg.Layout,
+		Family: s.cfg.Family, Library: s.cfg.Library, Layout: s.cfg.Layout,
 		LayoutParams: s.cfg.LayoutParams, Tags: p.Tags, NoSplit: p.NoSplit,
 	}
 	items := []store.PutItem{{ID: p.Op, File: f, Size: p.Size, Attrs: p.Attrs}}
