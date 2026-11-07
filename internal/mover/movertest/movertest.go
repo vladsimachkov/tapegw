@@ -229,14 +229,6 @@ func (f *Store) Extents(_ context.Context, ids []uuid.UUID) (map[uuid.UUID][]str
 	return out, nil
 }
 
-func (f *Store) Locate(_ context.Context, ids []uuid.UUID) ([]store.Location, error) {
-	out := make([]store.Location, 0, len(ids))
-	for range ids {
-		out = append(out, store.Location{TapeID: "TST-MOVER", DriveHint: "drive-A"})
-	}
-	return out, nil
-}
-
 func (f *Store) Close() error { return nil }
 
 // Env — запущенный mover с подключением к нему.
