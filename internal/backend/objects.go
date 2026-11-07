@@ -394,6 +394,13 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 			return nil, err
 		}
 
+		// Шов для теста окна гонки (блокер B1): в бою nil. Тест выполняет в
+		// крючке вытеснение и получает расклад «строку прочитали online, а
+		// открытием пришли уже после unlink» без гонок по таймингам.
+		if t.evictHook != nil {
+			t.evictHook(obj.ID)
+		}
+
 		f, err := t.spool.Open(obj.ID)
 		if errors.Is(err, os.ErrNotExist) {
 			// Файл исчез между решением о читаемости и open. Перечитываем
