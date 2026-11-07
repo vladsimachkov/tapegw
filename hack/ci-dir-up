@@ -61,6 +61,13 @@ if [ "${1:-}" = "--test" ]; then
         -e TAPEGW_PHOBOS_TEST=1 \
         -e TAPEGW_PHOBOS_DIR_MEDIA=/var/lib/phobos/dir1,/var/lib/phobos/dir2 \
         -w /src "$NAME" go test -tags phobos -count=1 ./internal/store/phobos
+
+    # Критерий S1: mover стартует, и клиент пишет и читает через него
+    # настоящий Phobos. Тот же контейнер, тот же phobosd.
+    echo "== mover поверх настоящего Phobos"
+    podman exec -e GOMODCACHE=/gomodcache -e GOFLAGS=-mod=mod \
+        -e TAPEGW_PHOBOS_TEST=1 \
+        -w /src "$NAME" go test -tags phobos -count=1 ./cmd/tapegw-mover
 fi
 
 echo "== остаётся запущенным: podman exec -it $NAME bash"

@@ -153,7 +153,11 @@ type Phobos struct {
 	Family       string            `yaml:"family"`
 	Layout       string            `yaml:"layout"`
 	LayoutParams map[string]string `yaml:"layout_params"`
-	Tags         []string          `yaml:"tags"`
+	// Library — имя библиотеки Phobos. API не читает профиль: без явных
+	// family/library/layout вызов падает с -ENODEV, и из текста ошибки это
+	// не понять (ADR-0007, спайк M0-02).
+	Library string   `yaml:"library"`
+	Tags    []string `yaml:"tags"`
 	// MaxInflight — размер пула горутин, имеющих право вызывать libphobos.
 	// До подтверждения потокобезопасности (спайк M0-3) держим 1.
 	MaxInflight int `yaml:"max_inflight"`
@@ -163,6 +167,11 @@ type Phobos struct {
 	// <node>/<ключ>) и часть SAN-URI сертификата mover'а. Одна идентичность
 	// вместо трёх, которые могут разойтись.
 	Movers map[string]Mover `yaml:"movers"`
+
+	// Mover — конфигурация самого процесса tapegw-mover (ADR-0021). tapegw
+	// эти поля не читает: они живут в том же файле, потому что один файл —
+	// одна установка, а переменные TAPEGW_PHOBOS_MOVER_* выводятся из пути.
+	Mover MoverServer `yaml:"mover"`
 }
 
 // Mover — точка подключения к одному mover'у (ADR-0007, ADR-0021).
@@ -170,6 +179,56 @@ type Mover struct {
 	Addr    string `yaml:"addr"`
 	Node    string `yaml:"node"`
 	Library string `yaml:"library"`
+}
+
+// MoverServer — настройки процесса tapegw-mover: слушатель, идентичность и
+// буфер (ADR-0021). Обязательное проверяет ValidateMover, а не Validate:
+// tapegw эти поля не читает, и требовать их в общем валидаторе значило бы
+// ломать конфиг тем, кто mover ещё не поднимал.
+type MoverServer struct {
+	// Listen — адрес mTLS-слушателя. Plaintext-режима нет намеренно: mover
+	// возит шифротекст через сеть (ADR-0021).
+	Listen string `yaml:"listen"`
+	// Drive — имя драйва, к которому привязан процесс: ключ в phobos.movers,
+	// слот воркера и SAN-URI сертификата (mover://<drive>). Одна идентичность
+	// вместо трёх, которые могут разойтись.
+	Drive string `yaml:"drive"`
+	// Role — для какого пула поднят процесс: migrator или recaller (ADR-0007).
+	// Роль сверяет клиент при рукопожатии, а сервер по ней решает, какие
+	// роли клиентов принимать: migrator'у — планировщик архивации, recaller'у —
+	// планировщик восстановления.
+	Role string `yaml:"role"`
+	// PhobosConfig — конфиг Phobos для libphobos и для CLI extent list. Пусто
+	// — значение по умолчанию Phobos. libphobos и CLI обязаны читать один файл,
+	// иначе «записали одним конфигом, ищем другим».
+	PhobosConfig string   `yaml:"phobos_config"`
+	TLS          MoverTLS `yaml:"tls"`
+	// StagingDir — каталог буфера операций: батч сначала принят целиком и
+	// fsync-нут, и только потом phobos_put читает с локального диска (ADR-0021).
+	StagingDir string `yaml:"staging_dir"`
+	// BufferBytes — весь буфер. Объект больше него не примут (no_buffer —
+	// ошибка конфигурации, она алертится).
+	BufferBytes ByteSize      `yaml:"buffer_bytes"`
+	ChunkSize   ByteSize      `yaml:"chunk_size"`
+	Inactivity  time.Duration `yaml:"inactivity_timeout"`
+	OpTimeout   time.Duration `yaml:"op_timeout"`
+	// ResultTTL — сколько держим запись и буфер завершённой операции: tapegw
+	// вправе переподключиться за итогом.
+	ResultTTL time.Duration `yaml:"result_ttl"`
+	// OpTTL — срок незавершённой операции: брошенный буфер не должен
+	// занимать место вечно.
+	OpTTL          time.Duration `yaml:"op_ttl"`
+	ExpireInterval time.Duration `yaml:"expire_interval"`
+	PhobosVersion  string        `yaml:"phobos_version"`
+}
+
+// MoverTLS — тройка для взаимного TLS mover'а (ADR-0021): cert/key — сам
+// mover (SAN-URI mover://<drive>), ca — корень, подписывающий клиентские
+// сертификаты tapegw.
+type MoverTLS struct {
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
+	CA   string `yaml:"ca"`
 }
 
 // Worker — настройки одного фоновыего воркера (migrator или recaller).
@@ -320,6 +379,17 @@ func Default() *Config {
 			Layout:       "raid1",
 			LayoutParams: map[string]string{"repl_count": "1"},
 			MaxInflight:  1,
+			Mover: MoverServer{
+				// Таймауты и TTL — стартовые значения для настройки на
+				// стенде, не требования (см. преамбулу к конфигурации в
+				// ARCHITECTURE.md).
+				ChunkSize:      4 << 20,
+				Inactivity:     5 * time.Minute,
+				OpTimeout:      30 * time.Minute,
+				ResultTTL:      time.Hour,
+				OpTTL:          24 * time.Hour,
+				ExpireInterval: time.Minute,
+			},
 		},
 		Migrator: Worker{
 			BatchMaxObjects: 1000,
@@ -750,6 +820,58 @@ func (c *Config) Validate() error {
 		add("logging.format: %q, ожидаются json или text", c.Logging.Format)
 	}
 
+	return errors.Join(errs...)
+}
+
+// ValidateMover — обязательное для процесса tapegw-mover (S1). Вызывается из
+// cmd/tapegw-mover, а не из Validate: tapegw эти поля не читает, и требовать
+// их в общем валидаторе значило бы ломать конфиг тем, кто mover ещё не
+// поднимал.
+func (c *Config) ValidateMover() error {
+	var errs []error
+	add := func(format string, args ...any) {
+		errs = append(errs, fmt.Errorf(format, args...))
+	}
+
+	m := c.Phobos.Mover
+	if m.Listen == "" {
+		add("phobos.mover.listen обязателен")
+	}
+	if m.Drive == "" {
+		add("phobos.mover.drive обязателен: имя драйва — слот воркера и SAN-URI сертификата")
+	}
+	switch m.Role {
+	case "migrator", "recaller":
+	default:
+		add("phobos.mover.role: %q, ожидаются migrator или recaller", m.Role)
+	}
+	if m.TLS.Cert == "" || m.TLS.Key == "" || m.TLS.CA == "" {
+		add("phobos.mover.tls: cert, key и ca обязательны — plaintext-режима у mover нет (ADR-0021)")
+	}
+	if m.StagingDir == "" {
+		add("phobos.mover.staging_dir обязателен: батч сначала принимается на локальный диск")
+	}
+	if m.BufferBytes <= 0 {
+		add("phobos.mover.buffer_bytes: %d, должно быть > 0", int64(m.BufferBytes))
+	}
+	if m.ChunkSize <= 0 {
+		add("phobos.mover.chunk_size: %d, должно быть > 0", int64(m.ChunkSize))
+	}
+	if m.Inactivity <= 0 {
+		add("phobos.mover.inactivity_timeout: %v, должно быть > 0", m.Inactivity)
+	}
+	if m.OpTimeout <= m.Inactivity {
+		add("phobos.mover.op_timeout: %v, должен быть больше inactivity_timeout: %v — "+
+			"иначе запись дольше ожидания кадра обрывалась бы на середине", m.OpTimeout, m.Inactivity)
+	}
+	if m.ExpireInterval <= 0 {
+		add("phobos.mover.expire_interval: %v, должно быть > 0", m.ExpireInterval)
+	}
+	// Библиотека обязательна: API Phobos не читает профиль, и без явной
+	// library put падает с -ENODEV без внятной ошибки (ADR-0007, M0-02).
+	if c.Phobos.Library == "" {
+		add("phobos.library обязателен: API Phobos не читает профиль (ADR-0007)")
+	}
 	return errors.Join(errs...)
 }
 

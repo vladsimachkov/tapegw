@@ -28,6 +28,7 @@ type ServerConfig struct {
 	// PhobosFamily/Layout/LayoutParams приходят из конфига: без явных family и
 	// library вызов падает с -ENODEV, и из текста ошибки это не понять (M0-02).
 	Family       string
+	Library      string
 	Layout       string
 	LayoutParams map[string]string
 	Chunk        int
@@ -506,7 +507,7 @@ func (s *Server) putReader(p *Put, f *os.File) Result {
 	defer s.phobosMu.Unlock()
 
 	opt := store.PutOptions{
-		Family: s.cfg.Family, Layout: s.cfg.Layout,
+		Family: s.cfg.Family, Library: s.cfg.Library, Layout: s.cfg.Layout,
 		LayoutParams: s.cfg.LayoutParams, Tags: p.Tags, NoSplit: p.NoSplit,
 	}
 	items := []store.PutItem{{ID: p.Op, File: f, Size: p.Size, Attrs: p.Attrs}}

@@ -253,7 +253,7 @@ func NewTimed(t *testing.T, bufMax int64, inactivity time.Duration, allowed ...m
 	if len(allowed) == 0 {
 		allowed = []mover.ClientID{mover.ClientScheduler}
 	}
-	p := newPKI(t)
+	p := NewPKI(t)
 	st := NewStore()
 	staging := filepath.Join(t.TempDir(), "staging")
 	reg, err := mover.NewRegistry(staging, bufMax, 64<<10, time.Hour)
@@ -355,7 +355,11 @@ func (e *Env) DialNoCert(t *testing.T) error {
 	return err
 }
 
-func newPKI(t *testing.T) PKI {
+// NewPKI генерирует одноразовую PKI: CA, сертификат mover'а (SAN-URI
+// mover://<drive>), клиентские сертификаты ролей scheduler и restorer и
+// «неправильные» сертификаты для проверок отказа. Открыта, чтобы тест бинаря
+// mover'а поднимал тот же набор, что и тесты протокола.
+func NewPKI(t *testing.T) PKI {
 	t.Helper()
 	dir := t.TempDir()
 	p := PKI{Drive: "drive-A", OtherDrive: "drive-B"}

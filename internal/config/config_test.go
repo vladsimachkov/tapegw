@@ -425,3 +425,81 @@ func TestMoversRequireFields(t *testing.T) {
 		}
 	}
 }
+
+// moverValidCfg — конфиг, у которого mover-секция заполнена; ValidateMover
+// на нём обязан проходить: тесты ниже меняют по одному полю и ждут отказ
+// именно про него.
+func moverValidCfg() *Config {
+	cfg := Default()
+	cfg.Root.Access, cfg.Root.Secret = "a", "b"
+	cfg.IAM.KEKFile = testKEKFile
+	cfg.Phobos.Library = "dirlib"
+	cfg.Phobos.Mover = MoverServer{
+		Listen: ":7443", Drive: "drive1", Role: "migrator",
+		TLS:            MoverTLS{Cert: "/etc/tapegw/mover.crt", Key: "/etc/tapegw/mover.key", CA: "/etc/tapegw/ca.crt"},
+		StagingDir:     "/srv/tapegw/mover",
+		BufferBytes:    8 << 30,
+		ChunkSize:      4 << 20,
+		Inactivity:     5 * time.Minute,
+		OpTimeout:      30 * time.Minute,
+		ResultTTL:      time.Hour,
+		OpTTL:          24 * time.Hour,
+		ExpireInterval: time.Minute,
+	}
+	return cfg
+}
+
+func TestValidateMoverDefaultsPass(t *testing.T) {
+	if err := moverValidCfg().ValidateMover(); err != nil {
+		t.Fatalf("заполненный mover невалиден: %v", err)
+	}
+}
+
+func TestValidateMoverRequiredFields(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(*Config)
+		want string
+	}{
+		{"listen", func(c *Config) { c.Phobos.Mover.Listen = "" }, "listen"},
+		{"drive", func(c *Config) { c.Phobos.Mover.Drive = "" }, "drive"},
+		{"role", func(c *Config) { c.Phobos.Mover.Role = "watcher" }, "role"},
+		{"tls", func(c *Config) { c.Phobos.Mover.TLS.CA = "" }, "tls"},
+		{"staging", func(c *Config) { c.Phobos.Mover.StagingDir = "" }, "staging_dir"},
+		{"buffer", func(c *Config) { c.Phobos.Mover.BufferBytes = 0 }, "buffer_bytes"},
+		{"library", func(c *Config) { c.Phobos.Library = "" }, "phobos.library"},
+	}
+	for _, tc := range cases {
+		cfg := moverValidCfg()
+		tc.mut(cfg)
+		err := cfg.ValidateMover()
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: отказ не про то: %v", tc.name, err)
+		}
+	}
+}
+
+// op_timeout обязан превышать inactivity: на время записи дедлайны продлеваются
+// до op_timeout, и если он меньше ожидания кадра, длинная запись обрывалась бы
+// на середине — ровно то, чего каскад touch/touchOp не должен допускать.
+func TestValidateMoverOpTimeoutAboveInactivity(t *testing.T) {
+	cfg := moverValidCfg()
+	cfg.Phobos.Mover.OpTimeout = time.Minute
+	cfg.Phobos.Mover.Inactivity = 5 * time.Minute
+	err := cfg.ValidateMover()
+	if err == nil || !strings.Contains(err.Error(), "op_timeout") {
+		t.Fatalf("op_timeout <= inactivity не отклонён: %v", err)
+	}
+}
+
+// Дефолты mover'а не должны требовать заполнения секции у tapegw: Validate
+// (не ValidateMover) проходит и без mover-секции — иначе конфиг тех, кто mover
+// ещё не поднимал, сломался бы.
+func TestValidateIgnoresMoverSection(t *testing.T) {
+	cfg := Default()
+	cfg.Root.Access, cfg.Root.Secret = "a", "b"
+	cfg.IAM.KEKFile = testKEKFile
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate не должен требовать mover-секцию: %v", err)
+	}
+}
