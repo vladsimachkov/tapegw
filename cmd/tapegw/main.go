@@ -25,6 +25,7 @@ import (
 	"github.com/vladsimachkov/tapegw/internal/keys"
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/spool"
+	"github.com/vladsimachkov/tapegw/internal/worker"
 )
 
 // Заполняется сборкой: -ldflags "-X main.Version=... -X main.Build=..."
@@ -165,17 +166,47 @@ func run(args []string) error {
 			slog.Duration("cache_ttl", cfg.IAM.CacheTTL))
 	}
 
+	// Воркеры архивации. Включённость читаем явно: «выключено» должно быть
+	// слышно (гремучая строка в логе + отметка в /health/ready ниже), а
+	// «включено и некому» — валить процесс на старте (worker.PlanMigrators).
+	var mig *worker.MigratorGroup
+	if cfg.Migrator.EnabledValue() {
+		targets, err := worker.PlanMigrators(cfg)
+		if err != nil {
+			return err
+		}
+		mig, err = worker.StartMigrators(ctx, worker.MigratorDeps{
+			Cfg: cfg, Meta: pool, Spool: land, Log: logger,
+		}, targets)
+		if err != nil {
+			return err
+		}
+	} else {
+		logger.Warn("АРХИВАЦИЯ ВЫКЛЮЧЕНА: migrator.enabled=false — объекты не поедут на ленту, " +
+			"landing будет расти до watermark")
+	}
+	if cfg.Metrics.Listen != "" {
+		rd, err := worker.StartReadiness(cfg.Metrics.Listen, cfg.Migrator.EnabledValue(), logger)
+		if err != nil {
+			return fmt.Errorf("readiness: %w", err)
+		}
+		defer rd.Close()
+	}
+
 	logger.Info("starting s3 gateway",
 		slog.Any("listen", cfg.S3.Listen),
 		slog.String("region", cfg.S3.Region),
 		slog.String("backend", be.String()),
 		slog.String("phobos_family", cfg.Phobos.Family))
 
-	// Начиная с M4 здесь же стартуют воркеры (migrator, recaller, janitor,
-	// deleter) и metrics-листенер. Пока их нет — только шлюз.
 	if err := embedgw.RunVersityGW(ctx, be, gwCfg); err != nil &&
 		!errors.Is(err, context.Canceled) {
 		return fmt.Errorf("gateway: %w", err)
+	}
+	// Шлюз встал на уши (ctx отменён) — воркеры ещё могут довозить начатую
+	// пачку: их отправка живёт на контексте без отмены. Ждём, но не вечно.
+	if mig != nil {
+		mig.Wait(cfg.Migrator.ShutdownGrace)
 	}
 	logger.Info("stopped")
 	return nil

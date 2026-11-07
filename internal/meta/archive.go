@@ -18,6 +18,19 @@ type Placement struct {
 	Length  uint64
 }
 
+// PoolTag — тег Phobos пула (pools.phobos_tag): по нему пачки разводят по
+// носителям (ADR-0013). Источник истины — таблица pools, а не конфиг: тег
+// существует ровно там, где ему предписано быть NOT NULL UNIQUE, и второй
+// копии в YAML не место — они имеют свойство расходиться.
+func (m *Meta) PoolTag(ctx context.Context, poolID int64) (string, error) {
+	var tag string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT phobos_tag FROM pools WHERE id = $1`, poolID).Scan(&tag); err != nil {
+		return "", fmt.Errorf("meta: тег пула %d: %w", poolID, err)
+	}
+	return tag, nil
+}
+
 // BeginPackArchive заводит строку пачки и переводит участников в archiving.
 //
 // Возвращает открытую транзакцию: вызывающий обязан закоммитить её ДО вызова
@@ -53,11 +66,23 @@ VALUES ($1, $2, 'data', 'open')`, packID, poolID)
 	// второго прохода. Ссылка без адреса ничего не стоит, поэтому её ставит
 	// FinishPackArchive — одной транзакцией с переходом в archived.
 	//
-	// Переход идемпотентен (правило 7): ноль затронутых строк означает, что
+	// Два входа в переход, и оба законны:
+	//
+	//   * 'pending' — вызывающий выбрал объекты сам (так устроены тесты цикла);
+	//   * 'archiving' без pack_id — объекты уже заняты в батч честной выборкой
+	//     ClaimMigrationBatch (ADR-0012: справедливость по тенантам живёт там,
+	//     и отказываться от неё воркер не вправе). Выборка переводит в
+	//     'archiving' сама, иначе SKIP LOCKED не с чем работать.
+	//
+	// pack_id IS NULL — граница, которая не даёт второму входу утащить участника
+	// уже запечатанной пачки: SealPack ставит pack_id, и с этого момента объект
+	// для BeginPackArchive недостижим.
+	//
+	// Переход идемпотенен (правило 7): ноль затронутых строк означает, что
 	// объект уже забрал другой воркер, и брать его нельзя.
 	tag, err := tx.Exec(ctx, `
 UPDATE objects SET state = 'archiving'
-WHERE id = ANY($1::uuid[]) AND state = 'pending'`, ids)
+WHERE id = ANY($1::uuid[]) AND pack_id IS NULL AND state IN ('pending', 'archiving')`, ids)
 	if err != nil {
 		tx.Rollback(ctx)
 		return nil, uuid.Nil, fmt.Errorf("meta: перевести в archiving: %w", err)
@@ -102,8 +127,9 @@ func (m *Meta) FinishPackArchive(ctx context.Context, packID uuid.UUID, placemen
 
 	// Одна транзакция на пачку: копия и состояние участников должны появиться
 	// вместе, иначе объект «архивирован», а копии нет, и восстановить её уже
-	// нечем.
-	state, doneAt := "writing", any(nil)
+	// нечем. doneAt — SQL-выражение: подстановка nil-интерфейса в %s дала бы
+	// синтаксическую ошибку, поэтому литерал null.
+	state, doneAt := "writing", "null"
 	if mediumID != 0 {
 		state, doneAt = "done", "now()"
 	}
@@ -411,7 +437,9 @@ func (m *Meta) MediaIDByLabel(ctx context.Context, label string) (int64, error) 
 // BindCopyMedium доводит копию из 'writing' до 'done', когда лента наконец
 // зарегистрирована в реестре. Перезаписи не происходит: данные лежат на ленте
 // с момента записи, не хватало только строки media.
-func (m *Meta) BindCopyMedium(ctx context.Context, copyID, mediaID int64) error {
+// copyID — uuid строки archive_copies (не int64: id там uuid, и первый же
+// вызов с числом упал бы «operator does not exist: uuid = bigint»).
+func (m *Meta) BindCopyMedium(ctx context.Context, copyID uuid.UUID, mediaID int64) error {
 	tag, err := m.Pool.Exec(ctx, `
 UPDATE archive_copies SET medium_id = $2, state = 'done', done_at = now()
 WHERE id = $1 AND state = 'writing'`, copyID, mediaID)
@@ -419,7 +447,7 @@ WHERE id = $1 AND state = 'writing'`, copyID, mediaID)
 		return fmt.Errorf("meta: привязать ленту к копии: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("meta: копия %d не в writing", copyID)
+		return fmt.Errorf("meta: копия %s не в writing", copyID)
 	}
 	return nil
 }
@@ -440,11 +468,24 @@ func (m *Meta) RecordPackCopy(ctx context.Context, packID uuid.UUID, spec, phobo
 	if spec == "" {
 		return uuid.Nil, fmt.Errorf("meta: копия без spec")
 	}
+	// То же правило, что в FinishPackArchive: 'done' без носителя CHECK
+	// archive_copies_done_has_medium не принимает — и правильно делает.
+	// Копия, легшая на ленту вне реестра, остаётся в 'writing' и доводится
+	// до 'done' через BindCopyMedium. Впервые всплыло на вертикальном срезе
+	// ci-dir: extent пришёл с меткой носителя, которой нет в media, и
+	// незаписанная копия зациклила продолжение пачки на CHECK-ошибке.
+	// doneAt — SQL-выражение, не аргумент: '%s' с nil-интерфейсом дал бы
+	// синтаксическую ошибку, поэтому литерал null.
+	state, doneAt := "writing", "null"
+	if mediumID != 0 {
+		state, doneAt = "done", "now()"
+	}
 	var id uuid.UUID
-	err := m.Pool.QueryRow(ctx, `
+	err := m.Pool.QueryRow(ctx, fmt.Sprintf(`
 INSERT INTO archive_copies (pack_id, spec, phobos_oid, phobos_version, format, state, sha256, medium_id, done_at)
-VALUES ($1, $2, $3, $4, $5, 'done', $6, NULLIF($7, 0), now())
-RETURNING id`, packID, spec, phobosOID, version, format, sha256, mediumID).Scan(&id)
+VALUES ($1, $2, $3, $4, $5, '%s', $6, NULLIF($7, 0), %s)
+RETURNING id`, state, doneAt),
+		packID, spec, phobosOID, version, format, sha256, mediumID).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("meta: записать копию пачки: %w", err)
 	}

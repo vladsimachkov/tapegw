@@ -459,3 +459,71 @@ func TestRequeueArchivingExhaustsToFailed(t *testing.T) {
 		t.Errorf("состояние %q, хотели failed", state)
 	}
 }
+
+// Композиция воркера (S2b): ClaimMigrationBatch — честная выборка, и она сама
+// переводит в 'archiving' (иначе SKIP LOCKED не с чем работать). BeginPackArchive
+// обязан принимать этот выход: заставлять воркера reimplement'ить выборку —
+// значит потерять справедливость по тенантам (ADR-0012). И обратно: участник
+// уже запечатанной пачки недостижим для второй пачки.
+func TestClaimBatchComposesWithBeginPackArchive(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+
+	ids := tenantWithObjects(t, m, 2, "compose", 10, 3)
+	got, err := m.ClaimMigrationBatch(ctx, 1, meta.BatchLimits{MaxObjects: 3, PerTenantObjects: 3})
+	if err != nil {
+		t.Fatalf("ClaimMigrationBatch: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("выбрано %d, ждали 3", len(got))
+	}
+
+	tx, packID, err := m.BeginPackArchive(ctx, 1, ids)
+	if err != nil {
+		t.Fatalf("BeginPackArchive после честной выборки: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var placements []meta.Placement
+	var off uint64
+	for _, id := range ids {
+		placements = append(placements, meta.Placement{Version: id, Offset: off, Length: 100})
+		off += 100
+	}
+	if err := m.SealPack(ctx, packID, placements, int64(off), "test/1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	// Запечатанный участник нельзя утащить во вторую пачку: pack_id — граница.
+	if _, _, err := m.BeginPackArchive(ctx, 1, ids[:1]); err == nil {
+		t.Fatal("участник запечатанной пачки ушёл во вторую пачку")
+	}
+
+	// Свежий pending по-прежнему принимается: фильтр не стал строже, чем нужно.
+	fresh := tenantWithObjects(t, m, 3, "compose2", 10, 1)
+	tx2, _, err := m.BeginPackArchive(ctx, 1, fresh)
+	if err != nil {
+		t.Fatalf("свежий pending не принят: %v", err)
+	}
+	tx2.Rollback(ctx)
+}
+
+func TestPoolTag(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	// Пул 1 заводится миграцией с тегом 'pool:shared' — воркер читает тег
+	// именно оттуда, второй копии в конфиге места нет.
+	tag, err := m.PoolTag(context.Background(), meta.DefaultPoolID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag == "" {
+		t.Fatal("пустой тег: пачка уедет на носители по умолчанию библиотеки")
+	}
+	if _, err := m.PoolTag(context.Background(), 999); err == nil {
+		t.Error("несуществующий пул не отвергнут")
+	}
+}

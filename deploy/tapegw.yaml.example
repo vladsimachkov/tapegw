@@ -93,6 +93,27 @@ phobos:
   tags: []
   max_inflight: 1                  # до подтверждения потокобезопасности libphobos (спайк M0-3)
 
+  # Mover'ы этой библиотеки, к которым подключается планировщик архивации.
+  # Ключ — имя драйва: оно же слот воркера (worker_id = <node>/<ключ>) и часть
+  # SAN-URI mover'а (mover://<ключ>). Роль обязательна: в одной библиотеке
+  # могут стоять драйвы обоих пулов, и планировщик архивации берёт только
+  # migrator'а — иначе отдаст архивацию драйву, который ждёт restorer'а.
+  movers:
+    drive1:
+      addr: "lib1.example:7443"
+      node: lib1                   # по нему определяется локальная передача
+      library: tape_lib
+      role: migrator
+    # drive2: {addr: "lib1.example:7444", node: lib1, library: tape_lib, role: recaller}
+
+  # Сертификат tapegw как клиента mover'ов (SAN-URI tapegw://scheduler,
+  # ADR-0021). Один на все mover'ы: различаются mover'ы драйвом в SAN, а роль
+  # у планировщика одна. Обязателен, если в movers есть хоть один migrator.
+  mover_client:
+    cert: /etc/tapegw/scheduler.crt
+    key: /etc/tapegw/scheduler.key
+    ca: /etc/tapegw/ca.crt
+
   # Конфигурация процесса tapegw-mover (ADR-0021). tapegw эти поля не читает;
   # переменные выводятся как TAPEGW_PHOBOS_MOVER_*.
   mover:
@@ -115,10 +136,20 @@ phobos:
     # phobos_version: "3.4.1"      # кладётся в hello, информационно
 
 migrator:
+  enabled: true                    # false — воркер не стартует; пишется в лог и
+                                   # в /health/ready («архивация выключена»),
+                                   # потому что выключенная архивация иначе
+                                   # выглядит как работающий шлюз
   batch_max_objects: 1000
   batch_max_bytes: 200GiB
   batch_max_wait: 15m              # это же RPO: всё, что не ушло на ленту, живёт только на диске
   max_attempts: 10
+  claim_ttl: 5m                    # на сколько воркер запечатывает пачку за собой;
+                                   # после сбоя именно он определяет, сколько
+                                   # пачка простоит без продолжения
+  shutdown_grace: 30m              # сколько ждём текущую отправку при остановке;
+                                   # не дождались — пачка остаётся в sealed,
+                                   # её продолжит следующий запуск
 
 recaller:
   batch_max_objects: 500
@@ -127,7 +158,9 @@ recaller:
   max_attempts: 10
 
 metrics:
-  listen: ":9464"                  # свой Prometheus-экспортёр, см. ADR-0002
+  listen: ":9464"                  # свой Prometheus-экспортёр, см. ADR-0002;
+                                   # здесь же /health/ready (отметка про архивацию);
+                                   # пусто — не слушать ничего
 
 admin:
   listen: ""                       # пусто = админ-API на S3-порту под path_prefix
