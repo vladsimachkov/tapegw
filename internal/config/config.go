@@ -34,6 +34,7 @@ type Config struct {
 	Phobos   Phobos  `yaml:"phobos"`
 	Migrator Worker  `yaml:"migrator"`
 	Recaller Worker  `yaml:"recaller"`
+	Janitor  Janitor `yaml:"janitor"`
 	Metrics  Metrics `yaml:"metrics"`
 	Admin    Admin   `yaml:"admin"`
 	Logging  Logging `yaml:"logging"`
@@ -272,6 +273,28 @@ type Worker struct {
 // EnabledValue — включён ли воркер с учётом умолчания (nil = true).
 func (w Worker) EnabledValue() bool { return w.Enabled == nil || *w.Enabled }
 
+// Janitor — фоновый вытеснитель дисковой копии. S3 — только вытеснение по
+// истечении online_until (ADR-0004); watermark-вытеснение и сборка сирот —
+// отдельные пункты плана.
+type Janitor struct {
+	// Enabled — по умолчанию true. Выключённый janitor не виден ни в одном
+	// S3-ответе, а landing тем временем растёт: выключенным его делает либо
+	// явный false, либо ничего — как и с migrator, молчание означает «включено».
+	Enabled *bool `yaml:"enabled"`
+	// Interval — период выборки. Вытеснение не спешит: дата обещает файл
+	// как минимум до online_until, а опоздание на интервал клиенту не видно.
+	Interval time.Duration `yaml:"interval"`
+	// BatchMaxObjects — сколько объектов снимается за один проход.
+	BatchMaxObjects int `yaml:"batch_max_objects"`
+	// ShutdownGrace — сколько ждём текущий проход при остановке. Проход — это
+	// unlink по локальному ФС, он долог только при зависшем ФС; не дождались —
+	// процесс уходит, неснятые объекты снимет следующий запуск.
+	ShutdownGrace time.Duration `yaml:"shutdown_grace"`
+}
+
+// EnabledValue — включён ли janitor с учётом умолчания (nil = true).
+func (j Janitor) EnabledValue() bool { return j.Enabled == nil || *j.Enabled }
+
 type Metrics struct {
 	Listen string `yaml:"listen"`
 }
@@ -439,6 +462,11 @@ func Default() *Config {
 			BatchMaxBytes:   0,
 			BatchMaxWait:    5 * time.Minute,
 			MaxAttempts:     10,
+		},
+		Janitor: Janitor{
+			Interval:        time.Minute,
+			BatchMaxObjects: 1000,
+			ShutdownGrace:   30 * time.Second,
 		},
 		Metrics: Metrics{Listen: ":9464"},
 		Admin:   Admin{PathPrefix: "/admin"},
@@ -815,6 +843,16 @@ func (c *Config) Validate() error {
 		if w.w.BatchMaxWait < 0 {
 			add("%s.batch_max_wait: %v, не может быть отрицательным", w.name, w.w.BatchMaxWait)
 		}
+	}
+
+	if c.Janitor.Interval <= 0 {
+		add("janitor.interval: %v, должно быть > 0", c.Janitor.Interval)
+	}
+	if c.Janitor.BatchMaxObjects < 1 {
+		add("janitor.batch_max_objects: %d, должно быть >= 1", c.Janitor.BatchMaxObjects)
+	}
+	if c.Janitor.ShutdownGrace <= 0 {
+		add("janitor.shutdown_grace: %v, должно быть > 0", c.Janitor.ShutdownGrace)
 	}
 
 	for _, wm := range []struct {

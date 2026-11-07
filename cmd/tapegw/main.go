@@ -185,6 +185,18 @@ func run(args []string) error {
 		logger.Warn("АРХИВАЦИЯ ВЫКЛЮЧЕНА: migrator.enabled=false — объекты не поедут на ленту, " +
 			"landing будет расти до watermark")
 	}
+
+	// Вытеснитель дисковых копий. Выключен так же виден наружу, как выключенная
+	// архивация: без него landing растёт и после archived — молча.
+	var jan *worker.JanitorGroup
+	if cfg.Janitor.EnabledValue() {
+		jan = worker.StartJanitor(ctx, worker.JanitorDeps{
+			Cfg: cfg, Meta: pool, Spool: land, Log: logger,
+		})
+	} else {
+		logger.Warn("ВЫТЕСНЕНИЕ ВЫКЛЮЧЕНО: janitor.enabled=false — файлы landing не удалятся " +
+			"после online_until, диск будет расти до watermark")
+	}
 	if cfg.Metrics.Listen != "" {
 		rd, err := worker.StartReadiness(cfg.Metrics.Listen, cfg.Migrator.EnabledValue(), logger)
 		if err != nil {
@@ -207,6 +219,9 @@ func run(args []string) error {
 	// пачку: их отправка живёт на контексте без отмены. Ждём, но не вечно.
 	if mig != nil {
 		mig.Wait(cfg.Migrator.ShutdownGrace)
+	}
+	if jan != nil {
+		jan.Wait(cfg.Janitor.ShutdownGrace)
 	}
 	logger.Info("stopped")
 	return nil
