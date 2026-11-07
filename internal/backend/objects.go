@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -348,8 +349,11 @@ func (t *TapeGW) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3
 //
 // Гонка с вытеснением решается по ADR-0004: мы могли решить, что объект онлайн,
 // а спул уже снял флаг и удаляет файл. Поэтому при ENOENT состояние перечитывается
-// и попытка повторяется EvictRetries раз; если объект стал нечитаем — отдаём
-// InvalidObjectState, а не 500.
+// и попытка повторяется EvictRetries раз; если перечитанное состояние говорит
+// «не онлайн» — отдаём InvalidObjectState. Если же попытки кончились, а состояние
+// по-прежнему обещает диск, — это несогласованность (файл пропал у онлайн- или
+// неархивированного объекта): ERROR в журнал и InternalError, а не правдоподобный
+// InvalidObjectState, который скрыл бы потерю данных за штатным Glacier.
 func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
 	bucket, key := str(input.Bucket), str(input.Key)
 	tenant, err := tenantFromContext(ctx)
@@ -405,10 +409,27 @@ func (t *TapeGW) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 		if errors.Is(err, os.ErrNotExist) {
 			// Файл исчез между решением о читаемости и open. Перечитываем
 			// состояние: если объект вытеснили, это штатный InvalidObjectState.
-			if attempt >= t.cfg.Spool.EvictRetries {
+			if attempt < t.cfg.Spool.EvictRetries {
+				continue
+			}
+			// Попытки кончились. Решение «штатный офлайн или несогласованность»
+			// принимаем по самому свежему состоянию, а не по прочитанному до
+			// неудачного open: иначе вытеснение, закоммитившееся между чтением
+			// строки и открытием файла, было бы записано клиенту как 500.
+			fresh, _, rerr := t.readVersion(ctx, tenant, bucket, key, input.VersionId)
+			if rerr == nil && !fresh.ReadableFromDisk(time.Now()) {
 				return nil, s3err.GetBucketErr(s3err.ErrInvalidObjectState, bucket)
 			}
-			continue
+			// Состояние обещает объект на диске, а файла нет. Это не штатный
+			// Glacier: restore тут не поможет — на ленте объекта ещё нет.
+			// Промолчать и ответить InvalidObjectState — значит выдать потерю
+			// данных за нормальное состояние, поэтому при сомнении громкая
+			// ошибка: ERROR в журнал и InternalError (500) клиенту.
+			slog.Error("файл landing отсутствует у онлайн-объекта",
+				"bucket", bucket, "key", key, "id", obj.ID.String(),
+				"state", obj.State, "reread_err", rerr, "open_err", err)
+			return nil, fmt.Errorf("landing file missing for online object %s/%s (id %s): %w",
+				bucket, key, obj.ID.String(), err)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("open object %s/%s: %w", bucket, key, err)

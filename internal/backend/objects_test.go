@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -346,6 +347,87 @@ func TestGetEvictedBetweenReadAndOpen(t *testing.T) {
 	}
 	if land.Exists(id) {
 		t.Error("файл остался на диске — окно «открыли после unlink» не создано")
+	}
+}
+
+// Файл landing пропал у объекта, состояние которого обещает диск, — мимо
+// janitor (сбой диска, ошибка в коде). Это не штатный Glacier: restore не
+// поможет, на ленте объекта ещё нет. Клиент обязан получить InternalError (500),
+// а не InvalidObjectState — иначе потеря данных выглядит как нормальное
+// состояние архива.
+func TestGetMissingLandingFileIsInternalError(t *testing.T) {
+	be, m, land := newBackend(t)
+	ctx := testCtx()
+	mustBucket(t, be)
+	putBody(t, be, "b", "k", "данные")
+
+	var id uuid.UUID
+	if err := m.Pool.QueryRow(ctx, `SELECT id FROM objects WHERE key='k'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	// pending — объект ещё даже не на ленте; файл убираем напрямую, минуя
+	// выборку janitor (флаг landing остаётся true — строка врёт «диск есть»).
+	if err := land.Remove(id); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k")})
+	if err == nil {
+		t.Fatal("GET без файла landing отдал содержимое")
+	}
+	if isS3Code(err, s3err.ErrInvalidObjectState) {
+		t.Errorf("GET без файла landing: InvalidObjectState — потеря данных выглядит штатным архивом; %v", err)
+	}
+	var se s3err.S3Error
+	if errors.As(err, &se) {
+		t.Errorf("GET без файла landing: S3-код %v, ждали внутреннюю ошибку (ProcessController превратит её в 500)", se.BaseError().Code)
+	}
+}
+
+// Исчерпание попыток при уже офлайн-состоянии — всё ещё штатный
+// InvalidObjectState: вытеснение могло закоммититься между перечитыванием и
+// open. EvictRetries=0 здесь не «продублировать тест выше», а другая ось:
+// окно закрывается перечитыванием ПОСЛЕ последнего ENOENT, а не следующим
+// витком цикла.
+func TestGetEvictedAtLastAttemptIsInvalidState(t *testing.T) {
+	be, m, land := newBackendWith(t, func(c *config.Config) { c.Spool.EvictRetries = 0 })
+	ctx := testCtx()
+	mustBucket(t, be)
+	putBody(t, be, "b", "k", "данные")
+
+	var id uuid.UUID
+	if err := m.Pool.QueryRow(ctx, `SELECT id FROM objects WHERE key='k'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE objects SET state='archived', landing=true, archived_at=now(),
+		        online_until = now() + interval '1 hour' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	// Вытеснение — ровно в окне между чтением строки и открытием файла.
+	// С EvictRetries=0 этот виток последний: перечитывания следующим проходом
+	// цикла не будет, решение принимает до-чтение после ENOENT.
+	be.SetEvictHookForTest(func(uuid.UUID) {
+		if _, err := m.Pool.Exec(ctx,
+			`UPDATE objects SET online_until = now() - interval '1 hour' WHERE id = $1`, id); err != nil {
+			t.Errorf("истечение срока в крючке: %v", err)
+			return
+		}
+		cands, err := m.ClaimEvictBatch(ctx, 10)
+		if err != nil {
+			t.Errorf("ClaimEvictBatch: %v", err)
+			return
+		}
+		for _, c := range cands {
+			if err := land.Remove(c.ID); err != nil {
+				t.Errorf("unlink: %v", err)
+			}
+		}
+	})
+
+	if _, err := be.GetObject(ctx, &s3.GetObjectInput{Bucket: ptr("b"), Key: ptr("k")}); !isS3Code(err, s3err.ErrInvalidObjectState) {
+		t.Errorf("GET, вытесненный на последней попытке: %v, ждали InvalidObjectState", err)
 	}
 }
 
