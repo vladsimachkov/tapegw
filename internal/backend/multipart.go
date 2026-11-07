@@ -430,7 +430,7 @@ func (t *TapeGW) CompleteMultipartUpload(ctx context.Context,
 	for _, p := range parts {
 		srcs = append(srcs, p.FileID)
 	}
-	cipherTotal, err := t.spool.Concatenate(id, srcs, trailer)
+	cipherTotal, fileBytes, err := t.spool.Concatenate(id, srcs, trailer)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("склейка частей: %w", err)
 	}
@@ -451,6 +451,7 @@ func (t *TapeGW) CompleteMultipartUpload(ctx context.Context,
 		Bucket:        up.Bucket,
 		Key:           up.Key,
 		Size:          total,
+		FileBytes:     fileBytes,
 		ETag:          strings.Trim(etag, `"`),
 		ContentType:   up.Meta.ContentType,
 		UserMeta:      up.Meta.UserMeta,

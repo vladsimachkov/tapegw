@@ -34,9 +34,15 @@ type Object struct {
 	// TenantID — владелец строки (денормализация из миграции 0005). Нужен
 	// шифрованию: DEK оборачивают ключом тенанта объекта, и доставать его из
 	// buckets вторым запросом было бы дорого на каждом GET.
-	TenantID     int64
-	Key          string
-	Size         int64
+	TenantID int64
+	Key      string
+	Size     int64
+	// FileBytes — длина файла объекта на диске (шифротекст + манифест + футер,
+	// ADR-0019). nil у строк, записанных до миграции 0023, и у маркеров удаления:
+	// длину знает только писавший файл. Загрузчик пачки по ней объявляет длину
+	// участника (участник = файл целиком, ADR-0020); nil для него — отказ,
+	// а не угадывание.
+	FileBytes    *int64
 	ETag         string
 	Checksums    map[string]string
 	ContentType  *string
@@ -96,10 +102,17 @@ func (o *Object) ReadableFromDisk(now time.Time) bool {
 
 // PutObjectInput — данные нового текущей строки объекта.
 type PutObjectInput struct {
-	ID           uuid.UUID
-	Bucket       string
-	Key          string
-	Size         int64
+	ID     uuid.UUID
+	Bucket string
+	Key    string
+	Size   int64
+	// FileBytes — длина записанного файла на диске: шифротекст + манифест +
+	// футер (ADR-0019). Обязательна: PutObject пишет версию с данными, а без
+	// этой длины потом не объявить участника пачки (участник = файл целиком,
+	// ADR-0020), и объект молча перестал бы архивироваться. PutObject требует
+	// > 0 — пусть забытое значение падает на записи, а не через месяц на
+	// загрузчике.
+	FileBytes    int64
 	ETag         string
 	Checksums    map[string]string
 	ContentType  *string
@@ -168,6 +181,13 @@ type PutObjectInput struct {
 // Локи берём в этом порядке всегда и только в нём: обратный порядок дал бы
 // взаимоблокировку с DeleteBucket, который сначала блокирует бакет.
 func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput) (*Object, error) {
+	// Длина файла обязательна (см. PutObjectInput.FileBytes): без неё версию
+	// нельзя объявить участником пачки, и забывает её тот, кто пишет новый путь
+	// записи. Отказ здесь дешевле, чем объект, который через месяц откажет
+	// загрузчик.
+	if in.FileBytes <= 0 {
+		return nil, fmt.Errorf("meta: версия %s: не задана длина файла на диске (file_bytes)", in.ID)
+	}
 	checksums, err := json.Marshal(in.Checksums)
 	if err != nil {
 		return nil, fmt.Errorf("marshal checksums: %w", err)
@@ -318,12 +338,14 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 		// is_null_version ставится по состоянию бакета: пока версии не включены,
 		// у объекта versionId = "null" в смысле AWS. Именно эта пометка потом
 		// позволяет записи в suspended-бакет заменить предыдущую null-версию.
+		// $20 — file_bytes: аргументы в прежнем порядке, новая колонка добавлена
+		// последним аргументом, чтобы не перенумеровывать всё вокруг.
 		insertQ := `INSERT INTO objects (
-		    id, bucket_id, key, is_current, size, etag, checksums,
+		    id, bucket_id, key, is_current, size, file_bytes, etag, checksums,
 		    content_type, user_meta, acl, tags, storage_class,
 		    state, landing, online_until, tenant_id, pool_id, is_null_version,
 		    retention_mode, retain_until, legal_hold, wrapped_dek)
-		 VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12,$13,$14,$15,
+		 VALUES ($1,$2,$3,true,$4,$20,$5,$6,$7,$8,$9,$10,$11,'pending',true,$12,$13,$14,$15,
 		         $16::retention_mode,$17,$18,$19)
 		 RETURNING ` + objectCols("")
 
@@ -332,7 +354,7 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 			in.ContentType, userMeta, in.ACL, tags, in.StorageClass,
 			in.OnlineUntil, bucketTenant, DefaultPoolID, nullVersion,
 			retentionModeArg(in.RetentionMode), in.RetainUntil, in.LegalHold,
-			wrappedDEKArg(in.WrappedDEK))
+			wrappedDEKArg(in.WrappedDEK), in.FileBytes)
 		if err != nil {
 			return fmt.Errorf("insert object %s/%s: %w", in.Bucket, in.Key, err)
 		}
@@ -436,7 +458,7 @@ func retentionModeArg(mode string) any {
 // разъезжаются молча: ошибка проявляется либо как «неверный тип в Scan», либо —
 // что хуже — как прочитанный NULL там, где данные есть.
 var objectColumns = []string{
-	"id", "bucket_id", "tenant_id", "key", "size", "etag", "checksums",
+	"id", "bucket_id", "tenant_id", "key", "size", "file_bytes", "etag", "checksums",
 	"content_type", "user_meta", "acl", "tags", "storage_class",
 	"state", "landing", "online_until", "created_at", "archived_at",
 	"is_delete_marker", "is_null_version",
@@ -484,7 +506,7 @@ func scanObjectRow(src interface {
 		onlineUntil                    time.Time
 	)
 	err := src.Scan(
-		&o.ID, &o.BucketID, &o.TenantID, &key, &o.Size, &etag, &checksums,
+		&o.ID, &o.BucketID, &o.TenantID, &key, &o.Size, &o.FileBytes, &etag, &checksums,
 		&o.ContentType, &userMeta, &o.ACL, &tags, &storageClass,
 		&state, &o.Landing, &onlineUntil, &o.CreatedAt, &o.ArchivedAt,
 		&o.IsDeleteMarker, &o.IsNullVersion,

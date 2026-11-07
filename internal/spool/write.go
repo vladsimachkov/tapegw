@@ -53,6 +53,12 @@ type ObjectInfo struct {
 	// посчитано по байтам.
 	Algorithm types.ChecksumAlgorithm
 	Checksum  string
+	// DiskBytes — сколько байт реально легло на диск: шифротекст плюс хвост
+	// манифеста. Size при этом остаётся размером открытых данных (его видит
+	// клиент), а DiskBytes — длина файла, которую потом объявит загрузчик
+	// пачки: участник — файл целиком (ADR-0020), а манифест переменной длины
+	// и формулой из Size не выводится.
+	DiskBytes int64
 }
 
 // Write атомарно записывает тело объекта и возвращает его размер и суммы.
@@ -256,6 +262,17 @@ func (s *Spool) write(id, version uuid.UUID, r io.Reader, spec SumSpec, limit in
 		}
 	}
 
+	// Длина файла на диске — после хвоста манифеста и до fsync: это ровно то,
+	// что увидит читатель, и ровно то, что пойдёт в objects.file_bytes.
+	// Берём из stat, а не суммой «шифротекст + длина хвоста»: пусть источником
+	// будет файловая система, а не наша арифметика.
+	st, err := tmp.Stat()
+	if err != nil {
+		tmp.Close()
+		return info, fmt.Errorf("spool: размер файла: %w", err)
+	}
+	info.DiskBytes = st.Size()
+
 	// fsync файла до rename: иначе после падения машины в каталоге может
 	// оказаться запись о файле с нулевым содержимым.
 	if err := tmp.Sync(); err != nil {
@@ -323,12 +340,14 @@ func hashTypeFor(a types.ChecksumAlgorithm) (utils.HashType, bool) {
 // последней части, поэтому Complete остаётся конкатенацией и перешифрования
 // частей не требует.
 //
-// Возвращает суммарный размер шифротекстов частей, БЕЗ хвоста: на этой цифре
-// вызывающий сверяет смещения частей, и примешивать к ней манифест нельзя.
-func (s *Spool) Concatenate(dst uuid.UUID, srcs []uuid.UUID, trailer []byte) (int64, error) {
+// Возвращает два размера: суммарный размер шифротекстов частей БЕЗ хвоста — на
+// этой цифре вызывающий сверяет смещения частей, примешивать к ней манифест
+// нельзя, — и итоговую длину файла на диске (со склеенным хвостом), которую
+// вызывающий пишет в objects.file_bytes как объявленную длину участника пачки.
+func (s *Spool) Concatenate(dst uuid.UUID, srcs []uuid.UUID, trailer []byte) (cipherTotal, fileBytes int64, err error) {
 	tmp, err := os.CreateTemp(s.tmp, "cat-*")
 	if err != nil {
-		return 0, fmt.Errorf("spool: временный файл склейки: %w", err)
+		return 0, 0, fmt.Errorf("spool: временный файл склейки: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer func() {
@@ -342,13 +361,13 @@ func (s *Spool) Concatenate(dst uuid.UUID, srcs []uuid.UUID, trailer []byte) (in
 		f, err := s.Open(src)
 		if err != nil {
 			tmp.Close()
-			return total, fmt.Errorf("spool: часть %s: %w", src, err)
+			return total, 0, fmt.Errorf("spool: часть %s: %w", src, err)
 		}
 		n, err := io.Copy(tmp, f)
 		f.Close()
 		if err != nil {
 			tmp.Close()
-			return total, fmt.Errorf("spool: склейка %s: %w", src, err)
+			return total, 0, fmt.Errorf("spool: склейка %s: %w", src, err)
 		}
 		total += n
 	}
@@ -356,24 +375,33 @@ func (s *Spool) Concatenate(dst uuid.UUID, srcs []uuid.UUID, trailer []byte) (in
 	if len(trailer) > 0 {
 		if _, err := tmp.Write(trailer); err != nil {
 			tmp.Close()
-			return total, fmt.Errorf("spool: хвост манифеста: %w", err)
+			return total, 0, fmt.Errorf("spool: хвост манифеста: %w", err)
 		}
 	}
 
+	// Длина готового файла — из stat, как в write(): источник истины — файловая
+	// система, а не наша арифметика по частям и хвосту.
+	st, err := tmp.Stat()
+	if err != nil {
+		tmp.Close()
+		return total, 0, fmt.Errorf("spool: размер склейки: %w", err)
+	}
+	fileBytes = st.Size()
+
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return total, fmt.Errorf("spool: fsync склейки: %w", err)
+		return total, 0, fmt.Errorf("spool: fsync склейки: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return total, fmt.Errorf("spool: закрыть склейку: %w", err)
+		return total, 0, fmt.Errorf("spool: закрыть склейку: %w", err)
 	}
 	final := s.Path(dst)
 	if err := os.Rename(tmpName, final); err != nil {
-		return total, fmt.Errorf("spool: rename склейки на %s: %w", final, err)
+		return total, 0, fmt.Errorf("spool: rename склейки на %s: %w", final, err)
 	}
 	tmpName = ""
 	if err := fsyncDir(filepath.Dir(final)); err != nil {
-		return total, err
+		return total, 0, err
 	}
-	return total, nil
+	return total, fileBytes, nil
 }

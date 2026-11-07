@@ -14,6 +14,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
 	"github.com/versity/versitygw/s3api/utils"
+
+	"github.com/vladsimachkov/tapegw/internal/encrypt"
 )
 
 func newSpool(t *testing.T) *Spool {
@@ -266,5 +268,87 @@ func TestAllShardsExistAfterOpen(t *testing.T) {
 		if _, err := os.Stat(filepath.Dir(s.Path(uuid.New()))); err != nil {
 			t.Fatalf("шарда нет для случайного UUID: %v", err)
 		}
+	}
+}
+
+// DiskBytes — длина файла на диске: шифротекст + хвост манифеста (ADR-0019).
+// По ней загрузчик пачки объявляет участника (участник = файл целиком,
+// ADR-0020), поэтому DiskBytes обязана совпадать со stat файла, а Size обязан
+// оставаться открытыми байтами: это разные величины, и путать их нельзя.
+func TestWriteEncryptedDiskBytesIsWholeFile(t *testing.T) {
+	s := newSpool(t)
+	id := uuid.New()
+	key := make([]byte, encrypt.KeySize)
+	salt := make([]byte, encrypt.SaltSize)
+	body := bytes.Repeat([]byte("сегменты "), 500)
+	trailer := []byte("хвост манифеста: соль, части, метаданные")
+
+	info, err := s.WriteEncrypted(id, bytes.NewReader(body), SumSpec{}, 0,
+		key, int64(len(body)), salt,
+		func(ObjectInfo) ([]byte, error) { return trailer, nil })
+	if err != nil {
+		t.Fatalf("WriteEncrypted: %v", err)
+	}
+	if info.Size != int64(len(body)) {
+		t.Errorf("Size = %d, хотели открытые байты %d", info.Size, len(body))
+	}
+	want := encrypt.CipherSize(int64(len(body))) + int64(len(trailer))
+	if info.DiskBytes != want {
+		t.Errorf("DiskBytes = %d, хотели шифротекст + хвост = %d", info.DiskBytes, want)
+	}
+	st, err := os.Stat(s.Path(id))
+	if err != nil {
+		t.Fatalf("stat файла: %v", err)
+	}
+	if st.Size() != info.DiskBytes {
+		t.Errorf("на диске %d байт, DiskBytes объявил %d", st.Size(), info.DiskBytes)
+	}
+}
+
+// Concatenate возвращает два размера: сумму шифротекстов частей без хвоста
+// (по ней сверяют смещения частей) и фактическую длину файла с хвостом — её
+// пишут в objects.file_bytes. Перепутать их местами значит обрезать манифест
+// multipart-объекта, поэтому проверяем обе по отдельности и по stat.
+func TestConcatenateReturnsCipherTotalAndFileBytes(t *testing.T) {
+	s := newSpool(t)
+	key := make([]byte, encrypt.KeySize)
+	salt := make([]byte, encrypt.SaltSize)
+	dst := uuid.New()
+	b1 := bytes.Repeat([]byte("часть один "), 300)
+	b2 := bytes.Repeat([]byte("часть два "), 400)
+	p1, p2 := uuid.New(), uuid.New()
+
+	// version — UUID будущего объекта: nonce и AAD строятся от него, а не от
+	// имени файла части (см. WritePartEncrypted).
+	for _, pc := range []struct {
+		file uuid.UUID
+		body []byte
+		part uint32
+	}{{p1, b1, 1}, {p2, b2, 2}} {
+		if _, err := s.WritePartEncrypted(pc.file, dst, bytes.NewReader(pc.body),
+			SumSpec{}, 0, key, int64(len(pc.body)), pc.part, salt); err != nil {
+			t.Fatalf("часть %d: %v", pc.part, err)
+		}
+	}
+
+	trailer := []byte("манифест одного объекта на две части")
+	cipherTotal, fileBytes, err := s.Concatenate(dst, []uuid.UUID{p1, p2}, trailer)
+	if err != nil {
+		t.Fatalf("Concatenate: %v", err)
+	}
+	wantCipher := encrypt.CipherSize(int64(len(b1))) + encrypt.CipherSize(int64(len(b2)))
+	if cipherTotal != wantCipher {
+		t.Errorf("cipherTotal = %d, хотели %d (без хвоста)", cipherTotal, wantCipher)
+	}
+	wantFile := wantCipher + int64(len(trailer))
+	if fileBytes != wantFile {
+		t.Errorf("fileBytes = %d, хотели %d (с хвостом)", fileBytes, wantFile)
+	}
+	st, err := os.Stat(s.Path(dst))
+	if err != nil {
+		t.Fatalf("stat файла: %v", err)
+	}
+	if st.Size() != fileBytes {
+		t.Errorf("на диске %d байт, fileBytes объявил %d", st.Size(), fileBytes)
 	}
 }
