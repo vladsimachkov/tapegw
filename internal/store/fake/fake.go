@@ -60,6 +60,12 @@ type blob struct {
 	complete bool
 	attrs    map[string]string
 	media    []string
+	// pending моделирует ленточное промежуточное состояние: экстент уже
+	// зарегистрирован, но копия ещё не в sync. На семействе dir такого не
+	// бывает — Phobos регистрирует экстенты по завершении записи (замер на
+	// ci-dir, docs/ops/tape-library.md), поэтому по умолчанию неполная копия
+	// в fake устроена как на dir: объект есть, экстентов нет.
+	pending bool
 }
 
 // New создаёт пустое хранилище.
@@ -274,13 +280,23 @@ func (s *Store) Stat(ctx context.Context, id uuid.UUID) (store.Meta, error) {
 	if !ok {
 		return store.Meta{}, store.ErrNotFound
 	}
-	return store.Meta{
+	m := store.Meta{
 		ID:       id,
 		Size:     int64(len(b.data)),
 		Version:  b.version,
 		Complete: b.complete,
 		Attrs:    cloneAttrs(b.attrs),
-	}, nil
+	}
+	if b.pending {
+		// Явно включённое ленточное состояние: экстент виден, но не sync.
+		media := ""
+		if len(b.media) > 0 {
+			media = b.media[0]
+		}
+		m.Extents = []store.Extent{{Size: int64(len(b.data)), Media: media, State: "pending"}}
+		m.Complete = false
+	}
+	return m, nil
 }
 
 func (s *Store) Delete(ctx context.Context, ids []uuid.UUID) []Result {
@@ -335,6 +351,22 @@ func (s *Store) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.data)
+}
+
+// MarkPending включает ленточное промежуточное состояние: экстент зарегистрирован,
+// но копия не в sync. На dir такое состояние не воспроизводится, поэтому оно
+// включается явно — общий набор сценариев запускает его только там, где оно
+// осмысленно.
+func (s *Store) MarkPending(id uuid.UUID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if b, ok := s.data[id]; ok {
+		b.pending = true
+		b.complete = false
+		// data хранит значения, а не указатели: без обратной записи правка
+		// исчезла бы вместе со копией.
+		s.data[id] = b
+	}
 }
 
 // Complete — «дописан» ли объект. Тесты проверяют, что воркер не принял
