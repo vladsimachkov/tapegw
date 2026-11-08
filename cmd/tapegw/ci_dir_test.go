@@ -141,10 +141,9 @@ metrics: {listen: %q}
 	}
 	defer pool.Close()
 
-	// Носители регистрирует явный шаг стенда (см. standRegisterMedia): с S6
-	// регистрация вынесена из тела теста в подготовку стенда, до появления
-	// команды Ф1.5.
-	standRegisterMedia(t, ctx, pool)
+	// Носители регистрирует явный шаг стенда (см. standRegisterMedia) штатной
+	// командой Ф1.5 — тот же путь оператора, каким лента заводится на установке.
+	standRegisterMedia(t, gwBin, gwCfg, "/var/lib/phobos/dir1", "/var/lib/phobos/dir2")
 
 	// --- PUT объекта крупнее одного кадра (кадр mover'а — 64 KiB) ---
 	body := make([]byte, 5<<20)

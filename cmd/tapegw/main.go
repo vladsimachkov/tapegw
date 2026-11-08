@@ -43,9 +43,14 @@ func main() {
 }
 
 func run(args []string) error {
+	// Операторские подкоманды (`tapegw admin media add`, Ф1.5) — не сервер:
+	// разбираются до флагов шлюза.
+	if len(args) > 0 && args[0] == "admin" {
+		return runAdmin(args[1:])
+	}
 	fs := flag.NewFlagSet("tapegw", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "usage: tapegw [flags]\n\n")
+		fmt.Fprintf(fs.Output(), "usage: tapegw [flags]\n       tapegw admin media add ...\n\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(fs.Output(), "\nполная конфигурация — docs/ARCHITECTURE.md, deploy/tapegw.yaml.example\n")
 	}

@@ -716,3 +716,27 @@ func TestJanitorValidate(t *testing.T) {
 		}
 	}
 }
+
+// Поколение закрыто для записи только по явному writable: false (слой 2 Р5):
+// отсутствие записи в конфиге не закрывает поколение молча.
+func TestGenerationWritable(t *testing.T) {
+	f := false
+	tr := true
+	p := Phobos{Generations: map[string]Generation{
+		"LTO-7": {Writable: &f},
+		"LTO-8": {Writable: &tr},
+		"LTO-9": {},
+	}}
+	if !p.GenerationWritable("LTO-8") {
+		t.Error("LTO-8 с writable: true закрыт")
+	}
+	if !p.GenerationWritable("LTO-9") {
+		t.Error("LTO-9 без writable закрыт — закрытие должно быть явным")
+	}
+	if !p.GenerationWritable("LTO-10") {
+		t.Error("неизвестное поколение закрыто — по умолчанию открыто")
+	}
+	if p.GenerationWritable("LTO-7") {
+		t.Error("LTO-7 с writable: false открыт")
+	}
+}
