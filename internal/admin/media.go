@@ -104,10 +104,14 @@ func MediaAdd(ctx context.Context, d MediaDeps, p MediaAddParams) (MediaAddResul
 		// Носитель с данными и без тега пула: по какому пулу лежат эти данные,
 		// неизвестно — они могли быть записаны в обход tapegw. Присвоение пула
 		// такому носителю — осознанный шаг оператора (-adopt), а не побочный
-		// эффект регистрации.
-		if !hasPoolTag(med.Tags) && med.UsedBytes > 0 && !p.Adopt {
-			return res, fmt.Errorf("admin: носитель %s содержит данные (%d байт), но тега пула нет: присвоение пула — осознанный шаг, повторите с -adopt",
-				p.Label, med.UsedBytes)
+		// эффект регистрации. Данные — по fs.status (used/full), а не по
+		// занятым байтам: для dir stats.phys_spc_used показывает занятость
+		// всей файловой системы, а не данные Phobos (проверено на стенде:
+		// свежий отформатированный dir показывает сотни гигабайт при
+		// fs.status=empty).
+		if !hasPoolTag(med.Tags) && (med.FSStatus == "used" || med.FSStatus == "full") && !p.Adopt {
+			return res, fmt.Errorf("admin: носитель %s содержит данные (fs.status=%s), но тега пула нет: присвоение пула — осознанный шаг, повторите с -adopt",
+				p.Label, med.FSStatus)
 		}
 		tags, err := planTags(med.Tags, poolTag, p)
 		if err != nil {

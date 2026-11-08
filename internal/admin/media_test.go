@@ -405,6 +405,32 @@ func TestMediaAddAdoptRequired(t *testing.T) {
 	}
 }
 
+// Свежий отформатированный dir без тегов: phys_spc_used у dir показывает
+// занятость всей файловой системы (на стенде — сотни гигабайт), а не данные
+// Phobos. Индикатор данных — fs.status, и он здесь empty: -adopt не нужен,
+// регистрация проходит. Именно на этом состоянии падал e2e-tape в CI, когда
+// проверка опиралась на байты.
+func TestMediaAddFreshFormattedNeedsNoAdopt(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	f := newFake(t)
+	f.set("list.out", `[{"name": "/var/lib/phobos/dir9", "tags": [], "adm_status": "unlocked",`+
+		` "put_access": true, "fs.status": "empty", "stats.phys_spc_free": 1000,`+
+		` "stats.phys_spc_used": 64513060864}]`)
+
+	res, err := mediaAdd(t, m, f)
+	if err != nil {
+		t.Fatalf("регистрация свежего dir: %v", err)
+	}
+	if res.MediaID == 0 {
+		t.Error("media.id не вернулся")
+	}
+	row, ok := mediaRow(t, m, "/var/lib/phobos/dir9")
+	if !ok || row["lifecycle"] != "active" {
+		t.Errorf("строка не заведена как active: %v", row)
+	}
+}
+
 // С явным -adopt пул присваивается: теги ставятся, строка заводится.
 func TestMediaAddAdoptAssignsPool(t *testing.T) {
 	m := testdb.Connect(t)
