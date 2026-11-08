@@ -109,6 +109,27 @@ func StartMigrators(ctx context.Context, deps MigratorDeps, targets []MoverTarge
 	if err != nil {
 		return nil, err
 	}
+	// Политика копий пула (предложение 0013 §2, Ф1.1): число копий и теги
+	// каждой — из конфига, имя пула — из БД. Опечатка в имени пула в конфиге
+	// отсекается на старте: иначе «политика есть» молча означает «пишем одну
+	// копию», а это ровно то, от чего политика защищает.
+	specs, specTags := []string{copySpec}, map[string][]string{copySpec: {tag}}
+	poolName, err := deps.Meta.PoolName(ctx, meta.DefaultPoolID)
+	if err != nil {
+		return nil, err
+	}
+	for cfgName := range deps.Cfg.Pools {
+		if _, ok, err := deps.Meta.PoolByName(ctx, cfgName); err != nil {
+			return nil, err
+		} else if !ok {
+			return nil, fmt.Errorf("worker: pools.%s в конфиге: пула с таким именем нет в базе — политика не применится ни к чему", cfgName)
+		}
+	}
+	if pw, ok := deps.Cfg.Pools[poolName]; ok {
+		specs, specTags = pw.CopySpecs(tag)
+		log.Info("migrator: политика копий пула",
+			slog.String("пул", poolName), slog.Any("копии", specs))
+	}
 	g := &MigratorGroup{log: log}
 	load := migrator.NewLoader(deps.Meta, deps.Spool)
 	for _, t := range targets {
@@ -120,7 +141,7 @@ func StartMigrators(ctx context.Context, deps MigratorDeps, targets []MoverTarge
 		g.wg.Add(1)
 		go func(t MoverTarget, id string) {
 			defer g.wg.Done()
-			runMigrator(ctx, deps, t, id, load, tag)
+			runMigrator(ctx, deps, t, id, load, specs, specTags)
 		}(t, id)
 	}
 	log.Info("migrator: воркеры запущены",
@@ -146,8 +167,9 @@ func (g *MigratorGroup) Wait(grace time.Duration) bool {
 	}
 }
 
-// runMigrator — цикл одного воркера.
-func runMigrator(ctx context.Context, deps MigratorDeps, t MoverTarget, id string, load migrator.LoadItems, tag string) {
+// runMigrator — цикл одного воркера. specs/specTags — спецификации копий и их
+// теги (политика пула из конфига либо одна «main» с тегом пула по умолчанию).
+func runMigrator(ctx context.Context, deps MigratorDeps, t MoverTarget, id string, load migrator.LoadItems, specs []string, specTags map[string][]string) {
 	cfg, log := deps.Cfg, deps.Log
 	if log == nil {
 		log = slog.Default()
@@ -156,7 +178,6 @@ func runMigrator(ctx context.Context, deps MigratorDeps, t MoverTarget, id strin
 	// доходит», а не «обрывается по сигналу».
 	sendCtx := context.WithoutCancel(ctx)
 	lim := meta.DefaultBatchLimits(cfg.Migrator.BatchMaxObjects, int64(cfg.Migrator.BatchMaxBytes))
-	attrs := map[string][]string{copySpec: {tag}}
 
 	for first := true; ; first = false {
 		if !first {
@@ -186,13 +207,13 @@ func runMigrator(ctx context.Context, deps MigratorDeps, t MoverTarget, id strin
 
 		a := &migrator.Archiver{
 			Meta: deps.Meta, Put: cli,
-			Spec:   copySpec,
-			Format: pack.FormatVersion,
-			// Одна копия по тегу пула — временное состояние среза; политика
-			// из двух копий в боевом пути — пункт «Две копии в боевом пути»
-			// плана после среза.
-			Specs:               []string{copySpec},
-			SpecTags:            attrs,
+			// Копии пишет политика пула (Ф1.1): N спецификаций с своими
+			// тегами, archived — только после записи всех (правило
+			// «архивный = все копии», предложение 0013).
+			Spec:                specs[0],
+			Format:              pack.FormatVersion,
+			Specs:               specs,
+			SpecTags:            specTags,
 			WorkerID:            id,
 			ClaimTTL:            cfg.Migrator.ClaimTTL,
 			LandingMinRetention: cfg.Spool.LandingMinRetention,
@@ -241,7 +262,7 @@ func runMigrator(ctx context.Context, deps MigratorDeps, t MoverTarget, id strin
 	}
 }
 
-// copySpec — имя единственной спецификации копии в срезе. Тег берётся из
-// pools.phobos_tag (meta.PoolTag). Одна копия — временное состояние среза:
-// «Две копии в боевом пути» — пункт плана после среза.
+// copySpec — имя копии по умолчанию, когда у пула нет политики в конфиге:
+// одна копия с тегом пула (pools.phobos_tag, meta.PoolTag). Политика из
+// pools.<имя>.copies перекрывает её целиком (Ф1.1).
 const copySpec = "main"

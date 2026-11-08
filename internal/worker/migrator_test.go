@@ -275,3 +275,109 @@ func TestStopDoesNotAbortSend(t *testing.T) {
 		return packState(t, h.m, packID) == "archived" && objectState(t, h.m, id) == "archived"
 	})
 }
+
+// Политика копий пула (Ф1.1): две копии в конфиге — воркер пишет обе (первую
+// put'ом, вторую локальной передачей из удержанного буфера), теги каждой
+// уходят в Phobos как заданы — именно так копии разводятся по носителям.
+// archived при этом только когда записаны обе: «архивный = все копии».
+func TestMigratorWorkerPolicyCopies(t *testing.T) {
+	h := newHarness(t)
+	// Имя пула в конфиге обязано совпасть с pools.name в БД: в сиде 'shared'.
+	h.cfg.Pools = map[string]config.PoolWrite{"shared": {Copies: []config.CopySpec{
+		{Name: "left", Tags: []string{"side:left"}},
+		{Name: "right", Tags: []string{"side:right"}},
+	}}}
+	id := h.putObject(t, "wb", "two.bin", []byte("две копии по политике пула"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	targets, err := worker.PlanMigrators(h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := worker.StartMigrators(ctx, worker.MigratorDeps{
+		Cfg: h.cfg, Meta: h.m, Spool: h.land, Log: h.log,
+	}, targets)
+	if err != nil {
+		t.Fatalf("StartMigrators: %v", err)
+	}
+
+	waitFor(t, "объект заархивирован", func() bool { return objectState(t, h.m, id) == "archived" })
+	cancel()
+	if !g.Wait(h.cfg.Migrator.ShutdownGrace) {
+		t.Error("воркер не завершился по сигналу за grace")
+	}
+
+	cctx := context.Background()
+	var packID uuid.UUID
+	if err := h.m.Pool.QueryRow(cctx,
+		`SELECT pack_id FROM objects WHERE id = $1`, id).Scan(&packID); err != nil {
+		t.Fatal(err)
+	}
+
+	// В реестре — обе копии, каждая со своей спецификацией и своим объектом
+	// Phobos (у копии свой oid, ADR-0022).
+	rows, err := h.m.Pool.Query(cctx,
+		`SELECT spec, state FROM archive_copies WHERE pack_id = $1 ORDER BY spec`, packID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var specs, states []string
+	for rows.Next() {
+		var s, st string
+		if err := rows.Scan(&s, &st); err != nil {
+			t.Fatal(err)
+		}
+		specs = append(specs, s)
+		states = append(states, st)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(specs, ",") != "left,right" {
+		t.Fatalf("копии в реестре: %v, ожидали left,right", specs)
+	}
+	for i, st := range states {
+		if st != "done" {
+			t.Errorf("копия %s в %s, ждали done", specs[i], st)
+		}
+	}
+
+	// Теги каждой копии ушли в Phobos своими: тег пула добавлен к тегу стороны
+	// (ADR-0013), а не заменён им. Копия «right» — отдельный объект Phobos с
+	// детерминированным oid от пачки и имени копии.
+	rightOp := uuid.NewSHA1(packID, []byte("right"))
+	if got := strings.Join(h.env.Store.Tags(packID), ","); got != "pool:shared,side:left" {
+		t.Errorf("теги первой копии %q, ожидали pool:shared,side:left", got)
+	}
+	if got := strings.Join(h.env.Store.Tags(rightOp), ","); got != "pool:shared,side:right" {
+		t.Errorf("теги второй копии %q, ожидали pool:shared,side:right", got)
+	}
+	if got := h.env.Store.Attrs(rightOp)["tapegw.copy"]; got != "right" {
+		t.Errorf("атрибут tapegw.copy второй копии %q", got)
+	}
+	// Два объекта на «ленте», а не один: без второй копии тест бы проходил и
+	// молчал бы о ней.
+	if h.env.Store.Len() != 2 {
+		t.Errorf("на ленте %d объектов, ждали 2 (пачка + вторая копия)", h.env.Store.Len())
+	}
+}
+
+// Опечатка в имени пула в политике отсекается на старте: иначе «политика есть»
+// молча означала бы «пишем одну копию» — ровно то, от чего политика защищает.
+func TestStartMigratorsRejectsUnknownPool(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Pools = map[string]config.PoolWrite{"shared-d": {Copies: []config.CopySpec{
+		{Name: "left", Tags: []string{"side:left"}},
+	}}}
+	_, err := worker.StartMigrators(context.Background(), worker.MigratorDeps{
+		Cfg: h.cfg, Meta: h.m, Spool: h.land, Log: h.log,
+	}, nil)
+	if err == nil {
+		t.Fatal("политика для несуществующего пула принята")
+	}
+	if !strings.Contains(err.Error(), "shared-d") {
+		t.Errorf("в ошибке нет имени пула: %v", err)
+	}
+}

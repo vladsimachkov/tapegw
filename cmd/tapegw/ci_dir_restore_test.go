@@ -387,12 +387,23 @@ metrics: {listen: %q}
 func standRegisterMedia(t *testing.T, gwBin, gwCfg string, labels ...string) {
 	t.Helper()
 	for _, label := range labels {
-		run := exec.Command(gwBin, "admin", "media", "add", "-config", gwCfg,
-			"-label", label, "-pool", "1", "-generation", "L8", "-medium-type", "L8")
-		run.Stdout, run.Stderr = os.Stderr, os.Stderr
-		if err := run.Run(); err != nil {
-			t.Fatalf("регистрация носителя %s: %v", label, err)
-		}
+		standRegisterMediaSide(t, gwBin, gwCfg, label, "")
+	}
+}
+
+// standRegisterMediaSide — то же, но с указанием стороны (тег side:<значение>):
+// тест политики копий разводит копии по лентам именно сторонами.
+func standRegisterMediaSide(t *testing.T, gwBin, gwCfg, label, side string) {
+	t.Helper()
+	args := []string{"admin", "media", "add", "-config", gwCfg,
+		"-label", label, "-pool", "1", "-generation", "L8", "-medium-type", "L8"}
+	if side != "" {
+		args = append(args, "-side", side)
+	}
+	run := exec.Command(gwBin, args...)
+	run.Stdout, run.Stderr = os.Stderr, os.Stderr
+	if err := run.Run(); err != nil {
+		t.Fatalf("регистрация носителя %s: %v", label, err)
 	}
 }
 

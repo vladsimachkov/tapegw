@@ -45,6 +45,33 @@ func (m *Meta) PoolTag(ctx context.Context, poolID int64) (string, error) {
 	return tag, nil
 }
 
+// PoolName — имя пула по id. Политики копий в конфиге (pools.<имя>) ищутся
+// по имени: id в YAML — это опечатка, которую никто не заметит до первой
+// записи не туда.
+func (m *Meta) PoolName(ctx context.Context, poolID int64) (string, error) {
+	var name string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT name FROM pools WHERE id = $1`, poolID).Scan(&name); err != nil {
+		return "", fmt.Errorf("meta: имя пула %d: %w", poolID, err)
+	}
+	return name, nil
+}
+
+// PoolByName — id пула по имени (false — пула с таким именем нет). Им нужна
+// проверка конфига на старте: политика для несуществующего пула — опечатка,
+// а не «молча пишем одну копию».
+func (m *Meta) PoolByName(ctx context.Context, name string) (int64, bool, error) {
+	var id int64
+	err := m.Pool.QueryRow(ctx, `SELECT id FROM pools WHERE name = $1`, name).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("meta: пул %q: %w", name, err)
+	}
+	return id, true, nil
+}
+
 // BeginPackArchive заводит строку пачки и переводит участников в archiving.
 //
 // Возвращает открытую транзакцию: вызывающий обязан закоммитить её ДО вызова

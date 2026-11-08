@@ -39,7 +39,53 @@ type Config struct {
 	Admin    Admin   `yaml:"admin"`
 	Logging  Logging `yaml:"logging"`
 	Root     Root    `yaml:"root"`
-	Version  Version `yaml:"-"`
+	// Pools — политика записи пулов по имени (pools.name в БД). Пусто =
+	// единственный пул пишет одну копию с тегом пула (историческое поведение
+	// среза). См. PoolWrite.
+	Pools   map[string]PoolWrite `yaml:"pools"`
+	Version Version              `yaml:"-"`
+}
+
+// PoolWrite — политика записи одного пула (предложение 0013 §2): список
+// спецификаций копий, число копий = длина списка. Правило «архивный = все
+// копии записаны» означает, что migrator пишет каждую копию отдельной
+// операцией протокола со своими тегами, а объект становится archived только
+// после последней.
+//
+// library_write из предложения сюда пока не вошёл: библиотека в конфиге одна
+// (phobos.library), выбор библиотеки записи становится по-настоящему
+// попульным вместе с переездом между библиотеками (Ф2.8).
+type PoolWrite struct {
+	Copies []CopySpec `yaml:"copies"`
+}
+
+// CopySpec — одна копия: имя (пишется в archive_copies.spec и в атрибут
+// tapegw.copy) и теги, которыми Phobos выберет ленту для этой копии.
+// Тег пула добавлять не нужно — migrator дописывает его сам (ADR-0013: тег
+// пула обязан быть на каждой записи).
+type CopySpec struct {
+	Name string   `yaml:"name"`
+	Tags []string `yaml:"tags"`
+}
+
+// CopySpecs — спецификации и теги для migrator'а: порядок копий сохранён,
+// тег пула добавлен к каждой копии без дублей. Теги двух копий не должны
+// совпадать — иначе «две копии» могут лечь на одну ленту, и проверка
+// держится конфигом, а не надеждой.
+func (p PoolWrite) CopySpecs(poolTag string) (specs []string, tags map[string][]string) {
+	tags = make(map[string][]string, len(p.Copies))
+	for _, c := range p.Copies {
+		specs = append(specs, c.Name)
+		set := make([]string, 0, len(c.Tags)+1)
+		set = append(set, poolTag)
+		for _, t := range c.Tags {
+			if t != poolTag {
+				set = append(set, t)
+			}
+		}
+		tags[c.Name] = set
+	}
+	return specs, tags
 }
 
 // Root — учётная запись администратора S3. versitygw требует непустые access/secret,
@@ -974,6 +1020,40 @@ func (c *Config) Validate() error {
 			"планировщику архивации нечем представиться (SAN-URI tapegw://scheduler, ADR-0021)")
 	}
 
+	// Политика копий пула (предложение 0013 §2). Проверяется всё до старта:
+	// кривая политика, обнаруженная в момент записи, — это уже испорченная
+	// очередь, а не ошибка конфигурации.
+	for _, name := range sortedKeys(c.Pools) {
+		pw := c.Pools[name]
+		if len(pw.Copies) == 0 {
+			add("pools.%s.copies: пусто, нужна хотя бы одна спецификация копии", name)
+		}
+		seenName := map[string]bool{}
+		seenTags := map[string]string{}
+		for _, cp := range pw.Copies {
+			if strings.TrimSpace(cp.Name) == "" {
+				add("pools.%s.copies: у копии пустое имя — оно попадёт в spec копии и атрибут tapegw.copy", name)
+				continue
+			}
+			if seenName[cp.Name] {
+				add("pools.%s.copies: имя %q повторяется — спецификации копий должны различаться", name, cp.Name)
+			}
+			seenName[cp.Name] = true
+			for _, t := range cp.Tags {
+				if strings.TrimSpace(t) == "" {
+					add("pools.%s.copies.%s: пустой тег в списке", name, cp.Name)
+				}
+			}
+			// Набор тегов как множество: порядок в YAML не должен превращать
+			// «одну и ту же ленту» в «две разные копии».
+			key := strings.Join(sortedStrings(cp.Tags), ",")
+			if other, dup := seenTags[key]; dup {
+				add("pools.%s.copies: копии %q и %q с одинаковыми тегами — обе могут лечь на одну ленту, копирование теряет смысл", name, other, cp.Name)
+			}
+			seenTags[key] = cp.Name
+		}
+	}
+
 	switch strings.ToLower(c.Logging.Format) {
 	case "json", "text":
 	default:
@@ -981,6 +1061,23 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// sortedKeys — детерминированный обход map'а конфига: сообщения об ошибках
+// не должны переставляться от запуска к запуску.
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedStrings(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
 }
 
 // ValidateMover — обязательное для процесса tapegw-mover (S1). Вызывается из
