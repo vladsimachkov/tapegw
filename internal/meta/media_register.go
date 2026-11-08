@@ -34,31 +34,42 @@ type MediaRegistration struct {
 	CapacityBytes int64
 	FreeBytes     int64
 	// Lifecycle — 'active' (цель записи: вызывающий проверил в Phobos право
-	// писать) или 'full' (на носителе уже есть данные, места нет — не цель).
-	// Регистрация не инструмент переводов lifecycle, третьих значений здесь не
-	// бывает.
+	// писать), 'full' (носитель заполнен — не цель) или 'read_only' (лента с
+	// данными, закрытая для записи сознательно: замок, снятый put или
+	// запрещённое поколение; причина обязательна). Регистрация не инструмент
+	// переводов lifecycle, третьих значений здесь не бывает.
 	Lifecycle string
+	// ReadOnlyReason — обязательна при 'read_only' и запрещена иначе: CHECK
+	// media_read_only_consistent требует ровно эквивалентности, закрытая
+	// лента без причины неотличима от закрытой по ошибке.
+	ReadOnlyReason string
 }
 
-// RegisterMedia заводит строку media с указанным lifecycle ('active' или
-// 'full'): вызывающий обязан убедиться в Phobos, что носитель отформатирован,
-// — до этой проверки строку заводить нельзя. Повтор команды с теми же
-// параметрами идемпотентен и возвращает существующий id; параметры другой
-// строки на той же метке — ErrMediaLabelTaken, перетегировать чужой носитель
-// молча нельзя.
+// RegisterMedia заводит строку media с указанным lifecycle ('active', 'full'
+// или 'read_only'): вызывающий обязан убедиться в Phobos, что носитель
+// отформатирован, — до этой проверки строку заводить нельзя. Для 'read_only'
+// обязательна причина (CHECK media_read_only_consistent требует ровно
+// эквивалентности lifecycle='read_only' ↔ причина IS NOT NULL), для прочих
+// причина запрещена. Повтор команды с теми же параметрами идемпотентен и
+// возвращает существующий id; параметры другой строки на той же метке —
+// ErrMediaLabelTaken, перетегировать чужой носитель молча нельзя.
 func (m *Meta) RegisterMedia(ctx context.Context, r MediaRegistration) (int64, error) {
-	if r.Lifecycle != "active" && r.Lifecycle != "full" {
-		return 0, fmt.Errorf("meta: регистрация носителя %q: lifecycle %q, ожидаются active или full", r.Label, r.Lifecycle)
+	if r.Lifecycle != "active" && r.Lifecycle != "full" && r.Lifecycle != "read_only" {
+		return 0, fmt.Errorf("meta: регистрация носителя %q: lifecycle %q, ожидаются active, full или read_only", r.Label, r.Lifecycle)
+	}
+	if (r.Lifecycle == "read_only") != (r.ReadOnlyReason != "") {
+		return 0, fmt.Errorf("meta: регистрация носителя %q: lifecycle %q и причина %q несовместимы (CHECK media_read_only_consistent)",
+			r.Label, r.Lifecycle, r.ReadOnlyReason)
 	}
 	var id int64
 	err := m.Pool.QueryRow(ctx,
 		`INSERT INTO media (label, generation, medium_type, pool_id, side,
-		                    lifecycle, capacity_bytes_cached, free_bytes_cached)
-		 VALUES ($1, $2, $3, $4, NULLIF($5, ''), $8, $6, $7)
+		                    lifecycle, capacity_bytes_cached, free_bytes_cached, read_only_reason)
+		 VALUES ($1, $2, $3, $4, NULLIF($5, ''), $8, $6, $7, NULLIF($9, ''))
 		 ON CONFLICT (label) DO NOTHING
 		 RETURNING id`,
 		r.Label, r.Generation, r.MediumType, r.PoolID, r.Side,
-		r.CapacityBytes, r.FreeBytes, r.Lifecycle).Scan(&id)
+		r.CapacityBytes, r.FreeBytes, r.Lifecycle, r.ReadOnlyReason).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
@@ -78,11 +89,14 @@ func (m *Meta) RegisterMedia(ctx context.Context, r MediaRegistration) (int64, e
 	}
 	sameSide := (row.Side == nil && r.Side == "") || (row.Side != nil && *row.Side == r.Side)
 	samePool := row.PoolID != nil && *row.PoolID == r.PoolID
-	// 'full' в списке наравне с активными состояниями: повтор команды на
-	// зарегистрированной заполненной ленте обязан возвращать тот же id,
-	// иначе доводку висящих копий нельзя запустить второй раз.
+	// 'full' и 'read_only' в списке наравне с активными состояниями: повтор
+	// команды на зарегистрированной заполненной или закрытой ленте обязан
+	// возвращать тот же id, иначе доводку висящих копий нельзя запустить
+	// второй раз. Переводы lifecycle повтор команды не делает — это задача
+	// сканера носителей.
 	if row.Generation == r.Generation && row.MediumType == r.MediumType && samePool && sameSide &&
-		(row.Lifecycle == "active" || row.Lifecycle == "formatted" || row.Lifecycle == "new" || row.Lifecycle == "full") {
+		(row.Lifecycle == "active" || row.Lifecycle == "formatted" || row.Lifecycle == "new" ||
+			row.Lifecycle == "full" || row.Lifecycle == "read_only") {
 		return row.ID, nil
 	}
 	return 0, fmt.Errorf("%w: %q (в реестре %s/%s, пул %v, сторона %q, состояние %s)",

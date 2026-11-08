@@ -92,14 +92,19 @@ func mediaRow(t *testing.T, m *meta.Meta, label string) (map[string]any, bool) {
 		id             int64
 		gen, mtype, lc string
 		poolID         *int64
+		reason         *string
 	)
 	err := m.Pool.QueryRow(context.Background(),
-		`SELECT id, generation, medium_type, pool_id, lifecycle FROM media WHERE label = $1`, label).
-		Scan(&id, &gen, &mtype, &poolID, &lc)
+		`SELECT id, generation, medium_type, pool_id, lifecycle, read_only_reason FROM media WHERE label = $1`, label).
+		Scan(&id, &gen, &mtype, &poolID, &lc, &reason)
 	if err != nil {
 		return nil, false
 	}
-	return map[string]any{"id": id, "gen": gen, "type": mtype, "pool": poolID, "lifecycle": lc}, true
+	rs := ""
+	if reason != nil {
+		rs = *reason
+	}
+	return map[string]any{"id": id, "gen": gen, "type": mtype, "pool": poolID, "lifecycle": lc, "reason": rs}, true
 }
 
 // Счастливый путь: носителя не было → add с тегами пула и поколения → Phobos
@@ -343,10 +348,10 @@ func TestMediaAddFullRegistersAsFull(t *testing.T) {
 	}
 
 	f := newFake(t)
-	// free=0 и put_access=false: Phobos закрыл ленту для записи — для 'full'
-	// это норма, а не отказ.
+	// free=0: лента заполнилась. put не снят и замок не наведён — оператор её
+	// не закрывал, это именно 'full', а не 'read_only'.
 	f.set("list.2.out", `[{"name": "/var/lib/phobos/dir9", "tags": ["pool:shared","gen:L8"],`+
-		` "adm_status": "unlocked", "put_access": false, "fs.status": "full",`+
+		` "adm_status": "unlocked", "put_access": true, "fs.status": "full",`+
 		` "stats.phys_spc_free": 0, "stats.phys_spc_used": 900}]`)
 	f.set("extents.out", `[{"oid": "pack/1", "media_name": ["/var/lib/phobos/dir9"]}]`)
 
@@ -381,6 +386,98 @@ func TestMediaAddFullRegistersAsFull(t *testing.T) {
 	}
 	if state != "done" {
 		t.Errorf("копия: state=%s, ждали done", state)
+	}
+}
+
+// Лента с данными и закрытая для записи — сознательное решение оператора:
+// подозрительную ленту (ошибки чтения, TapeAlert) закрывают, чтобы на неё не
+// писали, но копии её всё равно надо привязать к реестру. Регистрация проходит
+// как 'read_only' с причиной, замок не трогается (повтор команды не должен
+// молча открывать то, что оператор закрыл руками), копии доводятся до 'done'.
+func TestMediaAddLockedDataRegistersReadOnly(t *testing.T) {
+	cases := []struct{ name, adm, put, wantReason string }{
+		{"под замком", "locked", "true", "заблокирована в Phobos"},
+		{"put снят", "unlocked", "false", "запись запрещена в Phobos"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testdb.Connect(t)
+			testdb.Clean(t, m)
+			ctx := context.Background()
+			packID := uuid.New()
+			if _, err := m.Pool.Exec(ctx,
+				`INSERT INTO packs (id, pool_id, kind, state) VALUES ($1, 1, 'data', 'archived')`, packID); err != nil {
+				t.Fatal(err)
+			}
+			copyID := uuid.New()
+			if _, err := m.Pool.Exec(ctx,
+				`INSERT INTO archive_copies (id, pack_id, spec, phobos_oid, format, state, sha256)
+				 VALUES ($1, $2, 'main', 'pack/1', 1, 'writing', decode(repeat('AB', 32), 'hex'))`,
+				copyID, packID); err != nil {
+				t.Fatal(err)
+			}
+			f := newFake(t)
+			f.set("list.2.out", fmt.Sprintf(`[{"name": "/var/lib/phobos/dir9", "tags": ["pool:shared","gen:L8"],`+
+				` "adm_status": %q, "put_access": %s, "fs.status": "used",`+
+				` "stats.phys_spc_free": 1000, "stats.phys_spc_used": 500}]`, tc.adm, tc.put))
+			f.set("extents.out", `[{"oid": "pack/1", "media_name": ["/var/lib/phobos/dir9"]}]`)
+
+			res, err := mediaAdd(t, m, f)
+			if err != nil {
+				t.Fatalf("регистрация закрытой ленты: %v", err)
+			}
+			if res.BoundCopies != 1 {
+				t.Errorf("привязано %d копий, ждали 1; BindErrors=%v", res.BoundCopies, res.BindErrors)
+			}
+			row, ok := mediaRow(t, m, "/var/lib/phobos/dir9")
+			if !ok {
+				t.Fatal("строка media не создана")
+			}
+			if row["lifecycle"] != "read_only" || row["reason"] != tc.wantReason {
+				t.Errorf("строка: %v, ждали read_only/%q", row, tc.wantReason)
+			}
+			if strings.Contains(f.calls(), " unlock ") {
+				t.Errorf("замок трогать нельзя:\n%s", f.calls())
+			}
+			var state string
+			if err := m.Pool.QueryRow(ctx,
+				`SELECT state::text FROM archive_copies WHERE id = $1`, copyID).Scan(&state); err != nil {
+				t.Fatal(err)
+			}
+			if state != "done" {
+				t.Errorf("копия: state=%s, ждали done", state)
+			}
+		})
+	}
+}
+
+// Поколение закрыто для записи (writable: false в конфиге — слой 2 запрета Р5
+// из 0014): лента регистрируется 'read_only' с причиной, а не отказом, и замок
+// не трогается — даже у свежей ленты под замком: целью записи она не станет.
+func TestMediaAddGenerationReadOnlyRegistersReadOnly(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	f := newFake(t)
+	f.set("list.out", `[{"name": "/var/lib/phobos/dir9", "tags": ["pool:shared","gen:L7"],`+
+		` "adm_status": "locked", "put_access": true, "fs.status": "empty",`+
+		` "stats.phys_spc_free": 1000, "stats.phys_spc_used": 0}]`)
+
+	_, err := admin.MediaAdd(context.Background(),
+		admin.MediaDeps{Meta: m, Phobos: f.client("dir")},
+		admin.MediaAddParams{Label: "/var/lib/phobos/dir9", Generation: "L7", MediumType: "dir",
+			PoolID: 1, GenerationReadOnly: true})
+	if err != nil {
+		t.Fatalf("регистрация ленты запрещённого поколения: %v", err)
+	}
+	row, ok := mediaRow(t, m, "/var/lib/phobos/dir9")
+	if !ok {
+		t.Fatal("строка media не создана")
+	}
+	if row["lifecycle"] != "read_only" || row["reason"] != "поколение закрыто для записи" {
+		t.Errorf("строка: %v", row)
+	}
+	if strings.Contains(f.calls(), " unlock ") {
+		t.Errorf("замок трогать нельзя:\n%s", f.calls())
 	}
 }
 

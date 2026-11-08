@@ -35,6 +35,10 @@ type MediaAddParams struct {
 	// но тега пула нет. Без него такие носители — отказ: данные могли быть
 	// записаны в обход tapegw, и по какому пулу — неизвестно.
 	Adopt bool
+	// GenerationReadOnly — поколение закрыто для записи в конфиге tapegw
+	// (Р5 из 0014, слой 2): лента регистрируется read_only, а не целью
+	// записи, и замок её не трогается.
+	GenerationReadOnly bool
 }
 
 // MediaDeps — зависимости операции; разделяются на БД и Phobos, чтобы тест
@@ -164,14 +168,29 @@ func MediaAdd(ctx context.Context, d MediaDeps, p MediaAddParams) (MediaAddResul
 		return res, fmt.Errorf("admin: статус файловой системы носителя %s не определён (fs.status=%q), форматирование запрещено",
 			p.Label, med.FSStatus)
 	}
-	// Цель записи или архив. Носитель без свободного места регистрируется как
-	// 'full' — ровно тот случай, ради которого Ф1.5: лента, записанная в обход
-	// реестра и уже заполнившаяся, чьи копии висят в 'writing'. 'full' не
-	// является целью записи (представление media_write_targets его не
-	// включает), поэтому права на запись от него не требуются — и замок его не
-	// трогается: лок на полной ленте может быть сознательной защитой данных.
-	lifecycle := "full"
-	if med.FreeBytes > 0 {
+	// Цель записи, архив или read_only. Замок снимаем только со свежей ленты
+	// — blank, которую отформатировала команда, или empty: их цель — запись.
+	// Замок или снятый put на ленте с данными — сознательное решение
+	// оператора: подозрительную ленту (ошибки чтения, TapeAlert) закрывают,
+	// чтобы на неё не писали, но копии её всё равно надо привязать; то же для
+	// поколения, закрытого для записи (Р5 из 0014, слой 2). Регистрация этого
+	// решения не отменяет — такая лента заводится read_only с причиной, замок
+	// не трогается.
+	hasData := med.FSStatus == "used" || med.FSStatus == "full"
+	lifecycle, readOnlyReason := "active", ""
+	switch {
+	case p.GenerationReadOnly:
+		lifecycle, readOnlyReason = "read_only", "поколение закрыто для записи"
+	case hasData && med.AdmStatus != "unlocked":
+		lifecycle, readOnlyReason = "read_only", "заблокирована в Phobos"
+	case hasData && !med.PutAccess:
+		lifecycle, readOnlyReason = "read_only", "запись запрещена в Phobos"
+	case med.FreeBytes <= 0:
+		// 'full' — лента, записанная в обход реестра и уже заполнившаяся,
+		// чьи копии висят в 'writing'; целью записи она не является
+		// (media_write_targets её не включает), права на запись не требуется.
+		lifecycle = "full"
+	default:
 		// Цель записи: разблокирован и пишет — иначе первая же пачка дала бы
 		// ENOSPC/EACCES, а планировщик уже пообещал это место.
 		if med.AdmStatus != "unlocked" {
@@ -187,19 +206,19 @@ func MediaAdd(ctx context.Context, d MediaDeps, p MediaAddParams) (MediaAddResul
 			return res, fmt.Errorf("admin: Phobos не разрешает запись на %s (adm_status=%s, put_access=%v), а свободное место есть — носитель претендует на роль цели записи",
 				p.Label, med.AdmStatus, med.PutAccess)
 		}
-		lifecycle = "active"
 	}
 
 	// --- половина реестра ---
 	id, err := d.Meta.RegisterMedia(ctx, meta.MediaRegistration{
-		Label:         p.Label,
-		Generation:    p.Generation,
-		MediumType:    p.MediumType,
-		Side:          p.Side,
-		PoolID:        p.PoolID,
-		CapacityBytes: med.UsedBytes + med.FreeBytes,
-		FreeBytes:     med.FreeBytes,
-		Lifecycle:     lifecycle,
+		Label:          p.Label,
+		Generation:     p.Generation,
+		MediumType:     p.MediumType,
+		Side:           p.Side,
+		PoolID:         p.PoolID,
+		CapacityBytes:  med.UsedBytes + med.FreeBytes,
+		FreeBytes:      med.FreeBytes,
+		Lifecycle:      lifecycle,
+		ReadOnlyReason: readOnlyReason,
 	})
 	if err != nil {
 		return res, err

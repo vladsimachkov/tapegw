@@ -93,6 +93,10 @@ func runAdminMediaAdd(args []string) error {
 		Side:       *side,
 		PoolID:     *pool,
 		Adopt:      *adopt,
+		// Слой 2 запрета записи на устаревшее поколение (Р5 из 0014):
+		// writable: false в конфиге — лента заводится read_only, замок не
+		// трогается.
+		GenerationReadOnly: !cfg.Phobos.GenerationWritable(*generation),
 	})
 	for _, e := range res.BindErrors {
 		fmt.Fprintf(os.Stderr, "tapegw: не удалось проверить висящую копию: %v\n", e)

@@ -161,6 +161,12 @@ type Phobos struct {
 	// не понять (ADR-0007, спайк M0-02).
 	Library string   `yaml:"library"`
 	Tags    []string `yaml:"tags"`
+	// Generations — сведения о поколениях лент: флаг writable (Р5 из 0014,
+	// слой 2 запрета записи на устаревшее поколение). Поколение с
+	// writable: false закрыто для записи — ленты такого поколения
+	// регистрируются read_only, а не целью записи. Полное конфигурирование
+	// поколений (совместимость чтения, проверка политик при старте) — Ф0.5.
+	Generations map[string]Generation `yaml:"generations"`
 	// MaxInflight — размер пула горутин, имеющих право вызывать libphobos.
 	// До подтверждения потокобезопасности (спайк M0-3) держим 1.
 	MaxInflight int `yaml:"max_inflight"`
@@ -181,6 +187,23 @@ type Phobos struct {
 	// эти поля не читает: они живут в том же файле, потому что один файл —
 	// одна установка, а переменные TAPEGW_PHOBOS_MOVER_* выводятся из пути.
 	Mover MoverServer `yaml:"mover"`
+}
+
+// Generation — конфигурация одного поколения лент.
+type Generation struct {
+	// Writable — закрыто ли поколение для записи. nil (флаг не указан) —
+	// открыто: закрытие поколения всегда явное решение, отсутствие записи в
+	// конфиге не закрывает поколение молча.
+	Writable *bool `yaml:"writable"`
+}
+
+// GenerationWritable — открыто ли поколение для записи: по умолчанию открыто,
+// закрыт только тот, у кого явно указано writable: false.
+func (p *Phobos) GenerationWritable(name string) bool {
+	if g, ok := p.Generations[name]; ok && g.Writable != nil {
+		return *g.Writable
+	}
+	return true
 }
 
 // Mover — точка подключения к одному mover'у (ADR-0007, ADR-0021).
