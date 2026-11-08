@@ -126,7 +126,11 @@ phobos:
       key: /etc/tapegw/mover.key
       ca: /etc/tapegw/ca.crt
     staging_dir: /srv/tapegw/mover # буфер: батч сначала принят и fsync-нут
-    buffer_bytes: 8GiB             # объект больше буфера не примут (no_buffer)
+    # Не меньше s3.max_object_size: юнит больше буфера mover не примет
+    # (no_buffer), migrator заблокирует пачку с причиной — разблокировать
+    # придётся после подъёма буфера. На параллельные операции берётся запас
+    # (M9: не меньше двух целевых батчей/пачек на драйв).
+    buffer_bytes: 100GiB
     chunk_size: 4MiB
     inactivity_timeout: 5m         # сколько ждём следующий кадр
     op_timeout: 30m                # потолок одной операции Phobos; > inactivity

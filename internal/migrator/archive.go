@@ -382,6 +382,23 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 	}
 
 	if res.Code != mover.CodeOK {
+		if res.Code == mover.CodeNoBuffer {
+			// Архивный юнит больше всего буфера mover'а: отказ приходит до
+			// приёма байт (ADR-0021), на ленту ничего не легло. Пересылка
+			// бессмысленна — пока оператор не поднимет buffer_bytes, отказ
+			// будет тот же. Поэтому пачка не возвращается в очередь (она
+			// крутила бы круг) и не отменяется (объекты никуда не делись), а
+			// блокируется с причиной: объекты остаются в 'archiving' с
+			// pack_id, причина видна в реестре, продолжение такую пачку не
+			// берёт.
+			a.logger().Error("буфер mover'а меньше архивного юнита — поднимите phobos.mover.buffer_bytes",
+				"pack", packID.String(), "bytes", plan.Size)
+			if err := a.Meta.BlockPack(ctx, packID,
+				"mover: no_buffer — архивный юнит больше всего буфера mover"); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("mover: пачка %s заблокирована: юнит больше буфера mover", packID)
+		}
 		if definiteRefusals[res.Code] {
 			// Известно, что на ленту ничего не легло, — выбрасывать можно.
 			a.Meta.FailPackArchive(ctx, packID, ids, "mover: "+string(res.Code))

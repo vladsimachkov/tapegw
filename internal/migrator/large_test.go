@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vladsimachkov/tapegw/internal/archive"
+	"github.com/vladsimachkov/tapegw/internal/mover"
 	"github.com/vladsimachkov/tapegw/internal/store"
 	"github.com/vladsimachkov/tapegw/internal/testdb"
 )
@@ -247,6 +248,51 @@ func TestLargeObjectAttrsWithinBudget(t *testing.T) {
 	if got := store.AttrSize(attrs); got > store.AttrBudgetBytes {
 		t.Fatalf("атрибуты крупного объекта %d байт, бюджет %d — mover вернёт attr_too_large на живом трафике",
 			got, store.AttrBudgetBytes)
+	}
+}
+
+// Буфер mover'а меньше архивного юнита: no_buffer приходит до приёма байт, на
+// ленту ничего не легло. Пересылка повторила бы тот же отказ, поэтому пачка
+// блокируется с причиной, объект остаётся в 'archiving', а продолжение такую
+// пачку не берёт. Это ответ на «что делает migrator после no_buffer»: не
+// бесконечную пересылку.
+func TestArchiveLargeObjectNoBufferBlocks(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "large-nobuf", 1)
+	body := bytes.Repeat([]byte("z"), 4096)
+	a, pm := archiver(t, m, ids[0])
+	pm.code = mover.CodeNoBuffer
+	if _, err := a.ArchiveLargeObject(ctx, 1, rawItem(ids[0], body)); err == nil {
+		t.Fatal("архивация прошла несмотря на no_buffer")
+	}
+	if pm.puts != 1 {
+		t.Errorf("put вызван %d раз, ждали 1: пачку переслали", pm.puts)
+	}
+	var reason, state string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT blocked_reason, state::text FROM packs WHERE id = $1`, ids[0]).
+		Scan(&reason, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "sealed" || !strings.Contains(reason, "no_buffer") {
+		t.Errorf("пачка %s / %q, ждали sealed с причиной no_buffer", state, reason)
+	}
+	if st := objectState(t, m, ctx, ids[0]); st != "archiving" {
+		t.Errorf("объект в %s, ждали archiving: пачка не отменена, а не разобрана", st)
+	}
+	// Продолжение заблокированную пачку не берёт — пересылки нет.
+	load := func(context.Context, []uuid.UUID) ([]Item, error) {
+		return []Item{rawItem(ids[0], body)}, nil
+	}
+	n, err := a.ResumePacks(ctx, a.WorkerID, 30*time.Second, load, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("продолжение взяло заблокированную пачку: %d", n)
 	}
 }
 
