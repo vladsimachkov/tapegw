@@ -70,13 +70,19 @@ func (m *Meta) insertBucket(ctx context.Context, tenant TenantID, name, owner st
 	//
 	// tenant_id обязателен явно: колонка NOT NULL без DEFAULT (миграция 0005),
 	// чтобы забитый тенант не превращался в тихую запись в первый тенант.
-	// Обход по роли здесь означал бы запись «ничейному бакету»: tenants.id = -1
-	// нарушает FK, то есть ошибка видна сразу, а не тихо расползается по данным.
+	// Значение берётся через insertArg: служебное «все тенанты» отвергается до
+	// вставки, а не разбивается о FK. Бэкенд заменяет обход на системный тенант
+	// до вызова (backend.CreateBucket), так что это вторая линия защиты, — но
+	// и вторая обязана отказывать честно, а не 23503.
+	tenantArg, err := tenant.insertArg()
+	if err != nil {
+		return false, err
+	}
 	tag, err := m.Pool.Exec(ctx,
 		`INSERT INTO buckets (name, owner, acl, tags, tenant_id)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (name) WHERE deleted_at IS NULL DO NOTHING`,
-		name, owner, acl, tagsRaw, tenant.arg())
+		name, owner, acl, tagsRaw, tenantArg)
 	if err != nil {
 		return false, fmt.Errorf("insert bucket %q: %w", name, err)
 	}

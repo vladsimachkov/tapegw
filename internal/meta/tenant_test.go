@@ -4,7 +4,10 @@ package meta
 // нужно не SQL, а то, что обход фильтра нельзя подделать и что нулевое значение
 // не означает «все тенанты».
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestTenantIDBypassIsNotForgeable(t *testing.T) {
 	// Единственный способ получить обход — явная функция стража.
@@ -27,6 +30,22 @@ func TestTenantIDBypassIsNotForgeable(t *testing.T) {
 	}
 	if (TenantID{}).arg() == allTenants {
 		t.Error("нулевой TenantID не должен совпадать со служебным значением обхода")
+	}
+}
+
+// insertArg — значение для записи в tenant_id. Служебное «все тенанты» годится
+// как фильтр, но не как значение: запись -1 разбила бы вставку о FK (23503), и
+// клиент получил бы 500 вместо честного отказа (находка ревью PR #127).
+func TestTenantIDInsertArgRefusesSentinels(t *testing.T) {
+	if _, err := AllTenantsForGuard().insertArg(); !errors.Is(err, ErrTenantNotWritable) {
+		t.Errorf("insertArg для обхода: %v, ждали ErrTenantNotWritable", err)
+	}
+	// Нулевое значение — тоже не тенант: id тенантов начинаются с 1.
+	if _, err := (TenantID{}).insertArg(); !errors.Is(err, ErrTenantNotWritable) {
+		t.Errorf("insertArg для нулевого значения: %v, ждали ErrTenantNotWritable", err)
+	}
+	if v, err := NewTenant(2).insertArg(); err != nil || v != 2 {
+		t.Errorf("insertArg для тенанта 2: %d, %v — настоящий тенант отвергнут", v, err)
 	}
 }
 

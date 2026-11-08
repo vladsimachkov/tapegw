@@ -230,6 +230,35 @@ func TestRequestRestoreForeignTenant(t *testing.T) {
 	}
 }
 
+// Restore от root (или admin): страж отдаёт им «все тенанты», а тенант строки
+// очереди берётся из объекта, а не от вызывающего. Иначе вставка в
+// restores.tenant_id разбивается о FK (23503) и оператор не может восстановить
+// объект клиента — обычная задача поддержки (находка ревью PR #127; та же
+// ошибка, что была исправлена в PutObject в #14).
+func TestRequestRestoreTenantFromObject(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+
+	id := tenantWithObjects(t, m, 2, "rr", 10, 1)[0]
+	setEvictState(t, m, id, "archived", false, "-1 hour")
+
+	out, err := m.RequestRestore(context.Background(), meta.AllTenantsForGuard(), id, 7, "Standard")
+	if err != nil {
+		t.Fatalf("restore от «все тенанты»: %v", err)
+	}
+	if out != meta.RestoreQueued {
+		t.Fatalf("исход %v, ждали Queued", out)
+	}
+	var tenantID int64
+	if err := m.Pool.QueryRow(context.Background(),
+		`SELECT tenant_id FROM restores WHERE object_id = $1`, id).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if tenantID != 2 {
+		t.Errorf("restores.tenant_id=%d, ждали тенант объекта 2, а не служебное значение вызывающего", tenantID)
+	}
+}
+
 // days < 1 — внутренняя ошибка конфигурации вызывающего, не S3-код:
 // бэкенд обязан отсечь раньше, но и meta не принимает.
 func TestRequestRestoreRejectsBadDays(t *testing.T) {

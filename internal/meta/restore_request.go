@@ -67,11 +67,19 @@ func (m *Meta) RequestRestore(ctx context.Context, tenant TenantID, objectID uui
 	err := m.inTx(ctx, func(tx pgx.Tx) error {
 		// Строка объекта блокируется на всю транзакцию: параллельный RestoreObject
 		// или переход состояния не протиснутся между чтением и записью.
+		//
+		// Тенант для строки очереди берётся из этой же строки, а не от
+		// вызывающего: для root и admin страж отдаёт «все тенанты», и запись
+		// этого значения в tenant_id нарушает FK — оператор не смог бы
+		// восстановить объект клиента (находка ревью PR #127, та же ошибка,
+		// что была с PutObject в #14). Тенант вызывающего нужен только стражу:
+		// withTenant решает, можно ли трогать объект вовсе.
 		q, args := withTenant(
-			`SELECT state, landing FROM objects WHERE id = $1`, tenant, objectID)
+			`SELECT state, landing, tenant_id FROM objects WHERE id = $1`, tenant, objectID)
 		var state string
 		var landing bool
-		err := tx.QueryRow(ctx, q+` FOR UPDATE`, args...).Scan(&state, &landing)
+		var objTenant int64
+		err := tx.QueryRow(ctx, q+` FOR UPDATE`, args...).Scan(&state, &landing, &objTenant)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -135,7 +143,7 @@ func (m *Meta) RequestRestore(ctx context.Context, tenant TenantID, objectID uui
 				`INSERT INTO restores (object_id, tenant_id, state, tier, days, priority,
 				                       requested_at, next_try_at)
 				 VALUES ($1, $2, 'requested', $3, $4, $5, now(), now())`,
-				objectID, tenant.arg(), tier, days, restorePriority(tier))
+				objectID, objTenant, tier, days, restorePriority(tier))
 		} else {
 			_, err = tx.Exec(ctx,
 				`UPDATE restores SET state = 'requested', tier = $2, days = $3,

@@ -194,10 +194,11 @@ jobs:
           # включён, а его старт-гейт (PlanMigrators) роняет процесс на
           # «включено, но некому»: с #119 стенд не поднимал шлюз вовсе, и весь
           # e2e был красным. Стенд выключает его явно — молчание здесь
-          # означало бы «включено». S6 даёт стенду Phobos dir и mover, и
-          # выключение снимается. janitor ленту не требует — пусть работает.
+          # означало бы «включено». janitor ленту не требует — пусть работает.
           # S5 добавил второй такой же гейт (PlanRecallers) — recaller гасится
-          # тем же способом.
+          # тем же способом. С S6 ленточный путь не отсюда: mover требует cgo и
+          # libphobos, это целая EL9-посуда, и живёт она в job e2e-tape ниже.
+          # Здесь стенд остаётся без Phobos, и выключение остаётся.
           migrator:
             enabled: false
           recaller:
@@ -290,8 +291,55 @@ jobs:
           TAPEGW_E2E_KEK_VERSION: "1"
         run: go test -count=1 ./test/e2e -v
 
-  # Сборка с тегом phobos требует EL9 и исходников Phobos — это стенд ci-dir,
-  # он появляется на M0. До M0 джоб сознательно не включён: иначе он вечно
-  # красный и перестает что-то означать.
-  #
-  # TODO(M0): контейнер EL9, сборка Phobos + LTFS, go build -tags phobos ./...
+  # S6: ленточный путь на настоящем Phobos (family dir) — PUT → archived →
+  # вытеснение → RestoreObject → GET тех же байтов → просрочка → отказ.
+  # mover собирается с cgo и libphobos, поэтому весь прогон живёт внутри
+  # EL9-контейнера ci-dir (тот же образ, что hack/ci-dir-up): собираем образ,
+  # поднимаем phobosd + Postgres стенда, монтируем репозиторий и гоняем
+  # phobos-тесты cmd/tapegw внутри посудины. Основной e2e-джоб при этом
+  # остаётся без Phobos: ubuntu-раннер их не возит, а фальшивый «зелёный без
+  # ленты» за ленточный путь выдавать незачем.
+  e2e-tape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build ci-dir image
+        # Go в образ берётся тарболом (Containerfile копирует .build/go.tgz):
+        # в CI тот же источник, что у раннера — GOROOT от setup-go.
+        run: |
+          mkdir -p .build
+          tar czf .build/go.tgz -C "$(go env GOROOT)" .
+          docker build -f deploy/Containerfile.ci-dir -t tapegw-ci-dir .
+
+      - name: start ci-dir
+        run: |
+          docker run -d --name tapegw-ci-dir -v "$PWD:/src:ro" tapegw-ci-dir
+          for i in $(seq 1 90); do
+            docker logs tapegw-ci-dir 2>&1 | grep -q 'ci-dir: готов' && exit 0
+            sleep 2
+          done
+          echo "ci-dir не поднялся"; docker logs tapegw-ci-dir 2>&1 | tail -30; exit 1
+
+      - name: tape e2e (S6)
+        # Сеть внутри контейнера есть — модули скачиваются, GOMODCACHE
+        # монтировать не нужно. -mod=mod: репозиторий примонтирован ro, и go не
+        # должен пытаться что-то в нём дописывать (тот же режим, что у
+        # hack/ci-dir-up --test). -buildvcs=false: репозиторий принадлежит не
+        # тому пользователю, под которым идёт контейнер, git отказается в нём
+        # работать («dubious ownership», exit 128) — на этом и краснел первый
+        # прогон джобы; vcs-штамп тестовым бинарям не нужен. Под podman
+        # (rootless) uid контейнера и владелец файлов совпадают, поэтому
+        # локальный прогон этот отказ не ловил.
+        run: |
+          docker exec -e GOFLAGS="-mod=mod -buildvcs=false" -e TAPEGW_PHOBOS_TEST=1 \
+            -w /src tapegw-ci-dir \
+            go test -tags phobos -count=1 -timeout 15m -v ./cmd/tapegw
+
+  # Сборка с тегом phobos всего ./... требует EL9 — e2e-tape выше покрывает
+  # ленточный путь; полный go build -tags phobos ./... добавится со стендом
+  # ci-dir на ленте (mhVTL), он же закроет TODO(M0) по LTFS.

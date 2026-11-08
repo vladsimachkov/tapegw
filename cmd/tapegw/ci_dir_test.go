@@ -119,6 +119,11 @@ migrator:
   batch_max_wait: 1s
   claim_ttl: 30s
   shutdown_grace: 60s
+# S2b ничего не восстанавливает, а с S5 recaller по умолчанию включён и его
+# старт-гейт (PlanRecallers) требует mover роли recaller — здесь его нет.
+# Сквозной restore-путь со вторым mover'ом проверяет TestFullRestorePath.
+recaller:
+  enabled: false
 janitor:
   interval: 1s
 metrics: {listen: %q}
@@ -136,21 +141,10 @@ metrics: {listen: %q}
 	}
 	defer pool.Close()
 
-	// Носители стенда регистрируются в реестре здесь вынужденно: команда
-	// Ф1.5 («добавление ленты одной операцией tapegw», пункт 1 плана после
-	// среза) ещё не написана, а init.sh контейнера отрабатывает до появления
-	// схемы tapegw. Без строки в media копия остаётся в 'writing' (так и
-	// задумано), и объект не дойдёт до archived. Когда Ф1.5 появится,
-	// регистрация уйдёт отсюда в явный шаг стенда. Метки — те, что Phobos
-	// кладёт в extents для dir-устройств.
-	for _, label := range []string{"/var/lib/phobos/dir1", "/var/lib/phobos/dir2"} {
-		if _, err := pool.Exec(ctx,
-			`INSERT INTO media (label, lifecycle, pool_id, generation, medium_type, free_bytes_cached)
-			  VALUES ($1, 'active', 1, 'L8', 'L8', 100000000)
-			  ON CONFLICT (label) DO NOTHING`, label); err != nil {
-			t.Fatalf("регистрация носителя %s: %v", label, err)
-		}
-	}
+	// Носители регистрирует явный шаг стенда (см. standRegisterMedia): с S6
+	// регистрация вынесена из тела теста в подготовку стенда, до появления
+	// команды Ф1.5.
+	standRegisterMedia(t, ctx, pool)
 
 	// --- PUT объекта крупнее одного кадра (кадр mover'а — 64 KiB) ---
 	body := make([]byte, 5<<20)
