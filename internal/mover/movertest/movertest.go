@@ -38,13 +38,19 @@ import (
 // чужой CA, клиент без сертификата, сертификат mover'а в роли клиента — одним
 // «правильным» сертификатом этого не проверить.
 type PKI struct {
-	CA                string
-	ServerCert        string
-	ServerKey         string
-	ClientCert        string
-	ClientKey         string
-	RestorerCert      string
-	RestorerKey       string
+	CA           string
+	ServerCert   string
+	ServerKey    string
+	ClientCert   string
+	ClientKey    string
+	RestorerCert string
+	RestorerKey  string
+	// BothRolesCert — клиентский сертификат с обоими SAN-URI ролей
+	// (scheduler + restorer): стенду, где один процесс tapegw подключается и к
+	// migrator-, и к recaller-mover'у, не хватает одного роли —
+	// phobos.mover_client у них общий.
+	BothRolesCert     string
+	BothRolesKey      string
 	OtherDriveCert    string
 	OtherDriveKey     string
 	MoverAsClientCert string
@@ -483,6 +489,8 @@ func NewPKIWithDrive(t *testing.T, drive, other string) PKI {
 		[]*url.URL{mover.ClientURI(mover.ClientScheduler)}, nil)
 	p.RestorerCert, p.RestorerKey = sign(ca, caKey, "tapegw-restorer", x509.ExtKeyUsageClientAuth,
 		[]*url.URL{mover.ClientURI(mover.ClientRestorer)}, nil)
+	p.BothRolesCert, p.BothRolesKey = sign(ca, caKey, "tapegw-both", x509.ExtKeyUsageClientAuth,
+		[]*url.URL{mover.ClientURI(mover.ClientScheduler), mover.ClientURI(mover.ClientRestorer)}, nil)
 
 	fca, fcaKey, fcaPath := newCA("foreign-ca")
 	p.ForeignCA = fcaPath
