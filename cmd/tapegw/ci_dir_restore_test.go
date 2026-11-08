@@ -40,7 +40,10 @@ import (
 //     4×кадра = 256 KiB, объект 5 MiB) — поток идёт кредитованными порциями,
 //     а не одним кадром;
 //   - один из объектов — multipart: через весь путь проходит таблица частей
-//     с солями (проверка участника пачки расшифрованием по object_parts).
+//     с солями (проверка участника пачки расшифрованием по object_parts);
+//   - в конце — restore клиентского объекта от root: обычная задача поддержки,
+//     тенант строки очереди берётся из объекта, а не от вызывающего (находка
+//     ревью PR #127).
 //
 // Прогон — в контейнере ci-dir (hack/ci-dir-up --test и job e2e-tape в CI).
 // Без TAPEGW_PHOBOS_TEST тест пропускается, а не проходит.
@@ -159,12 +162,13 @@ metrics: {listen: %q}
 
 	// --- шаг стенда: клиентский тенант и учётка ---
 	//
-	// Restore — клиентская операция: restores.tenant_id связан FK с tenants, а
-	// у root-объектов клиентского тенанта нет (вставка в очередь падает на
-	// 23503). Тот же порядок, что в e2e-стенде CI: строка tenants + учётка
-	// через tapegw-iamctl, чтобы секрет заворачивался тем же кольцом KEK.
-	// Роль userplus: бакет без identity-политик может создавать только она
-	// (versitygw access-control), обычному user нужна политика бакета.
+	// Клиентский тенант — настоящий сценарий: бакет и объекты принадлежат
+	// клиенту, restore — клиентская операция. Тот же порядок, что в e2e-стенде
+	// CI: строка tenants + учётка через tapegw-iamctl, чтобы секрет
+	// заворачивался тем же кольцом KEK. Роль userplus: бакет без
+	// identity-политик может создавать только она (versitygw access-control),
+	// обычному user нужна политика бакета. Restore клиентского объекта от root
+	// проверяется в конце теста: тенант строки очереди берётся из объекта.
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO tenants (id, name, status, pool_id)
 		 VALUES (2, 's6-client', 'active', 1) ON CONFLICT (id) DO NOTHING`); err != nil {
@@ -326,6 +330,40 @@ metrics: {listen: %q}
 			_, err := cli.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("s6path"), Key: aws.String(k)})
 			return err
 		}, "InvalidObjectState")
+	}
+
+	// --- restore от root: задача поддержки (находка ревью PR #127) ---
+	//
+	// Оператор восстанавливает клиентский объект. Страж отдаёт root «все
+	// тенанты», а тенант строки очереди берётся из объекта: до исправления
+	// вставка в restores разбивалась о FK (23503), и клиент получал 500.
+	rootCli := s3.New(s3.Options{
+		Region:       "us-east-1",
+		Credentials:  credentials.NewStaticCredentialsProvider("s6er", "s6pass", ""),
+		BaseEndpoint: aws.String("http://" + s3Addr),
+		UsePathStyle: true,
+	})
+	if _, err := rootCli.RestoreObject(ctx, &s3.RestoreObjectInput{
+		Bucket: aws.String("s6path"), Key: aws.String("big.bin"),
+		RestoreRequest: &types.RestoreRequest{
+			Days:                 aws.Int32(1),
+			GlacierJobParameters: &types.GlacierJobParameters{Tier: types.TierExpedited},
+		},
+	}); err != nil {
+		t.Fatalf("RestoreObject от root: %v", err)
+	}
+	waitRestoreState(t, ctx, pool, "big.bin", "restored", 3*time.Minute)
+	var restoreTenant int64
+	if err := pool.QueryRow(ctx,
+		`SELECT r.tenant_id FROM restores r JOIN objects o ON o.id = r.object_id
+		 WHERE o.key = 'big.bin'`).Scan(&restoreTenant); err != nil {
+		t.Fatal(err)
+	}
+	if restoreTenant != 2 {
+		t.Errorf("restores.tenant_id=%d, ждали тенант объекта 2, а не служебное значение вызывающего", restoreTenant)
+	}
+	if got := getS3Bytes(t, rootCli, ctx, "big.bin"); !bytes.Equal(got, single) {
+		t.Errorf("GET от root после restore: %d байт, байты не совпали с исходными", len(got))
 	}
 
 	// --- остановка по сигналу ---
