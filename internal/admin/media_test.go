@@ -481,6 +481,37 @@ func TestMediaAddGenerationReadOnlyRegistersReadOnly(t *testing.T) {
 	}
 }
 
+// Чистая лента закрытого поколения не вводится: unlock и format дали бы
+// разблокированный отформатированный том запрещённого поколения, а после
+// форматирования запись на него разрешена — слой 2 запрета Р5 обнулился бы.
+// Отказ до действий с Phobos: ни unlock, ни format не вызваны, строки нет.
+// Форматированная лента того же поколения при этом регистрируется read_only
+// (TestMediaAddGenerationReadOnlyRegistersReadOnly) — отказ касается только
+// чистой, вводить которую незачем.
+func TestMediaAddGenerationReadOnlyRefusesBlank(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	f := newFake(t)
+	f.set("list.out", mediumJSON("/var/lib/phobos/dir9", `"pool:shared","gen:L7"`, "locked", "blank", 1000))
+
+	_, err := admin.MediaAdd(context.Background(),
+		admin.MediaDeps{Meta: m, Phobos: f.client("dir")},
+		admin.MediaAddParams{Label: "/var/lib/phobos/dir9", Generation: "L7", MediumType: "dir",
+			PoolID: 1, GenerationReadOnly: true})
+	if err == nil || !strings.Contains(err.Error(), "закрыто для записи") {
+		t.Fatalf("ошибка %v, ждали отказ вводить чистую ленту закрытого поколения", err)
+	}
+	calls := f.calls()
+	for _, forbidden := range []string{" unlock", " format"} {
+		if strings.Contains(calls, forbidden) {
+			t.Errorf("действие с Phobos при отказе %q:\n%s", forbidden, calls)
+		}
+	}
+	if _, ok := mediaRow(t, m, "/var/lib/phobos/dir9"); ok {
+		t.Error("строка в реестре при отказе")
+	}
+}
+
 // Носитель с данными и без тега пула: присвоение пула — осознанный шаг
 // оператора (-adopt), а не побочный эффект регистрации. Данные могли быть
 // записаны в обход tapegw, и по какому пулу они — неизвестно.

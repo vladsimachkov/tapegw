@@ -139,6 +139,16 @@ func MediaAdd(ctx context.Context, d MediaDeps, p MediaAddParams) (MediaAddResul
 	// пытаться.
 	switch med.FSStatus {
 	case "blank":
+		// Чистую ленту закрытого поколения вводить незачем: unlock и format
+		// дали бы разблокированную отформатированную ленту запрещённого
+		// поколения, а после форматирования запись на неё разрешена — ровно
+		// то, что слой 2 запрета Р5 обязан исключать. Отказ здесь, а не
+		// регистрация read_only: у ленты с данными read_only сохраняет
+		// копии, у чистой сохранять нечего, а разблокированный том
+		// закрытого поколения остался бы висеть в Phobos.
+		if p.GenerationReadOnly {
+			return res, fmt.Errorf("admin: поколение %s закрыто для записи — чистую ленту этого поколения вводить незачем", p.Generation)
+		}
 		if med.AdmStatus != "unlocked" {
 			if err := d.Phobos.Unlock(ctx, p.Label); err != nil {
 				return res, fmt.Errorf("admin: носитель не разблокирован: %w", err)
