@@ -26,10 +26,14 @@ static inline void tapegw_fini(void) { phobos_fini(); }
 /* lyt_keys/lyt_vals — параметры layout (например repl_count). Phobos берёт их
    из xd_params.put.lyt_params, и без них layout получает значение по умолчанию:
    raid1 без repl_count требует два устройства и на одном даёт ENODEV. */
+/* tags/ntags — теги выбора носителя (ADR-0013: тег пула обязан быть на каждой
+   записи, политики копий разводят копии тегами сторон). Без них Phobos пишет на
+   любой носитель библиотеки. Владение массивом и каждой строкой переходит к xd:
+   pho_xfer_desc_clean освобождает их через string_array_free. */
 int tapegw_put(const char *objid, int fd, long size, int family,
                const char *library, const char *layout_name, char **keys,
                char **vals, int nattrs, char **lyt_keys, char **lyt_vals,
-               int nlyt, long *tid_out);
+               int nlyt, char **tags, int ntags, long *tid_out);
 
 /* Читает объект в fd (xt_fd — файл для записи). scope: 1 = только живые. */
 int tapegw_get(const char *objid, int fd, int scope, long *tid_out);
