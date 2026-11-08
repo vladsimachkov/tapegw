@@ -48,6 +48,7 @@ func runAdminMediaAdd(args []string) error {
 		generation = fs.String("generation", "", "поколение: тег gen:<значение> в Phobos и media.generation")
 		mediumType = fs.String("medium-type", "", "технология носителя: обязательна для tape (-t в phobos tape add), для dir по умолчанию \"dir\"")
 		side       = fs.String("side", "", "сторона: left|right (тег side:<значение>), если библиотека с двумя сторонами")
+		adopt      = fs.Bool("adopt", false, "присвоить пул носителю, на котором уже есть данные без тега пула (данные могли быть записаны в обход tapegw)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -91,6 +92,7 @@ func runAdminMediaAdd(args []string) error {
 		MediumType: mt,
 		Side:       *side,
 		PoolID:     *pool,
+		Adopt:      *adopt,
 	})
 	for _, e := range res.BindErrors {
 		fmt.Fprintf(os.Stderr, "tapegw: не удалось проверить висящую копию: %v\n", e)

@@ -285,19 +285,148 @@ func TestMediaAddUnlockAndFormat(t *testing.T) {
 	}
 }
 
-// Phobos сообщает нулевое свободное место — регистрацию проводить нельзя:
-// лента дала бы ENOSPC на первой записи.
-func TestMediaAddZeroFree(t *testing.T) {
+// Статус файловой системы не определён — поля нет в выводе или значение
+// незнакомое (список полей CLI менялся вместе с обновлениями Phobos).
+// Форматировать в этом случае — самая разрушительная операция системы при
+// сомнении: лента может быть заполнена данными. Отказ без format.
+func TestMediaAddUnknownFSStatus(t *testing.T) {
+	cases := []struct{ name, body string }{
+		{"поля fs.status нет",
+			`[{"name": "/var/lib/phobos/dir9", "tags": ["pool:shared","gen:L8"], "adm_status": "unlocked",` +
+				` "put_access": true, "stats.phys_spc_free": 1000, "stats.phys_spc_used": 500}]`},
+		{"незнакомое значение",
+			`[{"name": "/var/lib/phobos/dir9", "tags": ["pool:shared","gen:L8"], "adm_status": "unlocked",` +
+				` "put_access": true, "fs.status": "strange", "stats.phys_spc_free": 1000, "stats.phys_spc_used": 500}]`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testdb.Connect(t)
+			testdb.Clean(t, m)
+			f := newFake(t)
+			f.set("list.2.out", tc.body)
+
+			if _, err := mediaAdd(t, m, f); err == nil ||
+				!strings.Contains(err.Error(), "не определён") {
+				t.Fatalf("ошибка %v, ждали «статус файловой системы не определён»", err)
+			}
+			if strings.Contains(f.calls(), " format") {
+				t.Errorf("форматирование при неизвестном статусе:\n%s", f.calls())
+			}
+			if _, ok := mediaRow(t, m, "/var/lib/phobos/dir9"); ok {
+				t.Error("строка в реестре при неизвестном статусе")
+			}
+		})
+	}
+}
+
+// Заполненная лента — не цель записи, но зарегистрировать её можно: ровно тот
+// случай, ради которого Ф1.5, — лента, записанная в обход реестра и уже
+// заполнившаяся, чьи копии висят в 'writing'. Регистрация проходит с
+// lifecycle='full' (put_access от такой ленты не требуются), копия доводится
+// до 'done', и в media_write_targets лента не попадает.
+func TestMediaAddFullRegistersAsFull(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+
+	packID := uuid.New()
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO packs (id, pool_id, kind, state) VALUES ($1, 1, 'data', 'archived')`, packID); err != nil {
+		t.Fatal(err)
+	}
+	copyID := uuid.New()
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO archive_copies (id, pack_id, spec, phobos_oid, format, state, sha256)
+		 VALUES ($1, $2, 'main', 'pack/1', 1, 'writing', decode(repeat('AB', 32), 'hex'))`,
+		copyID, packID); err != nil {
+		t.Fatal(err)
+	}
+
+	f := newFake(t)
+	// free=0 и put_access=false: Phobos закрыл ленту для записи — для 'full'
+	// это норма, а не отказ.
+	f.set("list.2.out", `[{"name": "/var/lib/phobos/dir9", "tags": ["pool:shared","gen:L8"],`+
+		` "adm_status": "unlocked", "put_access": false, "fs.status": "full",`+
+		` "stats.phys_spc_free": 0, "stats.phys_spc_used": 900}]`)
+	f.set("extents.out", `[{"oid": "pack/1", "media_name": ["/var/lib/phobos/dir9"]}]`)
+
+	res, err := mediaAdd(t, m, f)
+	if err != nil {
+		t.Fatalf("регистрация заполненной ленты: %v", err)
+	}
+	if res.BoundCopies != 1 {
+		t.Errorf("привязано %d копий, ждали 1; BindErrors=%v", res.BoundCopies, res.BindErrors)
+	}
+	row, ok := mediaRow(t, m, "/var/lib/phobos/dir9")
+	if !ok {
+		t.Fatal("строка media не создана")
+	}
+	if row["lifecycle"] != "full" {
+		t.Errorf("lifecycle=%v, ждали full", row["lifecycle"])
+	}
+	// Определение «доступна для записи» (media_write_targets) не должен
+	// пускать 'full': иначе migrator отправит put на ленту без места.
+	var targets int
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM media_write_targets WHERE id = $1`, res.MediaID).Scan(&targets); err != nil {
+		t.Fatal(err)
+	}
+	if targets != 0 {
+		t.Error("лента 'full' попала в media_write_targets")
+	}
+	var state string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT state::text FROM archive_copies WHERE id = $1`, copyID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "done" {
+		t.Errorf("копия: state=%s, ждали done", state)
+	}
+}
+
+// Носитель с данными и без тега пула: присвоение пула — осознанный шаг
+// оператора (-adopt), а не побочный эффект регистрации. Данные могли быть
+// записаны в обход tapegw, и по какому пулу они — неизвестно.
+func TestMediaAddAdoptRequired(t *testing.T) {
 	m := testdb.Connect(t)
 	testdb.Clean(t, m)
 	f := newFake(t)
-	f.set("list.2.out", mediumJSON("/var/lib/phobos/dir9", `"pool:shared","gen:L8"`, "unlocked", "used", 0))
+	f.set("list.out", mediumJSON("/var/lib/phobos/dir9", "", "unlocked", "used", 1000))
 
-	if _, err := mediaAdd(t, m, f); err == nil {
-		t.Fatal("нулевое место в Phobos обязано быть отказом")
+	if _, err := mediaAdd(t, m, f); err == nil || !strings.Contains(err.Error(), "-adopt") {
+		t.Fatalf("ошибка %v, ждали отказ с указанием -adopt", err)
+	}
+	calls := f.calls()
+	if strings.Contains(calls, " update") || strings.Contains(calls, " add ") {
+		t.Errorf("без -adopt трогать Phobos нельзя:\n%s", calls)
 	}
 	if _, ok := mediaRow(t, m, "/var/lib/phobos/dir9"); ok {
-		t.Error("строка в реестре при нулевом месте")
+		t.Error("строка в реестре без явного -adopt")
+	}
+}
+
+// С явным -adopt пул присваивается: теги ставятся, строка заводится.
+func TestMediaAddAdoptAssignsPool(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	f := newFake(t)
+	f.set("list.out", mediumJSON("/var/lib/phobos/dir9", "", "unlocked", "used", 1000))
+
+	res, err := admin.MediaAdd(context.Background(),
+		admin.MediaDeps{Meta: m, Phobos: f.client("dir")},
+		admin.MediaAddParams{Label: "/var/lib/phobos/dir9", Generation: "L8", MediumType: "dir", PoolID: 1, Adopt: true})
+	if err != nil {
+		t.Fatalf("MediaAdd с -adopt: %v", err)
+	}
+	if !strings.Contains(f.calls(), "dir update") {
+		t.Errorf("теги не установлены:\n%s", f.calls())
+	}
+	row, ok := mediaRow(t, m, "/var/lib/phobos/dir9")
+	if !ok || row["lifecycle"] != "active" {
+		t.Errorf("строка не заведена как active: %v", row)
+	}
+	if res.MediaID == 0 {
+		t.Error("media.id не вернулся")
 	}
 }
 

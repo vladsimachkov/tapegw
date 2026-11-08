@@ -33,23 +33,32 @@ type MediaRegistration struct {
 	PoolID        int64
 	CapacityBytes int64
 	FreeBytes     int64
+	// Lifecycle — 'active' (цель записи: вызывающий проверил в Phobos право
+	// писать) или 'full' (на носителе уже есть данные, места нет — не цель).
+	// Регистрация не инструмент переводов lifecycle, третьих значений здесь не
+	// бывает.
+	Lifecycle string
 }
 
-// RegisterMedia заводит строку media (lifecycle='active': вызывающий обязан
-// убедиться в Phobos, что носитель отформатирован и разблокирован, — до
-// этой проверки строку заводить нельзя). Повтор команды с теми же параметрами
-// идемпотентен и возвращает существующий id; параметры другой строки на той же
-// метке — ErrMediaLabelTaken, перетегировать чужой носитель молча нельзя.
+// RegisterMedia заводит строку media с указанным lifecycle ('active' или
+// 'full'): вызывающий обязан убедиться в Phobos, что носитель отформатирован,
+// — до этой проверки строку заводить нельзя. Повтор команды с теми же
+// параметрами идемпотентен и возвращает существующий id; параметры другой
+// строки на той же метке — ErrMediaLabelTaken, перетегировать чужой носитель
+// молча нельзя.
 func (m *Meta) RegisterMedia(ctx context.Context, r MediaRegistration) (int64, error) {
+	if r.Lifecycle != "active" && r.Lifecycle != "full" {
+		return 0, fmt.Errorf("meta: регистрация носителя %q: lifecycle %q, ожидаются active или full", r.Label, r.Lifecycle)
+	}
 	var id int64
 	err := m.Pool.QueryRow(ctx,
 		`INSERT INTO media (label, generation, medium_type, pool_id, side,
 		                    lifecycle, capacity_bytes_cached, free_bytes_cached)
-		 VALUES ($1, $2, $3, $4, NULLIF($5, ''), 'active', $6, $7)
+		 VALUES ($1, $2, $3, $4, NULLIF($5, ''), $8, $6, $7)
 		 ON CONFLICT (label) DO NOTHING
 		 RETURNING id`,
 		r.Label, r.Generation, r.MediumType, r.PoolID, r.Side,
-		r.CapacityBytes, r.FreeBytes).Scan(&id)
+		r.CapacityBytes, r.FreeBytes, r.Lifecycle).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
@@ -69,8 +78,11 @@ func (m *Meta) RegisterMedia(ctx context.Context, r MediaRegistration) (int64, e
 	}
 	sameSide := (row.Side == nil && r.Side == "") || (row.Side != nil && *row.Side == r.Side)
 	samePool := row.PoolID != nil && *row.PoolID == r.PoolID
+	// 'full' в списке наравне с активными состояниями: повтор команды на
+	// зарегистрированной заполненной ленте обязан возвращать тот же id,
+	// иначе доводку висящих копий нельзя запустить второй раз.
 	if row.Generation == r.Generation && row.MediumType == r.MediumType && samePool && sameSide &&
-		(row.Lifecycle == "active" || row.Lifecycle == "formatted" || row.Lifecycle == "new") {
+		(row.Lifecycle == "active" || row.Lifecycle == "formatted" || row.Lifecycle == "new" || row.Lifecycle == "full") {
 		return row.ID, nil
 	}
 	return 0, fmt.Errorf("%w: %q (в реестре %s/%s, пул %v, сторона %q, состояние %s)",

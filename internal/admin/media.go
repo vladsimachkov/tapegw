@@ -31,6 +31,10 @@ type MediaAddParams struct {
 	MediumType string // для tape — технология (-t), для dir — имя колонки реестра
 	Side       string // "" — сторона не задана
 	PoolID     int64
+	// Adopt — разрешение присвоить пул носителю, на котором уже есть данные,
+	// но тега пула нет. Без него такие носители — отказ: данные могли быть
+	// записаны в обход tapegw, и по какому пулу — неизвестно.
+	Adopt bool
 }
 
 // MediaDeps — зависимости операции; разделяются на БД и Phobos, чтобы тест
@@ -97,6 +101,14 @@ func MediaAdd(ctx context.Context, d MediaDeps, p MediaAddParams) (MediaAddResul
 			return res, fmt.Errorf("admin: Phobos не подтвердил добавление: %s нет в списке после add", p.Label)
 		}
 	} else {
+		// Носитель с данными и без тега пула: по какому пулу лежат эти данные,
+		// неизвестно — они могли быть записаны в обход tapegw. Присвоение пула
+		// такому носителю — осознанный шаг оператора (-adopt), а не побочный
+		// эффект регистрации.
+		if !hasPoolTag(med.Tags) && med.UsedBytes > 0 && !p.Adopt {
+			return res, fmt.Errorf("admin: носитель %s содержит данные (%d байт), но тега пула нет: присвоение пула — осознанный шаг, повторите с -adopt",
+				p.Label, med.UsedBytes)
+		}
 		tags, err := planTags(med.Tags, poolTag, p)
 		if err != nil {
 			return res, err
@@ -107,16 +119,31 @@ func MediaAdd(ctx context.Context, d MediaDeps, p MediaAddParams) (MediaAddResul
 			}
 		}
 	}
-	if med.AdmStatus != "unlocked" {
-		if err := d.Phobos.Unlock(ctx, p.Label); err != nil {
-			return res, fmt.Errorf("admin: носитель не разблокирован: %w", err)
+	// fs.status решает, можно ли вообще трогать содержимое носителя. Известные
+	// значения (docs/ops/tape-library.md): blank — не отформатирован, empty —
+	// отформатирован без данных, used — есть данные, full — места нет. Пустая
+	// строка или незнакомое значение означает «статус не определён»: поле не
+	// пришло, имя ключа поменялось, разбор не удался. Форматировать в этом
+	// случае — самая разрушительная операция системы, выполненная при сомнении,
+	// поэтому format — только по явному blank. Вторая линия обороны существует
+	// (Phobos сам отказывает format на отформатированном носителе, rc=22
+	// «Invalid argument»), но полагаться на неё нельзя: команда не обязана даже
+	// пытаться.
+	switch med.FSStatus {
+	case "blank":
+		if med.AdmStatus != "unlocked" {
+			if err := d.Phobos.Unlock(ctx, p.Label); err != nil {
+				return res, fmt.Errorf("admin: носитель не разблокирован: %w", err)
+			}
+			med, found, err = d.Phobos.List(ctx, p.Label)
+			if err != nil || !found {
+				return res, fmt.Errorf("admin: после unlock Phobos не подтвердил носитель")
+			}
+			if med.AdmStatus != "unlocked" {
+				return res, fmt.Errorf("admin: Phobos не снял замок с %s (adm_status=%s), форматирование под замком невозможно",
+					p.Label, med.AdmStatus)
+			}
 		}
-		med, found, err = d.Phobos.List(ctx, p.Label)
-		if err != nil || !found {
-			return res, fmt.Errorf("admin: после unlock Phobos не подтвердил носитель")
-		}
-	}
-	if med.FSStatus == "" || med.FSStatus == "blank" {
 		if err := d.Phobos.Format(ctx, p.Label); err != nil {
 			return res, fmt.Errorf("admin: форматирование не прошло: %w", err)
 		}
@@ -124,19 +151,39 @@ func MediaAdd(ctx context.Context, d MediaDeps, p MediaAddParams) (MediaAddResul
 		if err != nil || !found {
 			return res, fmt.Errorf("admin: после format Phobos не подтвердил носитель")
 		}
+		if med.FSStatus != "empty" && med.FSStatus != "used" && med.FSStatus != "full" {
+			return res, fmt.Errorf("admin: Phobos не подтвердил форматирование %s (fs.status=%q)", p.Label, med.FSStatus)
+		}
+	case "empty", "used", "full":
+		// Отформатирован — форматирование не нужно и недоступно.
+	default:
+		return res, fmt.Errorf("admin: статус файловой системы носителя %s не определён (fs.status=%q), форматирование запрещено",
+			p.Label, med.FSStatus)
 	}
-	// Финальная проверка перед записью в свой реестр: видим, разблокирован,
-	// пишет, отформатирован, есть место. Любое «нет» — ошибка, а не строка
-	// реестра «на авось»: лента без ёмкости дала бы ENOSPC на первой записи.
-	if med.AdmStatus != "unlocked" || !med.PutAccess {
-		return res, fmt.Errorf("admin: Phobos не разрешает запись на %s (adm_status=%s, put_access=%v)",
-			p.Label, med.AdmStatus, med.PutAccess)
-	}
-	if med.FSStatus == "" || med.FSStatus == "blank" {
-		return res, fmt.Errorf("admin: Phobos не подтвердил форматирование %s (fs.status=%q)", p.Label, med.FSStatus)
-	}
-	if med.FreeBytes <= 0 {
-		return res, fmt.Errorf("admin: Phobos сообщает нулевое свободное место на %s — регистрацию проводить нельзя", p.Label)
+	// Цель записи или архив. Носитель без свободного места регистрируется как
+	// 'full' — ровно тот случай, ради которого Ф1.5: лента, записанная в обход
+	// реестра и уже заполнившаяся, чьи копии висят в 'writing'. 'full' не
+	// является целью записи (представление media_write_targets его не
+	// включает), поэтому права на запись от него не требуются — и замок его не
+	// трогается: лок на полной ленте может быть сознательной защитой данных.
+	lifecycle := "full"
+	if med.FreeBytes > 0 {
+		// Цель записи: разблокирован и пишет — иначе первая же пачка дала бы
+		// ENOSPC/EACCES, а планировщик уже пообещал это место.
+		if med.AdmStatus != "unlocked" {
+			if err := d.Phobos.Unlock(ctx, p.Label); err != nil {
+				return res, fmt.Errorf("admin: носитель не разблокирован: %w", err)
+			}
+			med, found, err = d.Phobos.List(ctx, p.Label)
+			if err != nil || !found {
+				return res, fmt.Errorf("admin: после unlock Phobos не подтвердил носитель")
+			}
+		}
+		if med.AdmStatus != "unlocked" || !med.PutAccess {
+			return res, fmt.Errorf("admin: Phobos не разрешает запись на %s (adm_status=%s, put_access=%v), а свободное место есть — носитель претендует на роль цели записи",
+				p.Label, med.AdmStatus, med.PutAccess)
+		}
+		lifecycle = "active"
 	}
 
 	// --- половина реестра ---
@@ -148,6 +195,7 @@ func MediaAdd(ctx context.Context, d MediaDeps, p MediaAddParams) (MediaAddResul
 		PoolID:        p.PoolID,
 		CapacityBytes: med.UsedBytes + med.FreeBytes,
 		FreeBytes:     med.FreeBytes,
+		Lifecycle:     lifecycle,
 	})
 	if err != nil {
 		return res, err
@@ -238,6 +286,15 @@ func planTags(existing []string, poolTag string, p MediaAddParams) ([]string, er
 		desired = append(desired, t)
 	}
 	return desired, nil
+}
+
+func hasPoolTag(tags []string) bool {
+	for _, t := range tags {
+		if strings.HasPrefix(t, "pool:") {
+			return true
+		}
+	}
+	return false
 }
 
 func sameTagSet(a, b []string) bool {
