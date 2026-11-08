@@ -156,7 +156,20 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 			}
 			return gi[1] < gj[1]
 		}
-		return entries[i].doc.Created.Before(entries[j].doc.Created)
+		// Порядок версий внутри ключа — по version_seq из атрибута tapegw.seq
+		// (ADR-0020 §1). Время из манифеста для этого не годится: Postgres
+		// назначает version_seq при вставке, уже после записи файла, и на
+		// параллельных PUT одного ключа эти два порядка расходятся — по времени
+		// «последней» выглядела бы не та версия, и восстановление выбрал бы её
+		// текущей без единой ошибки.
+		//
+		// При равных seq (несколько копий одной версии — left/right/…) tie-break
+		// по oid: порядок между копиями не важен (они побайтово одинаковы),
+		// важен детерминизм отчёта.
+		if entries[i].ver.Seq != entries[j].ver.Seq {
+			return entries[i].ver.Seq < entries[j].ver.Seq
+		}
+		return entries[i].oid < entries[j].oid
 	})
 
 	created := map[string]bool{}
@@ -170,13 +183,9 @@ func Run(ctx context.Context, o Options) (*Report, error) {
 			cur, seq = g, 0
 		}
 		seq++
-		// Текущая — последняя по времени записи из манифеста. Это ВРЕМЕННО:
-		// настоящий порядок задаёт version_seq, а он в манифесте лежать не может
-		// — Postgres назначает его при вставке, уже после записи файла. На
-		// параллельных PUT одного ключа время и порядок версий расходятся, и
-		// восстановление выбрало бы не ту текущую версию. Чинится в M4: mover
-		// кладёт version_seq в атрибут tapegw.seq (требование в ARCHITECTURE.md,
-		// раздел M4), и сортировка переезжает на него.
+		// Текущая — последняя по tapegw.seq (сортировка выше). Номер к
+		// исходному version_seq не привязан: важна не нумерация, а порядок,
+		// а плотный счётчик не оставляет дыр, если часть версий не читается.
 		isCur := i+1 == len(entries) || entries[i+1].group() != g
 
 		if err := o.Meta.Pool.Ping(ctx); err != nil {

@@ -32,6 +32,7 @@ type Config struct {
 	IAM      IAM     `yaml:"iam"`
 	Spool    Spool   `yaml:"spool"`
 	Phobos   Phobos  `yaml:"phobos"`
+	Pack     Pack    `yaml:"pack"`
 	Migrator Worker  `yaml:"migrator"`
 	Recaller Worker  `yaml:"recaller"`
 	Janitor  Janitor `yaml:"janitor"`
@@ -269,6 +270,20 @@ type MoverTLS struct {
 	CA   string `yaml:"ca"`
 }
 
+// Pack — упаковка объектов (M4). Порог здесь один: объекты меньше него идут
+// в пачки, остальные пишутся отдельными объектами Phobos (ARCHITECTURE,
+// «Упаковка мелких объектов в пачки»). target_size и max_wait появятся вместе
+// с условиями закрытия пачки — сейчас пачка равна батчу.
+type Pack struct {
+	// Threshold — граница мелкого и крупного объекта. Сравнивается с ОТКРЫТЫМ
+	// размером объекта (objects.size), а не с длиной шифротекста на диске:
+	// порог — про объект, который видит клиент (и про RPO из договора, который
+	// тоже считается объектами), а file_bytes добавляет манифест с футером и
+	// у каждого объекта разный. Ровно порог — уже крупный: «меньше порога —
+	// в пачку, остальные — отдельными».
+	Threshold ByteSize `yaml:"threshold"`
+}
+
 // Worker — настройки одного фоновыего воркера (migrator или recaller).
 type Worker struct {
 	// Enabled — включать ли воркер. По умолчанию true, и включённый воркер
@@ -472,6 +487,11 @@ func Default() *Config {
 				OpTTL:          24 * time.Hour,
 				ExpireInterval: time.Minute,
 			},
+		},
+		Pack: Pack{
+			// 25 MiB — значение из ARCHITECTURE («Упаковка мелких объектов»);
+			// RPO в договоре обещается именно этим числом, менять молча нельзя.
+			Threshold: 25 * MiB,
 		},
 		Migrator: Worker{
 			BatchMaxObjects: 1000,
@@ -813,6 +833,12 @@ func (c *Config) Validate() error {
 		add("s3.max_object_size: %d не больше migrator.batch_max_bytes: %d — "+
 			"объект крупнее батча не будет заархивирован", int64(c.S3.MaxObjectSize),
 			int64(c.Migrator.BatchMaxBytes))
+	}
+	// Ноль означал бы «все объекты крупные»: каждый — отдельный объект Phobos,
+	// индекс LTFS раздут ровно тем, ради чего пачки и заводили. Порог —
+	// обязательная настройка, а не «ноль = как-нибудь».
+	if c.Pack.Threshold <= 0 {
+		add("pack.threshold: %d, должно быть > 0", int64(c.Pack.Threshold))
 	}
 	if c.DB.DSN == "" {
 		add("db.dsn обязателен")

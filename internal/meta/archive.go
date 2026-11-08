@@ -59,17 +59,36 @@ func (m *Meta) BeginPackArchive(ctx context.Context, poolID int64, ids []uuid.UU
 	if len(ids) == 0 {
 		return nil, uuid.Nil, fmt.Errorf("meta: пустая пачка")
 	}
+	// id генерируется здесь, а не DEFAULT-ом: у packs его нет (миграция 0017
+	// уже слита, править её нельзя), а вставить пачку без id — NOT NULL.
+	return m.beginArchive(ctx, poolID, ids, uuid.New(), false)
+}
+
+// BeginObjectArchive — начало архивации крупного объекта (≥ pack.threshold).
+//
+// Это та же машина состояний, что у пачки, и намеренно: «запечатывание до
+// отправки, захват с продлением, разбор неизвестного итога» — один механизм
+// на оба пути, иначе устойчивость к сбоям разъедется. Строка packs заводится
+// с id = UUID объекта и single_object = true: oid Phobos первой копии тогда
+// равен UUID версии, как требует ADR-0020 («tapegw.version … он же oid в
+// Phobos»), а повтор после обрыва бьётся в тот же объект.
+//
+// Транзакция возвращается открытой — те же правила, что у BeginPackArchive
+// (правило 13 разбирает вызывающий).
+func (m *Meta) BeginObjectArchive(ctx context.Context, poolID int64, objectID uuid.UUID) (pgx.Tx, error) {
+	tx, _, err := m.beginArchive(ctx, poolID, []uuid.UUID{objectID}, objectID, true)
+	return tx, err
+}
+
+func (m *Meta) beginArchive(ctx context.Context, poolID int64, ids []uuid.UUID, packID uuid.UUID, single bool) (pgx.Tx, uuid.UUID, error) {
 	tx, err := m.Pool.Begin(ctx)
 	if err != nil {
 		return nil, uuid.Nil, fmt.Errorf("meta: начать архивацию: %w", err)
 	}
 
-	// id генерируется здесь, а не DEFAULT-ом: у packs его нет (миграция 0017
-	// уже слита, править её нельзя), а вставить пачку без id — NOT NULL.
-	packID := uuid.New()
 	_, err = tx.Exec(ctx, `
-INSERT INTO packs (id, pool_id, kind, state)
-VALUES ($1, $2, 'data', 'open')`, packID, poolID)
+INSERT INTO packs (id, pool_id, kind, state, single_object)
+VALUES ($1, $2, 'data', 'open', $3)`, packID, poolID, single)
 	if err != nil {
 		tx.Rollback(ctx)
 		return nil, uuid.Nil, fmt.Errorf("meta: завести пачку: %w", err)
@@ -397,6 +416,24 @@ FROM objects WHERE id = ANY($1::uuid[])`, ids).Scan(&missing, &distinct, &packID
 		return uuid.Nil, nil
 	}
 	return *packID, nil
+}
+
+// PackSingleObject — признак «под пачкой лежит крупный объект одним
+// участником» (миграция 0025). Продолжение (ResumePacks) выбирает по нему,
+// какие байты пересобирать: сырой файл объекта или tar-пачку. Признак явный
+// именно потому, что косвенный («один участник») принимает пачку из одного
+// мелкого объекта за крупный — а байты у них разные, и сумма не сойдётся
+// уже на ленте.
+func (m *Meta) PackSingleObject(ctx context.Context, packID uuid.UUID) (bool, error) {
+	var single bool
+	err := m.Pool.QueryRow(ctx, `SELECT single_object FROM packs WHERE id = $1`, packID).Scan(&single)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("meta: пачки %s нет в реестре", packID)
+	}
+	if err != nil {
+		return false, fmt.Errorf("meta: признак single_object у пачки %s: %w", packID, err)
+	}
+	return single, nil
 }
 
 // SealedMembers возвращает участников запечатанной пачки в порядке смещений —

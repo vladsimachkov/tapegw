@@ -167,11 +167,12 @@ func (h *harness) putMultipart(t *testing.T, key string, sizes []int) []byte {
 }
 
 // snapshot — перенести записанное в фейковый архив так, как это сделал бы mover:
-// байты файла из спула плюс пять атрибутов (ADR-0019).
+// байты файла из спула плюс шесть атрибутов версии (ADR-0019, ADR-0020 §1),
+// включая tapegw.seq — порядок версий, по которому rebuild выбирает текущую.
 func (h *harness) snapshot(t *testing.T) map[string][]byte {
 	t.Helper()
 	rows, err := h.m.Pool.Query(h.ctx,
-		`SELECT o.id, o.tenant_id, o.wrapped_dek, t.kek_version
+		`SELECT o.id, o.tenant_id, o.wrapped_dek, t.kek_version, o.version_seq
 		  FROM objects o JOIN tenants t ON t.id = o.tenant_id
 		  WHERE NOT o.is_delete_marker ORDER BY o.id`)
 	if err != nil {
@@ -182,11 +183,12 @@ func (h *harness) snapshot(t *testing.T) map[string][]byte {
 		ten int64
 		dek []byte
 		kek int
+		seq int64
 	}
 	var all []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.id, &r.ten, &r.dek, &r.kek); err != nil {
+		if err := rows.Scan(&r.id, &r.ten, &r.dek, &r.kek, &r.seq); err != nil {
 			t.Fatal(err)
 		}
 		all = append(all, r)
@@ -202,6 +204,7 @@ func (h *harness) snapshot(t *testing.T) map[string][]byte {
 		attrs, err := archive.Attributes(archive.Version{
 			Version: r.id, Tenant: r.ten, WrappedDEK: r.dek,
 			KEK: strconv.Itoa(r.kek), Format: archive.FormatVersion,
+			Seq: uint64(r.seq),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -542,5 +545,54 @@ func TestRebuildDryRun(t *testing.T) {
 	}
 	if _, err := h.m.GetBucket(h.ctx, meta.NewTenant(int(tenantID)), bucketName); err == nil {
 		t.Error("dry-run создал бакет")
+	}
+}
+
+// TestRebuildOrdersVersionsBySeq — текущей становится версия с большим
+// tapegw.seq, а не та, что «новее» по времени из манифеста.
+//
+// Расхождение этих порядков — не выдуманный сценарий: version_seq назначает
+// Postgres при вставке, уже после записи файла и под advisory-локом ключа
+// (ADR-0005). Запись, начатая раньше, но с большим телом, лок берёт позже —
+// seq у неё больше, а по времени манифеста она «старше». Здесь расхождение
+// воспроизводится прямо: у двух версий одного ключа seq и порядок Created
+// меняются местами до снимка в архив.
+func TestRebuildOrdersVersionsBySeq(t *testing.T) {
+	h := setup(t)
+	if err := h.be.PutBucketVersioning(h.ctx, bucketName, types.BucketVersioningStatusEnabled); err != nil {
+		t.Fatal(err)
+	}
+	first := h.putOne(t, "k", 1000)
+	v1 := h.current(t, "k").ID
+	h.putOne(t, "k", 2000)
+	v2 := h.current(t, "k").ID // Created позже, но seq поставим меньше
+
+	// Разводим порядок seq против порядка Created: у более ранней по времени
+	// версии seq больше.
+	if _, err := h.m.Pool.Exec(h.ctx, `UPDATE objects SET version_seq = 5 WHERE id = $1`, v1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.Pool.Exec(h.ctx, `UPDATE objects SET version_seq = 3 WHERE id = $1`, v2); err != nil {
+		t.Fatal(err)
+	}
+
+	h.snapshot(t)
+	h.wipe(t)
+	rep := h.run(t)
+	if rep.Restored != 2 {
+		t.Fatalf("восстановлено %d, ждали две версии", rep.Restored)
+	}
+	o := h.current(t, "k")
+	if o.ID != v1 {
+		t.Errorf("текущая версия не та, у которой tapegw.seq больше: %s, ждали %s "+
+			"(сортировка по времени манифеста вернула бы эту)", o.ID, v1)
+	}
+	raw, err := os.ReadFile(h.archPath(o.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := h.readPlain(t, o.ID, tenantID, o.WrappedDEK, raw)
+	if !bytes.Equal(got, first) {
+		t.Error("содержимое текущей версии не совпало с содержимым более ранней по времени, но более новой по seq")
 	}
 }
