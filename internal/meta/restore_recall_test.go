@@ -147,6 +147,90 @@ func TestClaimRestorePackOrder(t *testing.T) {
 	}
 }
 
+// T3 справедливость: пока у тенанта есть читаемые restore, следующий захват
+// уходит к другому тенанту — бэклог одного не держит все драйвы. Два живых
+// воркера: первый держит пачку тенанта 2 (её запросы старше), второй обязан
+// взять тенанта 3, хотя у тенанта 2 остались запросы старше.
+func TestClaimRestorePackFairnessAcrossTenants(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+
+	a := tenantWithObjects(t, m, 2, "fair-a", 10, 2)
+	b := tenantWithObjects(t, m, 3, "fair-b", 10, 1)
+	for _, id := range []uuid.UUID{a[0], a[1], b[0]} {
+		setEvictState(t, m, id, "archived", false, "-1 hour")
+		recallFixture(t, m, id, 10)
+	}
+	requestRestore(t, m, a[0], 7, "Standard")
+	requestRestore(t, m, a[1], 7, "Standard")
+	if _, err := m.RequestRestore(ctx, meta.NewTenant(3), b[0], 7, "Standard"); err != nil {
+		t.Fatal(err)
+	}
+	// Запросы тенанта 2 старше: без справедливости очередь шла бы строго по
+	// времени, и тенант 3 ждал бы всего бэклога тенанта 2.
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE restores SET requested_at = requested_at - interval '1 hour' WHERE tenant_id = 2`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Воркер 1: при нулевой загрузке обоих — снова старый вперёд.
+	first, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 5)
+	if err != nil || len(first) != 1 || first[0].ObjectID != a[0] {
+		t.Fatalf("первый захват %+v err=%v, ждали a[0]", first, err)
+	}
+	// Воркер 2, пока первый читает ленту: у тенанта 2 активный захват, и
+	// выборка обязана уйти к тенанту 3.
+	second, err := m.ClaimRestorePack(ctx, "w2", 10, time.Minute, 5)
+	if err != nil || len(second) != 1 || second[0].ObjectID != b[0] {
+		t.Fatalf("второй захват %+v err=%v, ждали b[0]: бэклог тенанта 2 держит очередь", second, err)
+	}
+	// Воркер 1 закончил — тенант 2 разгрузился и получил свой ход.
+	if err := m.MarkRestoreRestored(ctx, a[0], 7, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	third, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 5)
+	if err != nil || len(third) != 1 || third[0].ObjectID != a[1] {
+		t.Fatalf("третий захват %+v err=%v, ждали a[1]", third, err)
+	}
+}
+
+// Приоритет (tier) остаётся первым ключом: справедливость применяется внутри
+// тира, а не поверх него. Expedited загруженного тенанта не уступает Standard
+// свободного — тира контрактная, и обещание «час вместо часов» важнее
+// очерёдности между тенантами.
+func TestClaimRestorePackPriorityBeatsFairness(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+
+	a := tenantWithObjects(t, m, 2, "pf-a", 10, 2)
+	b := tenantWithObjects(t, m, 3, "pf-b", 10, 1)
+	for _, id := range []uuid.UUID{a[0], a[1], b[0]} {
+		setEvictState(t, m, id, "archived", false, "-1 hour")
+		recallFixture(t, m, id, 10)
+	}
+	requestRestore(t, m, a[0], 7, "Standard")
+	// Воркер забрал a[0]: у тенанта 2 активный захват (in-flight = 1).
+	if _, err := m.ClaimRestorePack(ctx, "w1", 10, time.Minute, 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.RequestRestore(ctx, meta.NewTenant(3), b[0], 7, "Standard"); err != nil {
+		t.Fatal(err)
+	}
+	requestRestore(t, m, a[1], 7, "Expedited")
+	// Request b[0] старше запроса a[1]: без приоритета выиграл бы тенант 3.
+	if _, err := m.Pool.Exec(ctx,
+		`UPDATE restores SET requested_at = requested_at - interval '1 hour' WHERE tenant_id = 3`); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := m.ClaimRestorePack(ctx, "w2", 10, time.Minute, 5)
+	if err != nil || len(items) != 1 || items[0].ObjectID != a[1] {
+		t.Fatalf("захват %+v err=%v, ждали Expedited загруженного тенанта", items, err)
+	}
+}
+
 // Все готовые строки пачки уходят одним захватом: одно чтение ленты закрывает
 // их целиком, а не по строке на проход.
 func TestClaimRestorePackTakesWholePack(t *testing.T) {
