@@ -27,11 +27,6 @@ func (r *Restore) Ongoing() bool {
 	return r.State == "requested" || r.State == "in_progress"
 }
 
-// Active — копия выдана и срок не истёк.
-func (r *Restore) Active(now time.Time) bool {
-	return r.State == "restored" && r.ExpiresAt != nil && r.ExpiresAt.After(now)
-}
-
 // Формирование заголовка x-amz-restore живёт в бэкенде
 // (backend.restoreHeader): по ADR-0003 показанная дата берётся из
 // objects.online_until, а не из restores.expires_at, поэтому одного

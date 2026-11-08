@@ -100,6 +100,12 @@ func run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("landing: %w", err)
 	}
+	// Cache — буфер восстановленных копий (S5): пишет recaller, читает GET,
+	// вытесняет janitor. Обязателен наравне с landing (проверка в конфиге).
+	cache, err := spool.Open(cfg.Spool.Cache)
+	if err != nil {
+		return fmt.Errorf("cache: %w", err)
+	}
 
 	// Кольцо KEK загружается ДО бэкенда и независимо от того, включён ли
 	// Postgres-IAM: шифрование тела объекта обязательное (ADR-0014), и без
@@ -110,7 +116,8 @@ func run(args []string) error {
 		return err
 	}
 
-	be := backend.New(pool, land, cfg, keys.New(pool, ring))
+	vault := keys.New(pool, ring)
+	be := backend.New(pool, land, cache, cfg, vault)
 
 	gwCfg := &embedgw.Config{
 		Ports:             cfg.S3.Listen,
@@ -186,12 +193,33 @@ func run(args []string) error {
 			"landing будет расти до watermark")
 	}
 
+	// Воркеры восстановления (S5). Выключенность видна так же громко, как у
+	// архивации: очередь restore без читателя — это вечное
+	// «ongoing-request="true"» для клиента.
+	var rec *worker.RecallerGroup
+	if cfg.Recaller.EnabledValue() {
+		targets, err := worker.PlanRecallers(cfg)
+		if err != nil {
+			return err
+		}
+		rec, err = worker.StartRecallers(ctx, worker.RecallerDeps{
+			Cfg: cfg, Meta: pool, Cache: cache, Keys: vault, Log: logger,
+		}, targets)
+		if err != nil {
+			return err
+		}
+	} else {
+		logger.Warn("ВОССТАНОВЛЕНИЕ ВЫКЛЮЧЕНО: recaller.enabled=false — запросы restore " +
+			"не будут читаться с ленты, очередь будет расти")
+	}
+
 	// Вытеснитель дисковых копий. Выключен так же виден наружу, как выключенная
-	// архивация: без него landing растёт и после archived — молча.
+	// архивация: без него landing растёт и после archived — молча. Сюда же
+	// входит вытеснение истёкших restore из cache (S5).
 	var jan *worker.JanitorGroup
 	if cfg.Janitor.EnabledValue() {
 		jan = worker.StartJanitor(ctx, worker.JanitorDeps{
-			Cfg: cfg, Meta: pool, Spool: land, Log: logger,
+			Cfg: cfg, Meta: pool, Spool: land, Cache: cache, Log: logger,
 		})
 	} else {
 		logger.Warn("ВЫТЕСНЕНИЕ ВЫКЛЮЧЕНО: janitor.enabled=false — файлы landing не удалятся " +
@@ -219,6 +247,9 @@ func run(args []string) error {
 	// пачку: их отправка живёт на контексте без отмены. Ждём, но не вечно.
 	if mig != nil {
 		mig.Wait(cfg.Migrator.ShutdownGrace)
+	}
+	if rec != nil {
+		rec.Wait(cfg.Recaller.ShutdownGrace)
 	}
 	if jan != nil {
 		jan.Wait(cfg.Janitor.ShutdownGrace)

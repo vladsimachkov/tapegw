@@ -268,6 +268,9 @@ type Worker struct {
 	BatchMaxBytes   ByteSize      `yaml:"batch_max_bytes"`
 	BatchMaxWait    time.Duration `yaml:"batch_max_wait"`
 	MaxAttempts     int           `yaml:"max_attempts"`
+	// RetryBackoff — основание экспоненциальной задержки повтора (потолок
+	// сутки): попытка N откладывается на RetryBackoff * 2^N.
+	RetryBackoff time.Duration `yaml:"retry_backoff"`
 }
 
 // EnabledValue — включён ли воркер с учётом умолчания (nil = true).
@@ -452,6 +455,7 @@ func Default() *Config {
 			BatchMaxBytes:   200 * GiB,
 			BatchMaxWait:    15 * time.Minute,
 			MaxAttempts:     10,
+			RetryBackoff:    30 * time.Second,
 			ClaimTTL:        5 * time.Minute,
 			// 30 минут: батч на 200 GiB идёт минуты, grace обязан переживать
 			// штатную отправку, но не превращать остановку в вечное ожидание.
@@ -462,6 +466,13 @@ func Default() *Config {
 			BatchMaxBytes:   0,
 			BatchMaxWait:    5 * time.Minute,
 			MaxAttempts:     10,
+			RetryBackoff:    30 * time.Second,
+			// Lease захвата строки restores: чтение пачки с ленты идёт
+			// минутами, слишком короткий ttl заставил бы второй воркер
+			// перехватывать живую работу.
+			ClaimTTL: 30 * time.Minute,
+			// Начатое чтение доходит: grace переживает штатную пачку.
+			ShutdownGrace: 30 * time.Minute,
 		},
 		Janitor: Janitor{
 			Interval:        time.Minute,
@@ -842,6 +853,14 @@ func (c *Config) Validate() error {
 		}
 		if w.w.BatchMaxWait < 0 {
 			add("%s.batch_max_wait: %v, не может быть отрицательным", w.name, w.w.BatchMaxWait)
+		}
+		if w.w.RetryBackoff <= 0 {
+			add("%s.retry_backoff: %v, должно быть > 0 — ноль дал бы повтор в тот же момент",
+				w.name, w.w.RetryBackoff)
+		}
+		if w.w.ClaimTTL <= 0 {
+			add("%s.claim_ttl: %v, должно быть > 0 — просроченный захват перехватывают по нему",
+				w.name, w.w.ClaimTTL)
 		}
 	}
 

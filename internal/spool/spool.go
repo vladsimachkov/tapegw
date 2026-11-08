@@ -135,6 +135,49 @@ func (s *Spool) Remove(id uuid.UUID) error {
 	return nil
 }
 
+// Tmp создаёт временный файл в tmp/ — на той же ФС, что и корень (проверка в
+// Open), поэтому rename в Publish не даст EXDEV. Нужен, когда содержимое
+// прилетает не одним вызовом Write, а собирается снаружи: так делает recaller,
+// который пишет участников из потока ленты и проверяет каждый до публикации.
+// Вызывающий обязан закрыть файл и либо вызвать Publish, либо удалить сам.
+func (s *Spool) Tmp() (*os.File, error) {
+	f, err := os.CreateTemp(s.tmp, "stage-*")
+	if err != nil {
+		return nil, fmt.Errorf("spool: временный файл: %w", err)
+	}
+	return f, nil
+}
+
+// Publish поднимает временный файл на место объекта: fsync файла, rename,
+// fsync каталога — тот же порядок, что в write.go (правило 6: файл на диске
+// раньше любого commit'а, который на него ссылается). f закрывается при любом
+// исходе; при ошибке временный файл убирается.
+func (s *Spool) Publish(f *os.File, id uuid.UUID) error {
+	tmpName := f.Name()
+	defer func() {
+		if tmpName != "" {
+			os.Remove(tmpName)
+		}
+	}()
+
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("spool: fsync %s: %w", id, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("spool: закрыть %s: %w", tmpName, err)
+	}
+	final := s.Path(id)
+	if err := os.Rename(tmpName, final); err != nil {
+		return fmt.Errorf("spool: rename на %s: %w", final, err)
+	}
+	tmpName = "" // rename состоялся: убирать нечего
+	if err := fsyncDir(filepath.Dir(final)); err != nil {
+		return err
+	}
+	return nil
+}
+
 // devOf — st_dev каталога, для проверки «одна ФС».
 func devOf(dir string) (uint64, error) {
 	var st syscall.Stat_t

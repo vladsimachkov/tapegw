@@ -23,9 +23,13 @@ import (
 
 // JanitorDeps — всё, что нужно вытеснителю.
 type JanitorDeps struct {
-	Cfg   *config.Config
-	Meta  *meta.Meta
-	Spool *spool.Spool // landing: вытесняется только он (cache — после restore, S5)
+	Cfg  *config.Config
+	Meta *meta.Meta
+	// Spool — landing; Cache — восстановленные копии (S5). Cache обязателен,
+	// пока включён janitor: без него истёкшие restore накапливались бы в
+	// очереди и в дисковом буфере молча.
+	Spool *spool.Spool
+	Cache *spool.Spool
 	Log   *slog.Logger
 }
 
@@ -111,5 +115,40 @@ func evictOnce(ctx context.Context, deps JanitorDeps, log *slog.Logger) {
 		}
 		log.Info("janitor: дисковая копия вытеснена",
 			slog.String("key", c.Key), slog.String("id", c.ID.String()))
+	}
+
+	evictCacheOnce(ctx, deps, log)
+}
+
+// evictCacheOnce — истёкшие restore (S5, критерий «после срока restore —
+// снова InvalidObjectState»). ClaimCacheEvictBatch удаляет строку restores в
+// транзакции выборки — с этого момента GET уже отвечает InvalidObjectState,
+// и только потом здесь снимается файл из cache (ADR-0004: сначала строка
+// перестала обещать копию, потом unlink).
+func evictCacheOnce(ctx context.Context, deps JanitorDeps, log *slog.Logger) {
+	if deps.Cache == nil {
+		// До выборки: ClaimCacheEvictBatch удаляет строку, а файла без буфера
+		// не снять — обещание «строка снята, файл удалён» должно выполняться.
+		log.Error("janitor: cache не настроен — истёкшие restore не вытесняются")
+		return
+	}
+	ids, err := deps.Meta.ClaimCacheEvictBatch(ctx, deps.Cfg.Janitor.BatchMaxObjects)
+	if err != nil {
+		log.Error("janitor: выборка истёкших restore", slog.String("err", err.Error()))
+		return
+	}
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		// Файла мог и не быть (сбой публикации между rename и падением) —
+		// Remove идемпотентен, а строка уже удалена: состояние сходится.
+		if err := deps.Cache.Remove(id); err != nil {
+			log.Error("janitor: файл cache не удалён — остался сиротой",
+				slog.String("id", id.String()), slog.String("err", err.Error()))
+			continue
+		}
+		log.Info("janitor: восстановленная копия вытеснена из cache",
+			slog.String("id", id.String()))
 	}
 }

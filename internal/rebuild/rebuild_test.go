@@ -75,7 +75,9 @@ func setup(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	be := backend.New(m, land, config.Default(), keys.New(m, ring))
+	// cache здесь не нужен: rebuild-meta не трогает restore, а nil на месте
+	// cache проверяет, что обычный путь чтения его не требует.
+	be := backend.New(m, land, nil, config.Default(), keys.New(m, ring))
 	h := &harness{be: be, m: m, land: land, ring: ring,
 		arch: archive.NewFake(t.TempDir()),
 		ctx:  accountCtx("tester")}

@@ -157,8 +157,9 @@ CREATE TABLE upload_parts (
 | in\_progress | restored | recaller | файл в cache, размер и ETag сверены |
 | in\_progress | requested | recaller | ошибка и `attempts < max` |
 | in\_progress | failed | recaller | `attempts = max` |
+| in\_progress | in\_progress / failed | recaller | `claim_ttl` истёк (процесс умер посреди чтения): захват перехвачен, попытка засчитана |
 | restored | restored | backend | повторный RestoreObject продлевает `expires_at` |
-| restored | нет записи | janitor | `expires_at < now()`, файл удалён |
+| restored | нет записи | janitor | `online_until < now()` (обещанная дата, ADR-0003; инвариант `online_until >= expires_at`), строка удалена в транзакции, файл снят после commit |
 | любое | нет записи | backend | объект ушёл в `deleting`: строка `restores` удаляется в той же транзакции, иначе recaller вечно видит restore у удалённого объекта, а метрики очередей врут |
 
 ## Потоки запросов
@@ -227,8 +228,9 @@ CREATE TABLE upload_parts (
 | in\_progress | restored | recaller | файл в cache, размер и ETag сверены |
 | in\_progress | requested | recaller | ошибка и `attempts < max` |
 | in\_progress | failed | recaller | `attempts = max` |
+| in\_progress | in\_progress / failed | recaller | `claim_ttl` истёк (процесс умер посреди чтения): захват перехвачен, попытка засчитана |
 | restored | restored | backend | повторный RestoreObject продлевает `expires_at` |
-| restored | нет записи | janitor | `expires_at < now()`, файл удалён |
+| restored | нет записи | janitor | `online_until < now()` (обещанная дата, ADR-0003; инвариант `online_until >= expires_at`), строка удалена в транзакции, файл снят после commit |
 | любое | нет записи | backend | объект ушёл в `deleting`: строка `restores` удаляется в той же транзакции, иначе recaller вечно видит restore у удалённого объекта, а метрики очередей врут |
 
 ## Потоки запросов
@@ -283,15 +285,16 @@ CREATE TABLE upload_parts (
 
 **Recaller**
 
-1. Взять батч `requested` с `FOR UPDATE SKIP LOCKED`, порядок: `tier` (Expedited → Standard → Bulk), затем `requested_at`.
-2. Проверить место в кэше: если `cache.used + сумма размеров > cache.high_watermark`, сначала вытеснить истёкшие restore, иначе ждать (backpressure, не ошибка).
+1. Захват — **по одной пачке**, а не батчем по очереди: самая приоритетная готовая строка (приоритет tier Expedited → Standard → Bulk, затем `requested_at`), затем все готовые строки её пачки; `FOR UPDATE SKIP LOCKED`. Lease `recaller.claim_ttl` (в `next_try_at`) обязан покрывать одно чтение ленты, а не серию: при батче на весь ttl один воркер забрал бы очередь и читал пачки по очереди, второй драйв простаивал, а непрочитанные пачки после истечения lease перехватывались бы посреди чтения той же ленты. Просроченный захват перехватывается с засчитанной попыткой: процесс, умерший посреди чтения, не оставляет вечно длящий `in_progress`.
+   Строки захвата закрепляются за воркером (`restores.claimed_by`, узел/слот — как `packs.claimed_by` у migrator), и захват **продлевается каждую треть срока** коротким `UPDATE … WHERE claimed_by = me` вне транзакции чтения (правило 13): чтение пачки — ожидание драйва, монтирование и передача гигабайт (ADR-0021), срок, выставленный один раз, истёк бы посреди чтения, и второй воркер крутил бы ту же ленту второй раз. Не удалось продлить (строки уже чужие) — результат не публикуется, пачкой занимается другой. `MarkRestoreRestored`/`MarkRestoreFailure`/`MarkRestoreCorrupt` проверяют, что их вызывает текущий владелец.
+2. Проверить место в кэше: если `cache.used + сумма размеров > cache.high_watermark`, сначала вытеснить истёкшие restore, иначе ждать (backpressure, не ошибка). *Пункт ещё не реализован — S5 читает без проверки watermark.*
 3. Если Phobos API отдаёт ленту и смещение объекта — отсортировать батч по (лента, смещение). Иначе положиться на переупорядочивание в LRS (спайк M0).
-4. `phobos_get` батчем в файлы `cache/tmp/<uuid>`, проверить размер и ETag (для одиночных PUT — md5), `fsync`, `rename` в `cache/<2 hex>/<uuid>`.
-5. Строка → `restored`, `restored_at`, `expires_at = restored_at + days`. Ошибки — ретраи как у migrator, затем `failed`.
+4. Участники одной пачки читаются одним потоком: `phobos_get` копии пачки (oid из `archive_copies`, сумма `sha256` той же строки сверяется с отданными байтами), участник извлекается в `cache/tmp/<uuid>`, затем проверяется по-своему: длина файла, полное расшифрование (AEAD-теги сегментов и манифеста, ADR-0019), открытый размер и ETag (md5 для одиночных PUT). Не прошёл — в `restored` не входим, ошибка в журнал. Отказ участника **при совпавшей сумме пачки — терминальный** (`failed` сразу, без ретраев): сумма доказывает, что с ленты пришли ровно те байты, что легли при архивации, — повтор прочитает то же и только потратит ленту. Ретраи остаются для ошибок чтения и несовпадения суммы пачки.
+5. `fsync`, `rename` в `cache/<2 hex>/<uuid>` — и только потом строка → `restored`, `restored_at`, `expires_at = restored_at + days`, `online_until = max(online_until, restored_at + days)` (срок от завершения, ADR-0003). Порядок — ADR-0004 наоборот вытеснению: файл на диске раньше строки, которая на него ссылается. Решает `online_until` — одна колонка для заголовка, чтения из cache и вытеснения; `expires_at` справочное (из-за `GREATEST` он может быть меньше). Ошибки — ретраи как у migrator (backoff `recaller.retry_backoff`), затем `failed`.
 
 **GetObject**
 
-- `landing=true` → отдать из landing. `restored` и не истёк → из cache. Иначе `InvalidObjectState`.
+- `landing=true` → отдать из landing. Иначе `restored` и `online_until > now()` → из cache (решает одна колонка `online_until` — та же, что в заголовке и у janitor'а, ADR-0003; `expires_at` справочное). Иначе `InvalidObjectState`.
 - Range-запросы и условные заголовки (`If-Match`, `If-None-Match`, `If-Modified-Since`) — поведение как в posix-бэкенде.
 - Файл открывается до ответа, поэтому вытеснение **после** открытия безопасно: Linux держит inode до закрытия дескриптора.
 - Промежуток «прочитали состояние → открыли файл» закрывает ADR-0004: janitor сначала ставит `landing=false` в транзакции и только потом делает `unlink`, а GET на `ENOENT` перечитывает строку и пересчитывает решение (максимум `spool.evict_retries` повторов, затем `InvalidObjectState`, а не `InternalError`).
@@ -514,10 +517,13 @@ migrator:
   batch_max_bytes: 200GiB
   batch_max_wait: 15m
   max_attempts: 10
+  retry_backoff: 30s
 recaller:
   batch_max_objects: 500
   batch_max_wait: 5m
   max_attempts: 10
+  retry_backoff: 30s
+  claim_ttl: 30m                       # lease захвата строки restores: чтение пачки с ленты минутное
 metrics: {listen: ":9464"}
 ```
 

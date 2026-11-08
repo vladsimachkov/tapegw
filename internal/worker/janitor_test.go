@@ -57,7 +57,7 @@ func startJanitor(t *testing.T, h *harness, ctx context.Context) *worker.Janitor
 	h.cfg.Janitor.Interval = 50 * time.Millisecond
 	h.cfg.Janitor.ShutdownGrace = 10 * time.Second
 	return worker.StartJanitor(ctx, worker.JanitorDeps{
-		Cfg: h.cfg, Meta: h.m, Spool: h.land, Log: h.log,
+		Cfg: h.cfg, Meta: h.m, Spool: h.land, Cache: h.cache, Log: h.log,
 	})
 }
 
@@ -203,5 +203,102 @@ func TestJanitorKeepsObjectBeforeDeadline(t *testing.T) {
 	}
 	if !landingFlag(t, h, id) {
 		t.Error("флаг landing снят до срока")
+	}
+}
+
+// restoreToCache — результат работы recaller'а (S5): файл в cache, строка
+// archived без landing, в restores живой 'restored'.
+func restoreToCache(t *testing.T, h *harness, id uuid.UUID, until string) {
+	t.Helper()
+	ctx := context.Background()
+
+	src, err := h.land.Open(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp, err := h.cache.Tmp()
+	if err != nil {
+		src.Close()
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(tmp, src); err != nil {
+		src.Close()
+		tmp.Close()
+		t.Fatal(err)
+	}
+	src.Close()
+	if err := h.cache.Publish(tmp, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.land.Remove(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.Pool.Exec(ctx,
+		`UPDATE objects SET state = 'archived', landing = false, archived_at = now(),
+		        online_until = now() + $2::interval WHERE id = $1`, id, until); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.Pool.Exec(ctx,
+		`INSERT INTO restores (object_id, tenant_id, state, tier, days, requested_at,
+		                       restored_at, expires_at)
+		 VALUES ($1, 1, 'restored', 'Standard', 7, now() - interval '8 days',
+		         now() - interval '8 days', now() + $2::interval)`,
+		id, until); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Критерий S6 «после срока restore — снова InvalidObjectState»: истёкший
+// restore вытесняется из cache — строка уходит в транзакции выборки, файл
+// снимается после commit (ADR-0004), GET отвечает штатный InvalidObjectState.
+func TestJanitorEvictsExpiredRestore(t *testing.T) {
+	h := newHarness(t)
+	id := h.putObject(t, "jb", "restored.bin", []byte("данные после restore"))
+	restoreToCache(t, h, id, "-1 second")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	jan := startJanitor(t, h, ctx)
+
+	waitFor(t, "файл cache вытеснен", func() bool { return !h.cache.Exists(id) })
+	var n int
+	if err := h.m.Pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM restores WHERE object_id = $1`, id).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Error("строка restores осталась после вытеснения")
+	}
+	cancel()
+	jan.Wait(h.cfg.Janitor.ShutdownGrace)
+
+	_, err := h.be.GetObject(h.adminCtx(), &s3.GetObjectInput{
+		Bucket: aws.String("jb"), Key: aws.String("restored.bin"),
+	})
+	if !isInvalidObjectState(err) {
+		t.Errorf("GET после вытеснения restore: %v, ждали InvalidObjectState", err)
+	}
+}
+
+// Живой restore (online_until в будущем) вытеснению не подлежит — обещание в
+// x-amz-restore должно выполняться до последней секунды.
+func TestJanitorKeepsLiveRestore(t *testing.T) {
+	h := newHarness(t)
+	id := h.putObject(t, "jb", "alive.bin", []byte("срок restore ещё идёт"))
+	restoreToCache(t, h, id, "1 day")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	jan := startJanitor(t, h, ctx)
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	jan.Wait(h.cfg.Janitor.ShutdownGrace)
+
+	if !h.cache.Exists(id) {
+		t.Error("файл cache исчез до истечения online_until")
+	}
+	if _, err := h.be.GetObject(h.adminCtx(), &s3.GetObjectInput{
+		Bucket: aws.String("jb"), Key: aws.String("alive.bin"),
+	}); err != nil {
+		t.Errorf("GET живого restore: %v, ждали успех", err)
 	}
 }
