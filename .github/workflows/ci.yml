@@ -329,9 +329,15 @@ jobs:
         # Сеть внутри контейнера есть — модули скачиваются, GOMODCACHE
         # монтировать не нужно. -mod=mod: репозиторий примонтирован ro, и go не
         # должен пытаться что-то в нём дописывать (тот же режим, что у
-        # hack/ci-dir-up --test).
+        # hack/ci-dir-up --test). -buildvcs=false: репозиторий принадлежит не
+        # тому пользователю, под которым идёт контейнер, git отказается в нём
+        # работать («dubious ownership», exit 128) — на этом и краснел первый
+        # прогон джобы; vcs-штамп тестовым бинарям не нужен. Под podman
+        # (rootless) uid контейнера и владелец файлов совпадают, поэтому
+        # локальный прогон этот отказ не ловил.
         run: |
-          docker exec -e GOFLAGS=-mod=mod -e TAPEGW_PHOBOS_TEST=1 -w /src tapegw-ci-dir \
+          docker exec -e GOFLAGS="-mod=mod -buildvcs=false" -e TAPEGW_PHOBOS_TEST=1 \
+            -w /src tapegw-ci-dir \
             go test -tags phobos -count=1 -timeout 15m -v ./cmd/tapegw
 
   # Сборка с тегом phobos всего ./... требует EL9 — e2e-tape выше покрывает
