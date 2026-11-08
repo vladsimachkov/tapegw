@@ -26,7 +26,7 @@ import (
 // ErrRestoreLost — строка restore уже не в 'in_progress' (объект удалили,
 // строка ушла по каскаду, или перехватил другой воркер). Для вызывающего это
 // «работу опередили», а не сбой: повтор ничего не испортит.
-var ErrRestoreLost = errors.New("meta: строка restore не засталась в in_progress")
+var ErrRestoreLost = errors.New("meta: строка restore уже не в in_progress")
 
 // RestoreItem — участник батча recaller'а: что читать с ленты и что сверять.
 type RestoreItem struct {
