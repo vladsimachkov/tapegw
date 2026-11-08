@@ -157,8 +157,8 @@ metrics: {listen: %q}
 	}
 	defer pool.Close()
 
-	// --- шаг стенда: регистрация носителей (до Ф1.5) ---
-	standRegisterMedia(t, ctx, pool)
+	// --- шаг стенда: регистрация носителей командой Ф1.5 ---
+	standRegisterMedia(t, gwBin, gwCfg, "/var/lib/phobos/dir1", "/var/lib/phobos/dir2")
 
 	// --- шаг стенда: клиентский тенант и учётка ---
 	//
@@ -373,22 +373,24 @@ metrics: {listen: %q}
 	waitExit(t, gw, 90*time.Second)
 }
 
-// standRegisterMedia — ЯВНЫЙ ШАГ СТЕНДА: регистрация dir-носителей в реестре
-// tapegw сразу после готовности шлюза, до тестового сценария.
+// standRegisterMedia — ЯВНЫЙ ШАГ СТЕНДА: регистрация dir-носителей штатной
+// командой Ф1.5 (`tapegw admin media add`) сразу после готовности шлюза, до
+// тестового сценария. С Ф1.5 шаг вызывает команду, а не вставляет в БД:
+// сквозной тест проверяет путь оператора, а не прямой SQL.
 //
-// Так, а не вставкой внутри теста, потому что команда Ф1.5 («добавление ленты
-// одной операцией tapegw») ещё не написана, а init.sh контейнера отрабатывает
-// до появления схемы tapegw (миграции применяются на старте шлюза). Без
-// строки в media копия остаётся в 'writing' (так и задумано), и объект не
-// доходит до archived. Метки — пути, которые Phobos кладёт в extents для
-// dir-устройств. С Ф1.5 этот шаг заменится на вызов команды.
-func standRegisterMedia(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+// Команду нельзя выполнить раньше старта шлюза: схема tapegw появляется на
+// старте (миграции), а init.sh контейнера регистрирует носители в Phobos до
+// неё. Команда это переживает: она идемпотентна и сходится из положения
+// «в Phobos уже есть, у нас ещё нет» — проверяет список, ставит теги и
+// заводит строку реестра. Метки — пути, которые Phobos кладёт в extents для
+// dir-устройств.
+func standRegisterMedia(t *testing.T, gwBin, gwCfg string, labels ...string) {
 	t.Helper()
-	for _, label := range []string{"/var/lib/phobos/dir1", "/var/lib/phobos/dir2"} {
-		if _, err := pool.Exec(ctx,
-			`INSERT INTO media (label, lifecycle, pool_id, generation, medium_type, free_bytes_cached)
-			  VALUES ($1, 'active', 1, 'L8', 'L8', 100000000)
-			  ON CONFLICT (label) DO NOTHING`, label); err != nil {
+	for _, label := range labels {
+		run := exec.Command(gwBin, "admin", "media", "add", "-config", gwCfg,
+			"-label", label, "-pool", "1", "-generation", "L8", "-medium-type", "L8")
+		run.Stdout, run.Stderr = os.Stderr, os.Stderr
+		if err := run.Run(); err != nil {
 			t.Fatalf("регистрация носителя %s: %v", label, err)
 		}
 	}
