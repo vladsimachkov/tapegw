@@ -24,10 +24,13 @@ func TestArchiveTwoCopiesThroughRealMover(t *testing.T) {
 	testdb.Clean(t, m)
 
 	env := movertest.New(t, 1<<20)
-	env.Store.SetExtents("TST-LIVE")
+	// Fake выбирает ленту по тегам записи, как Phobos: две копии разводятся по
+	// двум носителям — страж «носители копий различны» требует именно этого.
+	env.Store.SetMediaByTag(map[string]string{"side:left": "TST-LIVE-L", "side:right": "TST-LIVE-R"})
 	if _, err := m.Pool.Exec(ctx, `
 INSERT INTO media (label, lifecycle, pool_id, generation, medium_type, free_bytes_cached)
-VALUES ('TST-LIVE', 'active', 1, 'L8', 'L8', 100000) ON CONFLICT (label) DO NOTHING`); err != nil {
+VALUES ('TST-LIVE-L', 'active', 1, 'L8', 'L8', 100000),
+       ('TST-LIVE-R', 'active', 1, 'L8', 'L8', 100000) ON CONFLICT (label) DO NOTHING`); err != nil {
 		t.Fatal(err)
 	}
 	cli := env.Dial(t)
@@ -60,16 +63,18 @@ VALUES ('TST-LIVE', 'active', 1, 'L8', 'L8', 100000) ON CONFLICT (label) DO NOTH
 		t.Fatal(err)
 	}
 	rows, err := m.Pool.Query(ctx,
-		`SELECT spec, phobos_oid, state FROM archive_copies WHERE pack_id = $1 ORDER BY spec`, packID)
+		`SELECT c.spec, c.phobos_oid, c.state, m.label
+		   FROM archive_copies c JOIN media m ON m.id = c.medium_id
+		  WHERE c.pack_id = $1 ORDER BY c.spec`, packID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	type cp struct{ spec, oid, state string }
+	type cp struct{ spec, oid, state, label string }
 	var got []cp
 	for rows.Next() {
 		var c cp
-		if err := rows.Scan(&c.spec, &c.oid, &c.state); err != nil {
+		if err := rows.Scan(&c.spec, &c.oid, &c.state, &c.label); err != nil {
 			t.Fatal(err)
 		}
 		got = append(got, c)
@@ -97,6 +102,9 @@ VALUES ('TST-LIVE', 'active', 1, 'L8', 'L8', 100000) ON CONFLICT (label) DO NOTH
 	}
 	if got[1].oid == packID.String() {
 		t.Errorf("вторая копия записана под oid первой: %s", got[1].oid)
+	}
+	if got[0].label == got[1].label {
+		t.Errorf("копии на одном носителе %s — архивацией это не считается", got[0].label)
 	}
 	if tags := env.Store.Tags(mustUUID(t, got[1].oid)); len(tags) != 1 || tags[0] != "side:right" {
 		t.Errorf("теги копии: %v — копии не разведены тегами", tags)

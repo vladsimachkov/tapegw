@@ -69,6 +69,12 @@ type probeMover struct {
 	copyCode  mover.Code // если задан — put с from_op вернёт этот код
 	holds     int        // сколько put приходили с hold
 
+	// mediumByTag — выбор ленты по тегам записи, как Phobos: экстент берётся
+	// по первому тегу из отображения. Тест копий заводит две ленты и
+	// разводит копии — иначе обе «лежат» на одной метке, и страж «копии на
+	// разных носителях» срабатывал бы в каждом тесте.
+	mediumByTag map[string]string
+
 	// #101: ответы на stat/delete по oid пачки.
 	statCode       mover.Code
 	statVersion    int
@@ -167,7 +173,7 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 			p.written = map[uuid.UUID]int{}
 		}
 		p.written[in.Op]++
-		return &mover.Result{Op: in.Op, Code: mover.CodeOK, Version: 1, Extents: []string{p.medium}}, nil
+		return &mover.Result{Op: in.Op, Code: mover.CodeOK, Version: 1, Extents: []string{p.mediumFor(in)}}, nil
 	}
 	body, err := io.ReadAll(in.Body)
 	if err != nil {
@@ -229,7 +235,17 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 		p.dropReply = false
 		return nil, errors.New("соединение оборвано после записи")
 	}
-	return &mover.Result{Op: in.Op, Code: mover.CodeOK, Version: 1, Extents: []string{p.medium}}, nil
+	return &mover.Result{Op: in.Op, Code: mover.CodeOK, Version: 1, Extents: []string{p.mediumFor(in)}}, nil
+}
+
+// mediumFor — метка ленты по тегам записи (см. mediumByTag), иначе общая p.medium.
+func (p *probeMover) mediumFor(in mover.PutIn) string {
+	for _, t := range in.Tags {
+		if lbl, ok := p.mediumByTag[t]; ok {
+			return lbl
+		}
+	}
+	return p.medium
 }
 
 func (p *probeMover) Status(op uuid.UUID) (*mover.Result, error) {
@@ -928,6 +944,14 @@ func TestPackArchivedOnlyAfterAllCopies(t *testing.T) {
 	a.Spec = "side:left"
 	a.Specs = []string{"side:left", "side:right"}
 	a.SpecTags = map[string][]string{"side:left": {"side:left"}, "side:right": {"side:right"}}
+	// Копии разводятся по лентам тегами — и страж «разные носители» требует,
+	// чтобы fake отвечал разными метками, как настоящий Phobos по тегам.
+	if _, err := m.Pool.Exec(context.Background(),
+		`INSERT INTO media (label, lifecycle, pool_id, generation, medium_type, free_bytes_cached)
+		 VALUES ('TST-MIG-2', 'active', 1, 'L8', 'L8', 1000) ON CONFLICT (label) DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	pm.mediumByTag = map[string]string{"side:left": "TST-MIG", "side:right": "TST-MIG-2"}
 
 	plan, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil)
 	if err != nil {
@@ -964,6 +988,47 @@ func TestPackArchivedOnlyAfterAllCopies(t *testing.T) {
 	}
 	if pm.releases != 1 {
 		t.Errorf("буфер освобождён %d раз, ждали 1 — иначе он висит до result_ttl", pm.releases)
+	}
+}
+
+// «Две копии» на одной ленте — не две копии: отказ носителя забирает обе.
+// Если Phobos положил копии на один носитель (теги лент подвели), пачка не
+// архивируется, а блокируется с причиной: повтор переслал бы то же самое,
+// поэтому это окончательный отказ, как no_buffer.
+func TestSameMediumCopiesBlockPack(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	ids := seedObjects(t, m, "collide", 2)
+	a, _ := archiver(t, m, ids[0])
+	a.Spec = "side:left"
+	a.Specs = []string{"side:left", "side:right"}
+	a.SpecTags = map[string][]string{"side:left": {"side:left"}, "side:right": {"side:right"}}
+	// mediumByTag не задан: fake отвечает одну и ту же метку на обе копии —
+	// ровно то, что даст лента, подошедшая под оба набора тегов.
+
+	_, err := a.ArchivePack(ctx, 1, itemsFor(ids), nil)
+	if err == nil || !strings.Contains(err.Error(), "носитель") {
+		t.Fatalf("ожидали отказ про один носитель, получили %v", err)
+	}
+	packID := packIDOf(t, m, ctx)
+	var packState, blocked string
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT state::text, COALESCE(blocked_reason, '') FROM packs WHERE id = $1`, packID).
+		Scan(&packState, &blocked); err != nil {
+		t.Fatal(err)
+	}
+	if packState != "sealed" || blocked == "" {
+		t.Errorf("пачка %s (blocked=%q), ждали sealed с причиной", packState, blocked)
+	}
+	if !strings.Contains(blocked, "носитель") {
+		t.Errorf("в причине %q нет слова про носитель", blocked)
+	}
+	for _, id := range ids {
+		if st := objectState(t, m, ctx, id); st != "archiving" {
+			t.Errorf("объект в %s, ждали archiving: пачка не разобрана", st)
+		}
 	}
 }
 

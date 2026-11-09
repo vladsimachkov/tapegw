@@ -76,7 +76,18 @@ type Store struct {
 	incomplete map[uuid.UUID]bool
 	statErr    error
 	extents    []string
+	mediaByTag map[string]string
 	putBlock   chan struct{}
+}
+
+// SetMediaByTag — выбор ленты по тегам записи, как в настоящем Phobos:
+// Extents(id) вернёт метку по первому тегу записи, который есть в отображении
+// (тег → метка). Без него Extents отдаёт один SetExtents на все объекты, и
+// тест копий не отличал бы «развели по лентам» от «обе на одну».
+func (f *Store) SetMediaByTag(m map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mediaByTag = m
 }
 
 // SetPutBlock включает ловушку: Put ждёт закрытия канала перед записью. Тесты
@@ -263,10 +274,24 @@ func (f *Store) Extents(_ context.Context, ids []uuid.UUID) (map[uuid.UUID][]str
 	out := map[uuid.UUID][]string{}
 	for _, id := range ids {
 		if _, ok := f.data[id]; ok {
+			if lbl := f.matchTagLocked(f.tags[id]); lbl != "" {
+				out[id] = []string{lbl}
+				continue
+			}
 			out[id] = append([]string(nil), f.extents...)
 		}
 	}
 	return out, nil
+}
+
+// matchTagLocked — метка по первому тегу из mediaByTag; вызов под f.mu.
+func (f *Store) matchTagLocked(tags []string) string {
+	for _, t := range tags {
+		if lbl, ok := f.mediaByTag[t]; ok {
+			return lbl
+		}
+	}
+	return ""
 }
 
 func (f *Store) Close() error { return nil }

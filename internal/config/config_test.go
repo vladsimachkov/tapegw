@@ -776,3 +776,133 @@ func TestPackThreshold(t *testing.T) {
 		t.Errorf("нулевой порог принят: %v", err)
 	}
 }
+
+// Политика копий пула (Ф1.1): парсинг из YAML.
+func TestLoadPoolsPolicy(t *testing.T) {
+	t.Setenv("TAPEGW_ROOT_ACCESS", "a")
+	t.Setenv("TAPEGW_ROOT_SECRET", "b")
+	t.Setenv("TAPEGW_IAM_KEK_FILE", testKEKFile)
+	path := writeConfig(t, `
+pools:
+  shared:
+    copies:
+      - name: left
+        tags: [side:left]
+      - name: right
+        tags: [side:right, vault]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	pw, ok := cfg.Pools["shared"]
+	if !ok {
+		t.Fatalf("pools.shared не распарсился: %+v", cfg.Pools)
+	}
+	if len(pw.Copies) != 2 {
+		t.Fatalf("копий %d, ожидали 2: %+v", len(pw.Copies), pw.Copies)
+	}
+	if pw.Copies[0].Name != "left" || strings.Join(pw.Copies[0].Tags, ",") != "side:left" {
+		t.Errorf("копия 1 = %+v", pw.Copies[0])
+	}
+	if pw.Copies[1].Name != "right" || strings.Join(pw.Copies[1].Tags, ",") != "side:right,vault" {
+		t.Errorf("копия 2 = %+v", pw.Copies[1])
+	}
+}
+
+// Кривая политика отсекается на старте: обнаруженная в момент записи, она
+// означает уже испорченную очередь, а не ошибку конфигурации.
+func TestValidatePoolsPolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		copies []CopySpec
+		want   string // подстрока ожидаемой ошибки; пусто = политика валидна
+	}{
+		{"пустой список", nil, "нужна хотя бы одна спецификация"},
+		{"пустое имя", []CopySpec{{Name: " ", Tags: []string{"a:1"}}}, "пустое имя"},
+		{
+			"дубль имени",
+			[]CopySpec{{Name: "x", Tags: []string{"a:1"}}, {Name: "x", Tags: []string{"a:2"}}},
+			"имя \"x\" повторяется",
+		},
+		{
+			"пустой тег",
+			[]CopySpec{{Name: "x", Tags: []string{"a:1", " "}}},
+			"пустой тег",
+		},
+		{
+			"одинаковые теги",
+			[]CopySpec{{Name: "left", Tags: []string{"side:left"}}, {Name: "right", Tags: []string{"side:left"}}},
+			"с одинаковыми тегами",
+		},
+		{
+			"одинаковые наборы в разном порядке",
+			[]CopySpec{{Name: "a", Tags: []string{"b:2", "a:1"}}, {Name: "b", Tags: []string{"a:1", "b:2"}}},
+			"с одинаковыми тегами",
+		},
+		{
+			// Пустой набор — подмножество любого: копии «any» годится
+			// любая лента пула, включая ту, куда легла первая копия.
+			"пустой набор — подмножество",
+			[]CopySpec{{Name: "left", Tags: []string{"side:left"}}, {Name: "any", Tags: nil}},
+			"подмножество",
+		},
+		{
+			"строгое подмножество",
+			[]CopySpec{{Name: "narrow", Tags: []string{"x:1"}}, {Name: "wide", Tags: []string{"x:1", "y:2"}}},
+			"подмножество",
+		},
+		{
+			"подмножество в обратном порядке",
+			[]CopySpec{{Name: "wide", Tags: []string{"x:1", "y:2"}}, {Name: "narrow", Tags: []string{"x:1"}}},
+			"подмножество",
+		},
+		{
+			"разные наборы проходят",
+			[]CopySpec{{Name: "left", Tags: []string{"side:left"}}, {Name: "right", Tags: []string{"side:right"}}},
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Root.Access, cfg.Root.Secret = "a", "b"
+			cfg.IAM.KEKFile = testKEKFile
+			cfg.Pools = map[string]PoolWrite{"shared": {Copies: tt.copies}}
+			err := cfg.Validate()
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("валидная политика отвергнута: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ожидали ошибку %q, получили %v", tt.want, err)
+			}
+		})
+	}
+}
+
+// Тег пула обязан попасть в каждую копию (ADR-0013), даже если админ уже
+// написал его руками, и не продублироваться при этом.
+func TestCopySpecsPrependsPoolTag(t *testing.T) {
+	pw := PoolWrite{Copies: []CopySpec{
+		{Name: "left", Tags: []string{"side:left"}},
+		{Name: "manual", Tags: []string{"pool:shared", "side:manual"}},
+		{Name: "bare", Tags: nil},
+	}}
+	specs, tags := pw.CopySpecs("pool:shared")
+	if strings.Join(specs, ",") != "left,manual,bare" {
+		t.Errorf("порядок копий сломан: %v", specs)
+	}
+	want := map[string]string{
+		"left":   "pool:shared,side:left",
+		"manual": "pool:shared,side:manual",
+		"bare":   "pool:shared",
+	}
+	for name, wantTags := range want {
+		if got := strings.Join(tags[name], ","); got != wantTags {
+			t.Errorf("теги копии %s = %q, ожидали %q", name, got, wantTags)
+		}
+	}
+}

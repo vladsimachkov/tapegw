@@ -527,3 +527,35 @@ func TestPoolTag(t *testing.T) {
 		t.Error("несуществующий пул не отвергнут")
 	}
 }
+
+// Имя пула — ключ политики копий в конфиге (pools.<имя>.copies), обратный
+// поиск — проверка опечатки на старте воркера.
+func TestPoolNameAndByName(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+
+	name, err := m.PoolName(ctx, meta.DefaultPoolID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name == "" {
+		t.Fatal("пустое имя: политика пула в конфиге не найдёт своего пула")
+	}
+	if _, err := m.PoolName(ctx, 999); err == nil {
+		t.Error("несуществующий пул не отвергнут")
+	}
+
+	id, ok, err := m.PoolByName(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || id != meta.DefaultPoolID {
+		t.Errorf("PoolByName(%q) = %d, %v", name, id, ok)
+	}
+	// Несуществующее имя — это (false), а не ошибка: вызывающий отличает
+	// «опечатка в конфиге» от сбоя БД именно по различению ok/err.
+	if id, ok, err := m.PoolByName(ctx, "нет-такого-пула"); err != nil || ok || id != 0 {
+		t.Errorf("PoolByName(несуществующего) = %d, %v, %v", id, ok, err)
+	}
+}

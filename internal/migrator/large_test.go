@@ -155,6 +155,14 @@ func TestArchiveLargeObjectCopiesFromOneBuffer(t *testing.T) {
 	a.Spec = "side:left"
 	a.Specs = []string{"side:left", "side:right"}
 	a.SpecTags = map[string][]string{"side:left": {"side:left"}, "side:right": {"side:right"}}
+	// Копии разводятся по лентам тегами — страж «носители копий различны»
+	// требует, чтобы fake отвечал разными метками, как Phobos по тегам.
+	if _, err := m.Pool.Exec(context.Background(),
+		`INSERT INTO media (label, lifecycle, pool_id, generation, medium_type, free_bytes_cached)
+		 VALUES ('TST-MIG-2', 'active', 1, 'L8', 'L8', 1000) ON CONFLICT (label) DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	pm.mediumByTag = map[string]string{"side:left": "TST-MIG", "side:right": "TST-MIG-2"}
 
 	if _, err := a.ArchiveLargeObject(ctx, 1, rawItem(ids[0], body)); err != nil {
 		t.Fatalf("архивация: %v", err)

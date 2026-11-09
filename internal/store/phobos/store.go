@@ -187,6 +187,22 @@ func cstr(s string) *C.char {
 	return c
 }
 
+// cTags — массив тегов для shim. И массив, и строки выделены в C: их освобождает
+// Phobos (pho_xfer_desc_clean → string_array_free вызывает free() на каждой
+// строке и на массиве), а память Go free() не переживёт. Повторно освобождать
+// здесь нельзя — владение переходит вместе с вызовом tapegw_put.
+func cTags(tags []string) (**C.char, C.int) {
+	if len(tags) == 0 {
+		return nil, 0
+	}
+	arr := C.malloc(C.size_t(len(tags)) * C.size_t(unsafe.Sizeof((*C.char)(nil))))
+	p := unsafe.Slice((**C.char)(arr), len(tags))
+	for i, t := range tags {
+		p[i] = C.CString(t)
+	}
+	return (**C.char)(arr), C.int(len(tags))
+}
+
 func (s *Store) putOne(it store.PutItem, opt store.PutOptions) error {
 	if err := store.Rewind(it.File); err != nil {
 		return err
@@ -203,6 +219,10 @@ func (s *Store) putOne(it store.PutItem, opt store.PutOptions) error {
 	lkeys, lvals, freeLyt := cAttrs(opt.LayoutParams)
 	defer freeLyt()
 
+	// Теги выбора носителя (ADR-0013): без них Phobos пишет на любой носитель
+	// библиотеки, и разведение копий по тегам не работает.
+	tags, ntags := cTags(opt.Tags)
+
 	runtime.KeepAlive(it.File)
 	var tid C.long
 	cl := cstr(opt.Layout)
@@ -212,7 +232,8 @@ func (s *Store) putOne(it store.PutItem, opt store.PutOptions) error {
 
 	rc := C.tapegw_put(id, C.int(it.File.Fd()), C.long(it.Size),
 		C.int(familyOf(opt.Family)), clib, cl, keys, vals,
-		C.int(len(it.Attrs)), lkeys, lvals, C.int(len(opt.LayoutParams)), &tid)
+		C.int(len(it.Attrs)), lkeys, lvals, C.int(len(opt.LayoutParams)),
+		tags, ntags, &tid)
 	s.noteTID(tid)
 	switch {
 	case rc == 0:

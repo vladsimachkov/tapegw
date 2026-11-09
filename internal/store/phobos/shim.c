@@ -8,7 +8,7 @@
 int tapegw_put(const char *objid, int fd, long size, int family,
                const char *library, const char *layout_name, char **keys,
                char **vals, int nattrs, char **lyt_keys, char **lyt_vals,
-               int nlyt, long *tid_out) {
+               int nlyt, char **tags, int ntags, long *tid_out) {
     *tid_out = tapegw_tid();
 
     struct pho_xfer_desc xd;
@@ -27,8 +27,18 @@ int tapegw_put(const char *objid, int fd, long size, int family,
 
     xd.xd_ntargets = 1;
     xd.xd_targets = calloc(1, sizeof(struct pho_xfer_target));
-    if (xd.xd_targets == NULL)
+    if (xd.xd_targets == NULL) {
+        /* clean ниже не дошёл бы — владение тегами ещё на нас. */
+        for (int i = 0; i < ntags; i++)
+            free(tags[i]);
+        free(tags);
         return -ENOMEM;
+    }
+
+    /* Владение переходит к xd: pho_xfer_desc_clean освободит массив и строки
+     * (xfer_put_param_clean → string_array_free). */
+    xd.xd_params.put.tags.strings = tags;
+    xd.xd_params.put.tags.count = (size_t)ntags;
 
     /* pho_xfer_desc_clean освобождает цели и атрибуты; objid принадлежит
      * вызывающему и clean её не трогает (см. заголовок библиотеки). */
