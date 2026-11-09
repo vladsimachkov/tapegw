@@ -1052,6 +1052,21 @@ func (c *Config) Validate() error {
 			}
 			seenTags[key] = cp.Name
 		}
+		// Различие наборов мало: если теги одной копии — подмножество тегов
+		// другой (пустой набор — подмножество любого), любая лента, подходящая
+		// «широкой» копии, годится и «узкой», и обе копии могут лечь на одну.
+		// Равенство сообщено выше как дубль, здесь — собственные подмножества.
+		for i := 0; i < len(pw.Copies); i++ {
+			for j := i + 1; j < len(pw.Copies); j++ {
+				a, b := pw.Copies[i], pw.Copies[j]
+				switch {
+				case properSubset(a.Tags, b.Tags):
+					add("pools.%s.copies: теги копии %q — подмножество тегов %q: лента, подходящая %q, годится и для %q — обе копии могут лечь на одну", name, a.Name, b.Name, b.Name, a.Name)
+				case properSubset(b.Tags, a.Tags):
+					add("pools.%s.copies: теги копии %q — подмножество тегов %q: лента, подходящая %q, годится и для %q — обе копии могут лечь на одну", name, b.Name, a.Name, a.Name, b.Name)
+				}
+			}
+		}
 	}
 
 	switch strings.ToLower(c.Logging.Format) {
@@ -1078,6 +1093,29 @@ func sortedStrings(in []string) []string {
 	out := append([]string(nil), in...)
 	sort.Strings(out)
 	return out
+}
+
+// properSubset — строгое подмножество по множествам (дубли внутри списка не
+// считаются): A ⊂ B, если у A меньше различных тегов, чем у B, и каждый тег A
+// есть у B. Пустое A — подмножество любого непустого B.
+func properSubset(a, b []string) bool {
+	setA := make(map[string]bool, len(a))
+	for _, t := range a {
+		setA[t] = true
+	}
+	setB := make(map[string]bool, len(b))
+	for _, t := range b {
+		setB[t] = true
+	}
+	if len(setA) >= len(setB) {
+		return false
+	}
+	for t := range setA {
+		if !setB[t] {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidateMover — обязательное для процесса tapegw-mover (S1). Вызывается из

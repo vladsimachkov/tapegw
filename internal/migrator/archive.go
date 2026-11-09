@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -379,6 +380,19 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 		return nil, err
 	}
 	done, err := a.Meta.ArchivePackWhenCopiesDone(ctx, packID, metaPlacements(placements), a.copySpecs(), a.WorkerID, a.LandingMinRetention)
+	if errors.Is(err, meta.ErrCopiesSameMedium) {
+		// Копии на одной ленте — это не «не дошло», повтор даст тот же исход:
+		// данные уже записаны, носитель не поменяется. Окончательный отказ,
+		// как no_buffer: блокируем с причиной, оператор чинит теги лент или
+		// политику и снимает блокировку. Считать такую пачку архивной —
+		// значит отчитаться защитой, которой нет.
+		a.logger().Error("копии пачки легли на один носитель — пачка заблокирована, проверьте теги лент и политику копий",
+			"pack", packID.String(), "err", err.Error())
+		if berr := a.Meta.BlockPack(ctx, packID, err.Error()); berr != nil {
+			return nil, berr
+		}
+		return nil, fmt.Errorf("migrator: пачка %s заблокирована: %w", packID, err)
+	}
 	if err != nil {
 		return nil, err
 	}

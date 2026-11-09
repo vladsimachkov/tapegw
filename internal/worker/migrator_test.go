@@ -287,6 +287,15 @@ func TestMigratorWorkerPolicyCopies(t *testing.T) {
 		{Name: "left", Tags: []string{"side:left"}},
 		{Name: "right", Tags: []string{"side:right"}},
 	}}}
+	// Fake выбирает ленту по тегам записи, как Phobos: без этого обе копии
+	// «легли» бы на TST-MOVER, и страж разных носителей сработал бы здесь.
+	if _, err := h.m.Pool.Exec(context.Background(),
+		`INSERT INTO media (label, lifecycle, pool_id, generation, medium_type, free_bytes_cached)
+		 VALUES ('TST-LEFT', 'active', 1, 'L8', 'L8', 100000),
+		        ('TST-RIGHT', 'active', 1, 'L8', 'L8', 100000)`); err != nil {
+		t.Fatal(err)
+	}
+	h.env.Store.SetMediaByTag(map[string]string{"side:left": "TST-LEFT", "side:right": "TST-RIGHT"})
 	id := h.putObject(t, "wb", "two.bin", []byte("две копии по политике пула"))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -315,22 +324,26 @@ func TestMigratorWorkerPolicyCopies(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// В реестре — обе копии, каждая со своей спецификацией и своим объектом
-	// Phobos (у копии свой oid, ADR-0022).
+	// В реестре — обе копии, каждая со своей спецификацией, своим объектом
+	// Phobos (у копии свой oid, ADR-0022) и на СВОЁМ носителе: «две копии»
+	// на одной ленте архивацией не считаются.
 	rows, err := h.m.Pool.Query(cctx,
-		`SELECT spec, state FROM archive_copies WHERE pack_id = $1 ORDER BY spec`, packID)
+		`SELECT c.spec, c.state::text, m.label
+		   FROM archive_copies c JOIN media m ON m.id = c.medium_id
+		  WHERE c.pack_id = $1 ORDER BY c.spec`, packID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	var specs, states []string
+	var specs, states, labels []string
 	for rows.Next() {
-		var s, st string
-		if err := rows.Scan(&s, &st); err != nil {
+		var s, st, lb string
+		if err := rows.Scan(&s, &st, &lb); err != nil {
 			t.Fatal(err)
 		}
 		specs = append(specs, s)
 		states = append(states, st)
+		labels = append(labels, lb)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -342,6 +355,9 @@ func TestMigratorWorkerPolicyCopies(t *testing.T) {
 		if st != "done" {
 			t.Errorf("копия %s в %s, ждали done", specs[i], st)
 		}
+	}
+	if strings.Join(labels, ",") != "TST-LEFT,TST-RIGHT" {
+		t.Errorf("копии на носителях %v, ожидали TST-LEFT,TST-RIGHT — разведение по тегам не сработало", labels)
 	}
 
 	// Теги каждой копии ушли в Phobos своими: тег пула добавлен к тегу стороны
@@ -379,5 +395,49 @@ func TestStartMigratorsRejectsUnknownPool(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "shared-d") {
 		t.Errorf("в ошибке нет имени пула: %v", err)
+	}
+}
+
+// Боевой путь стража «копии на разных носителях»: если ленты подобрались так,
+// что обе копии легли на одну (теги подвели), пачка не становится архивной —
+// она блокируется с причиной, а объекты ждут на диске. Тест не заводит
+// разведения по тегам: fake отвечает обеим копиям один TST-MOVER.
+func TestMigratorWorkerSameMediumBlocks(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Pools = map[string]config.PoolWrite{"shared": {Copies: []config.CopySpec{
+		{Name: "left", Tags: []string{"side:left"}},
+		{Name: "right", Tags: []string{"side:right"}},
+	}}}
+	id := h.putObject(t, "wb", "coll.bin", []byte("обе копии легли на одну ленту"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	targets, err := worker.PlanMigrators(h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.StartMigrators(ctx, worker.MigratorDeps{
+		Cfg: h.cfg, Meta: h.m, Spool: h.land, Log: h.log,
+	}, targets); err != nil {
+		t.Fatalf("StartMigrators: %v", err)
+	}
+
+	var packID uuid.UUID
+	waitFor(t, "пачка заблокирована с причиной", func() bool {
+		if err := h.m.Pool.QueryRow(context.Background(),
+			`SELECT pack_id FROM objects WHERE id = $1`, id).Scan(&packID); err != nil {
+			return false
+		}
+		var blocked string
+		if err := h.m.Pool.QueryRow(context.Background(),
+			`SELECT COALESCE(blocked_reason, '') FROM packs WHERE id = $1`, packID).Scan(&blocked); err != nil {
+			return false
+		}
+		return blocked != ""
+	})
+	cancel()
+
+	if st := objectState(t, h.m, id); st != "archiving" {
+		t.Errorf("объект в %s, ждали archiving: пачка с одной лентой архивной не считается", st)
 	}
 }

@@ -805,6 +805,23 @@ func TestValidatePoolsPolicy(t *testing.T) {
 			"с одинаковыми тегами",
 		},
 		{
+			// Пустой набор — подмножество любого: копии «any» годится
+			// любая лента пула, включая ту, куда легла первая копия.
+			"пустой набор — подмножество",
+			[]CopySpec{{Name: "left", Tags: []string{"side:left"}}, {Name: "any", Tags: nil}},
+			"подмножество",
+		},
+		{
+			"строгое подмножество",
+			[]CopySpec{{Name: "narrow", Tags: []string{"x:1"}}, {Name: "wide", Tags: []string{"x:1", "y:2"}}},
+			"подмножество",
+		},
+		{
+			"подмножество в обратном порядке",
+			[]CopySpec{{Name: "wide", Tags: []string{"x:1", "y:2"}}, {Name: "narrow", Tags: []string{"x:1"}}},
+			"подмножество",
+		},
+		{
 			"разные наборы проходят",
 			[]CopySpec{{Name: "left", Tags: []string{"side:left"}}, {Name: "right", Tags: []string{"side:right"}}},
 			"",

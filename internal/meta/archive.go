@@ -581,9 +581,49 @@ WHERE NOT EXISTS (
 	return out, rows.Err()
 }
 
+// ErrCopiesSameMedium — копии пачки легли на один и тот же носитель. «Две
+// копии» на одном картридже не являются двумя копиями: отказ ленты забирает
+// обе, и защита иллюзорна. Правило «архивный = все копии» здесь не просто
+// «все строки done», а «все копии на РАЗНЫХ носителях» — иначе политика
+// копирования держится на корректности тегов лент, а не на проверке.
+// Вторая линия после конфига (набор тегов копии не может быть подмножеством
+// другой): ошибка в тегах ленты или в политике здесь превращается в
+// блокировку с причиной, а не в молчаливую «защиту» одной лентой.
+var ErrCopiesSameMedium = errors.New("meta: копии легли на один носитель")
+
+// copiesMediumCollision — спецификации готовых копий, чьи носители совпали
+// (через запятую; пусто — коллизии нет). 'done' без носителя схемой запрещён
+// (archive_copies_done_has_medium), но NULL на всякий случай не считаем:
+// «неизвестный носитель» — это не «носитель совпал».
+func (m *Meta) copiesMediumCollision(ctx context.Context, packID uuid.UUID, specs []string) (string, error) {
+	var want []string
+	if len(specs) > 0 {
+		want = specs
+	}
+	var collide *string
+	err := m.Pool.QueryRow(ctx, `
+WITH done AS (
+    SELECT spec, medium_id FROM archive_copies
+     WHERE pack_id = $1 AND state = 'done' AND medium_id IS NOT NULL
+       AND ($2::text[] IS NULL OR spec = ANY($2::text[]))
+)
+SELECT string_agg(spec, ',' ORDER BY spec) FROM done
+ WHERE medium_id IN (SELECT medium_id FROM done GROUP BY medium_id HAVING count(*) > 1)`,
+		packID, want).Scan(&collide)
+	if err != nil {
+		return "", fmt.Errorf("meta: сверить носители копий: %w", err)
+	}
+	if collide == nil {
+		return "", nil
+	}
+	return *collide, nil
+}
+
 // ArchivePackWhenCopiesDone переводит пачку и участников в 'archived', только
 // когда все нужные копии записаны. Возвращает false, если копий не хватает:
 // это не ошибка, а «ещё не готово» — остальное догонит следующий проход.
+// Если копии есть, но две из них на одном носителе — ErrCopiesSameMedium:
+// пачка не архивируется, вызывающий решает (migrator блокирует её с причиной).
 func (m *Meta) ArchivePackWhenCopiesDone(ctx context.Context, packID uuid.UUID, placements []Placement, specs []string, workerID string, minRetention time.Duration) (bool, error) {
 	if workerID == "" {
 		return false, fmt.Errorf("meta: завершение пачки без workerID")
@@ -599,6 +639,16 @@ func (m *Meta) ArchivePackWhenCopiesDone(ctx context.Context, packID uuid.UUID, 
 	}
 	if len(missing) > 0 {
 		return false, nil
+	}
+	// Все копии есть — но не легли ли две на одну ленту? Проверка здесь, а не
+	// в вызывающем: инвариант «archived ⇒ копии на разных носителях» обязан
+	// держаться для любого пути архивации, а не только для migrator'а.
+	collide, err := m.copiesMediumCollision(ctx, packID, specs)
+	if err != nil {
+		return false, err
+	}
+	if collide != "" {
+		return false, fmt.Errorf("%w: %s", ErrCopiesSameMedium, collide)
 	}
 	tx, err := m.Pool.Begin(ctx)
 	if err != nil {
