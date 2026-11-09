@@ -15,6 +15,7 @@ func testVersion() archive.Version {
 		Tenant:     42,
 		WrappedDEK: []byte("обёртка DEK — 48 байт на самом деле"),
 		KEK:        "v3",
+		Seq:        7,
 	}
 }
 
@@ -125,6 +126,34 @@ func TestAttributesRoundTrip(t *testing.T) {
 	}
 	if string(got.WrappedDEK) != string(v.WrappedDEK) {
 		t.Fatal("обёртка DEK испорчена при переносе")
+	}
+	if got.Seq != v.Seq {
+		t.Errorf("version_seq разъехался: %d, было %d", got.Seq, v.Seq)
+	}
+}
+
+// tapegw.copy — седьмой атрибут крупного объекта (ADR-0020 §1): его добавляет
+// записывающая сторона поверх набора версии. Разбор обязан его принимать и
+// складывать в Version.Copy, а отсутствие не считать ошибкой: атрибут описывает
+// копию, а не версию.
+func TestParseAttributesAcceptsCopy(t *testing.T) {
+	v := testVersion()
+	attrs, err := archive.Attributes(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attrs[archive.AttrCopy] = "left"
+	got, err := archive.ParseAttributes(attrs)
+	if err != nil {
+		t.Fatalf("разбор с tapegw.copy: %v", err)
+	}
+	if got.Copy != "left" {
+		t.Errorf("copy = %q, ждали left", got.Copy)
+	}
+	// Без copy — тоже законно.
+	delete(attrs, archive.AttrCopy)
+	if _, err := archive.ParseAttributes(attrs); err != nil {
+		t.Fatalf("разбор без tapegw.copy: %v", err)
 	}
 }
 

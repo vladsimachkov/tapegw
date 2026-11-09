@@ -741,6 +741,42 @@ func TestGenerationWritable(t *testing.T) {
 	}
 }
 
+// pack.threshold — настройка из правила 9: дефолт, YAML, переменная окружения
+// и отказ на нуле. Ноль означал бы «каждый объект — отдельный файл на ленте»,
+// то есть ровно раздутый индекс LTFS, ради которого пачки и заводили.
+func TestPackThreshold(t *testing.T) {
+	if Default().Pack.Threshold != 25*MiB {
+		t.Errorf("по умолчанию %v, ждали 25MiB (значение из договора про RPO)", Default().Pack.Threshold)
+	}
+
+	path := writeConfig(t, "pack:\n  threshold: 1MiB\n")
+	t.Setenv("TAPEGW_ROOT_ACCESS", "a")
+	t.Setenv("TAPEGW_ROOT_SECRET", "b")
+	t.Setenv("TAPEGW_IAM_KEK_FILE", "/tmp/kek.json")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Pack.Threshold != 1*MiB {
+		t.Errorf("yaml: threshold = %v, ждали 1MiB", cfg.Pack.Threshold)
+	}
+
+	t.Setenv("TAPEGW_PACK_THRESHOLD", "64MiB")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load с env: %v", err)
+	}
+	if cfg.Pack.Threshold != 64*MiB {
+		t.Errorf("TAPEGW_PACK_THRESHOLD не применён: %v", cfg.Pack.Threshold)
+	}
+
+	bad := Default()
+	bad.Pack.Threshold = 0
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "pack.threshold") {
+		t.Errorf("нулевой порог принят: %v", err)
+	}
+}
+
 // Политика копий пула (Ф1.1): парсинг из YAML.
 func TestLoadPoolsPolicy(t *testing.T) {
 	t.Setenv("TAPEGW_ROOT_ACCESS", "a")

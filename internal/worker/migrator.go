@@ -254,9 +254,24 @@ func runMigrator(ctx context.Context, deps MigratorDeps, t MoverTarget, id strin
 			cli.Close()
 			continue
 		}
-		if _, err := a.ArchivePack(sendCtx, meta.DefaultPoolID, items, nil); err != nil {
-			log.Error("migrator: архивация пачки",
-				slog.String("слот", id), slog.Int("объектов", len(items)), slog.String("err", err.Error()))
+		// Разбивка батча по pack.threshold: мелкие — в пачку, крупные — каждый
+		// своим объектом Phobos (ARCHITECTURE, «Упаковка»). Крупные идут
+		// первыми: они не ограничены окном закрытия пачки и не должны ждать,
+		// пока соберётся tar. Отказ одного крупного не отменяет пачку и
+		// остальные объекты — учёт попыток построчный.
+		small, large := migrator.SplitByThreshold(items, int64(cfg.Pack.Threshold))
+		for _, it := range large {
+			if _, err := a.ArchiveLargeObject(sendCtx, meta.DefaultPoolID, it); err != nil {
+				log.Error("migrator: архивация крупного объекта",
+					slog.String("слот", id), slog.String("объект", it.Version.String()),
+					slog.String("err", err.Error()))
+			}
+		}
+		if len(small) > 0 {
+			if _, err := a.ArchivePack(sendCtx, meta.DefaultPoolID, small, nil); err != nil {
+				log.Error("migrator: архивация пачки",
+					slog.String("слот", id), slog.Int("объектов", len(small)), slog.String("err", err.Error()))
+			}
 		}
 		cli.Close()
 	}

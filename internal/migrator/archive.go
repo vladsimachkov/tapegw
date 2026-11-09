@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vladsimachkov/tapegw/internal/archive"
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/mover"
 	"github.com/vladsimachkov/tapegw/internal/store"
@@ -141,7 +142,7 @@ func (a *Archiver) attrsFor(base map[string]string, spec string) map[string]stri
 	for k, v := range base {
 		out[k] = v
 	}
-	out["tapegw.copy"] = spec
+	out[archive.AttrCopy] = spec
 	return out
 }
 
@@ -275,21 +276,69 @@ func (a *Archiver) ArchivePack(ctx context.Context, poolID int64, items []Item, 
 	}
 
 	// Шаги 4 и 5 — отправка и итог.
-	return a.deliver(ctx, packID, items, plan, attrs)
+	return a.deliver(ctx, packID, items, plan, attrs, packUnit{}, a.Format)
+}
+
+// ArchiveLargeObject — один цикл архивации крупного объекта (≥ pack.threshold).
+//
+// Путь проходит через ту же машину, что пачка, и это не переиспользование кода
+// ради кода: у пути крупного объекта не должно быть отдельного запаса
+// устойчивости к сбоям. Запечатывание до отправки (SealPack), захват с
+// продлением (heartbeat), разбор неизвестного итога (resolveUnknown /
+// resolveByStat) и копии из одного буфера (hold / from_op) — те же функции.
+// Отличаются байты (сырой файл вместо tar-пачки), oid (UUID версии вместо
+// свежего UUID пачки) и атрибуты (шесть полей версии плюс копия).
+func (a *Archiver) ArchiveLargeObject(ctx context.Context, poolID int64, it Item) (*Plan, error) {
+	if a.Meta == nil || a.Put == nil {
+		return nil, fmt.Errorf("migrator: Archiver без Meta или Put")
+	}
+	if a.WorkerID == "" || a.ClaimTTL <= 0 {
+		return nil, fmt.Errorf("migrator: Archiver без ProcessID/ClaimTTL: пачку нельзя закрепить за собой")
+	}
+	// Атрибуты выводятся из участника, а не приходят извне: продолжение после
+	// рестарта пересобирает их из загрузчика и обязано получить те же байты.
+	attrs, err := objectAttrs(it)
+	if err != nil {
+		return nil, err
+	}
+	ids := []uuid.UUID{it.Version}
+
+	tx, err := a.Meta.BeginObjectArchive(ctx, poolID, it.Version)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // после коммита нечего откатывать
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("migrator: закоммитить переход: %w", err)
+	}
+	// oid первой копии — UUID версии (ADR-0020), он же id строки packs.
+	packID := it.Version
+
+	plan, err := MeasureFile(it)
+	if err != nil {
+		a.Meta.FailPackArchive(ctx, packID, ids, "сборка: "+err.Error())
+		return nil, err
+	}
+	if err := a.Meta.SealPack(ctx, packID, metaPlacements(plan.Placements), plan.Size, a.WorkerID, a.ClaimTTL); err != nil {
+		a.Meta.FailPackArchive(ctx, packID, ids, "запечатывание: "+err.Error())
+		return nil, err
+	}
+	return a.deliver(ctx, packID, []Item{it}, plan, attrs, objectUnit{}, archive.FormatVersion)
 }
 
 // deliver — шаги 4 и 5: второй проход, отправка, разбор неизвестного итога и
 // запись результата. Транзакции во время вызова mover'а нет (правило 13).
-// Общий для ArchivePack и ResumePacks: продолжение обязано пройти ровно тот же
-// путь, иначе «продолжили не так» превратится в вторую копию.
-func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, plan *Plan, attrs map[string]string) (*Plan, error) {
+// Общий для ArchivePack, ArchiveLargeObject и ResumePacks: продолжение обязано
+// пройти ровно тот же путь, иначе «продолжили не так» превратится в вторую
+// копию.
+func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, plan *Plan, attrs map[string]string, b unitBuilder, format int) (*Plan, error) {
 	ids := make([]uuid.UUID, 0, len(items))
 	for _, it := range items {
 		ids = append(ids, it.Version)
 	}
 	// Шаг 4 — второй проход и отправка. Транзакции нет (правило 13).
 	var buf bytes.Buffer
-	placements, err := BuildIndexed(&buf, items, plan)
+	placements, err := b.build(&buf, items, plan)
 	if err != nil {
 		// Пачка запечатана, но на ленту ничего не шло: отказ определённый,
 		// снимается членство.
@@ -334,6 +383,23 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 	}
 
 	if res.Code != mover.CodeOK {
+		if res.Code == mover.CodeNoBuffer {
+			// Архивный юнит больше всего буфера mover'а: отказ приходит до
+			// приёма байт (ADR-0021), на ленту ничего не легло. Пересылка
+			// бессмысленна — пока оператор не поднимет buffer_bytes, отказ
+			// будет тот же. Поэтому пачка не возвращается в очередь (она
+			// крутила бы круг) и не отменяется (объекты никуда не делись), а
+			// блокируется с причиной: объекты остаются в 'archiving' с
+			// pack_id, причина видна в реестре, продолжение такую пачку не
+			// берёт.
+			a.logger().Error("буфер mover'а меньше архивного юнита — поднимите phobos.mover.buffer_bytes",
+				"pack", packID.String(), "bytes", plan.Size)
+			if err := a.Meta.BlockPack(ctx, packID,
+				"mover: no_buffer — архивный юнит больше всего буфера mover"); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("mover: пачка %s заблокирована: юнит больше буфера mover", packID)
+		}
 		if definiteRefusals[res.Code] {
 			// Известно, что на ленту ничего не легло, — выбрасывать можно.
 			a.Meta.FailPackArchive(ctx, packID, ids, "mover: "+string(res.Code))
@@ -373,10 +439,10 @@ func (a *Archiver) deliver(ctx context.Context, packID uuid.UUID, items []Item, 
 	}
 	// С5: первая копия записана. Пачка ещё НЕ archived — «архивирован» значит
 	// «записаны все копии политики», а не «одна легла».
-	if _, err := a.Meta.RecordPackCopy(ctx, packID, a.Spec, packID.String(), res.Version, a.Format, raw, mediumID); err != nil {
+	if _, err := a.Meta.RecordPackCopy(ctx, packID, a.Spec, packID.String(), res.Version, format, raw, mediumID); err != nil {
 		return nil, err
 	}
-	if err := a.writeExtraCopies(ctx, packID, plan, attrs); err != nil {
+	if err := a.writeExtraCopies(ctx, packID, plan, attrs, format); err != nil {
 		return nil, err
 	}
 	done, err := a.Meta.ArchivePackWhenCopiesDone(ctx, packID, metaPlacements(placements), a.copySpecs(), a.WorkerID, a.LandingMinRetention)
@@ -498,7 +564,7 @@ func (a *Archiver) copySpecs() []string {
 // Сбой копии не откатывает остальные (С6): записанное на ленту остаётся,
 // недостающая копия помечается и догоняется отдельно. Пачка при этом не
 // 'archived' — это и есть сигнал «чего-то не хватает».
-func (a *Archiver) writeExtraCopies(ctx context.Context, packID uuid.UUID, plan *Plan, attrs map[string]string) error {
+func (a *Archiver) writeExtraCopies(ctx context.Context, packID uuid.UUID, plan *Plan, attrs map[string]string, format int) error {
 	specs := a.copySpecs()
 	if len(specs) <= 1 {
 		return nil
@@ -533,7 +599,7 @@ func (a *Archiver) writeExtraCopies(ctx context.Context, packID uuid.UUID, plan 
 			}
 		}
 		// oid копии — её собственный объект Phobos, не oid пачки.
-		if _, err := a.Meta.RecordPackCopy(ctx, packID, spec, op.String(), res.Version, a.Format, raw, mediumID); err != nil {
+		if _, err := a.Meta.RecordPackCopy(ctx, packID, spec, op.String(), res.Version, format, raw, mediumID); err != nil {
 			return err
 		}
 	}
@@ -617,10 +683,33 @@ func (a *Archiver) resumeOne(ctx context.Context, packID uuid.UUID, load LoadIte
 				items[i].Version, id)
 		}
 	}
-	plan, err := Measure(items)
+	// Признак single_object решает, какие байты пересобирать: сырой файл или
+	// tar-пачку. Ошибка в эту ветку — не «сумма не сошлась где-то потом», а
+	// второй объект на ленте под тем же oid с чужими байтами, поэтому выборка
+	// идёт по явному флагу строки, а не по числу участников.
+	single, err := a.Meta.PackSingleObject(ctx, packID)
+	if err != nil {
+		return err
+	}
+	var b unitBuilder = packUnit{}
+	format := a.Format
+	if single {
+		if len(items) != 1 {
+			return fmt.Errorf("migrator: пачка %s помечена как крупный объект, участников %d", packID, len(items))
+		}
+		b = objectUnit{}
+		format = archive.FormatVersion
+		// Атрибуты крупного объекта выводятся из участника — их обязан уметь
+		// восстановить любой процесс, а не только тот, что начал архивацию.
+		attrs, err = objectAttrs(items[0])
+		if err != nil {
+			return err
+		}
+	}
+	plan, err := b.measure(items)
 	if err != nil {
 		return fmt.Errorf("migrator: пересобрать пачку %s: %w", packID, err)
 	}
-	_, err = a.deliver(ctx, packID, items, plan, attrs)
+	_, err = a.deliver(ctx, packID, items, plan, attrs, b, format)
 	return err
 }
