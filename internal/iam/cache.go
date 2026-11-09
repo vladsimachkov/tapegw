@@ -275,17 +275,24 @@ func (c *Cache) InvalidateByAccess(access string) {
 	c.mu.Lock()
 	c.gen++
 	delete(c.entries, access)
-	c.mu.Unlock()
+	// Счётчик — под тем же мьютексом, что и сам сброс (см. InvalidateAll).
 	c.stats.invalidations.Add(1)
+	c.mu.Unlock()
 }
 
 // InvalidateAll — сброс всего кэша.
+//
+// Счётчик поднимается ДО снятия мьютекса намеренно: иначе наблюдатель видит
+// пустой кэш на строку раньше, чем выросший счётчик, и «сброс произошёл»
+// оказывается отсталым от состояния, которое описывает. На этом ловком
+// наблюдателе (тест ждёт пустого кэша и тут же читает Stats) и ловился
+// ложнозелёный/ложнокрасый исход — см. issue #135.
 func (c *Cache) InvalidateAll() {
 	c.mu.Lock()
 	c.gen++
 	clear(c.entries)
-	c.mu.Unlock()
 	c.stats.flushes.Add(1)
+	c.mu.Unlock()
 }
 
 func (c *Cache) generation() uint64 {
