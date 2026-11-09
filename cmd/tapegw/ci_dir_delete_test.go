@@ -133,7 +133,11 @@ metrics: {listen: %q}
 	}
 	defer pool.Close()
 
-	standRegisterMedia(t, gwBin, gwCfg, "/var/lib/phobos/dir1")
+	// Оба носителя DSS, а не один: Phobos сам выбирает, куда положить копию, а
+	// копия на ленте вне реестра tapegw для migrator'а — «записана вне реестра»,
+	// и пачка зависает в «ждёт догонки». Стенд ci-dir знает dir1 и dir2, поэтому
+	// в реестр обязаны попасть оба.
+	standRegisterMedia(t, gwBin, gwCfg, "/var/lib/phobos/dir1", "/var/lib/phobos/dir2")
 
 	body := make([]byte, 3<<20)
 	if _, err := rand.Read(body); err != nil {

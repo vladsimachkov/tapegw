@@ -400,6 +400,20 @@ SELECT c.copy_name, c.version, c.copy_status, e.medium_id, e.state
  WHERE c.object_uuid = (SELECT object_uuid FROM object WHERE oid = '<oid>');
 ```
 
+### Зарегистрирован не весь DSS — пачка висит в «ждёт догонки»
+
+Симптом: объект не доходит до `archived`, в логе шлюза
+`копия записана на ленту вне реестра` и `пачка записана не полностью — ждёт
+догонки копий`, повтор бьётся в `duplicate key … archive_copies_copy_unique`.
+
+Причина: Phobos сам выбирает носитель, а tapegw признаёт только те метки, что
+внесены в реестр (`tapegw admin media add`). В стенде ci-dir DSS знает `dir1`
+и `dir2`, и если зарегистрировать только один, часть пачек уезжает на
+незарегистрированный носитель.
+
+Что делать: регистрировать **все** носители DSS, а не «тот, что нужен тесту».
+Проверка: `phobos dir list` против `select label from media`.
+
 ### После `phobos delete` экстенты остаются: жив ли объект — по `getmd`
 
 Симптом: `phobos delete <oid>` отвечает успехом (`DELETE operation for oid ...
