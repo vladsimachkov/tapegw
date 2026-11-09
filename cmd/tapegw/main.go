@@ -230,6 +230,18 @@ func run(args []string) error {
 		logger.Warn("ВЫТЕСНЕНИЕ ВЫКЛЮЧЕНО: janitor.enabled=false — файлы landing не удалятся " +
 			"после online_until, диск будет расти до watermark")
 	}
+	// Удалитель (M6): снимает с диска и с ленты версии, ушедшие в 'deleting'.
+	// Выключен виден так же громко, как выключенная архивация: удалённые
+	// версии продолжали бы занимать диск и ленту, и снаружи это не видно.
+	var del *worker.DeleterGroup
+	if cfg.Deleter.EnabledValue() {
+		del = worker.StartDeleter(ctx, worker.DeleterDeps{
+			Cfg: cfg, Meta: pool, Spool: land, Cache: cache, Log: logger,
+		})
+	} else {
+		logger.Warn("УДАЛЕНИЕ ВЫКЛЮЧЕНО: deleter.enabled=false — удалённые версии останутся " +
+			"на диске и на ленте, очередь deleting будет расти")
+	}
 	if cfg.Metrics.Listen != "" {
 		rd, err := worker.StartReadiness(cfg.Metrics.Listen, cfg.Migrator.EnabledValue(), logger)
 		if err != nil {
@@ -258,6 +270,9 @@ func run(args []string) error {
 	}
 	if jan != nil {
 		jan.Wait(cfg.Janitor.ShutdownGrace)
+	}
+	if del != nil {
+		del.Wait(cfg.Deleter.ShutdownGrace)
 	}
 	logger.Info("stopped")
 	return nil

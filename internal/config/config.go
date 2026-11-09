@@ -36,6 +36,7 @@ type Config struct {
 	Migrator Worker  `yaml:"migrator"`
 	Recaller Worker  `yaml:"recaller"`
 	Janitor  Janitor `yaml:"janitor"`
+	Deleter  Deleter `yaml:"deleter"`
 	Metrics  Metrics `yaml:"metrics"`
 	Admin    Admin   `yaml:"admin"`
 	Logging  Logging `yaml:"logging"`
@@ -230,6 +231,13 @@ type Phobos struct {
 	// Читается только когда включён migrator и в библиотеке есть mover'ы.
 	MoverClient MoverTLS `yaml:"mover_client"`
 
+	// DeleterClient — сертификат tapegw как клиента mover'ов для удалителя
+	// (SAN-URI tapegw://deleter, M6). Отдельный от mover_client намеренно:
+	// purge удаляет целый архивный объект, и это право не должно жить на
+	// сертификате планировщика архивации. Требуется, когда deleter включён и
+	// в библиотеке есть mover роли migrator.
+	DeleterClient MoverTLS `yaml:"deleter_client"`
+
 	// Mover — конфигурация самого процесса tapegw-mover (ADR-0021). tapegw
 	// эти поля не читает: они живут в том же файле, потому что один файл —
 	// одна установка, а переменные TAPEGW_PHOBOS_MOVER_* выводятся из пути.
@@ -381,6 +389,31 @@ type Janitor struct {
 
 // EnabledValue — включён ли janitor с учётом умолчания (nil = true).
 func (j Janitor) EnabledValue() bool { return j.Enabled == nil || *j.Enabled }
+
+// Deleter — фоновый удалитель (M6): снимает с диска и с ленты версии, ушедшие
+// в 'deleting'. Выключенный deleter виден так же громко, как выключенная
+// архивация: удалённые версии продолжали бы занимать место на ленте и на
+// диске, и снаружи это не видно ничем.
+type Deleter struct {
+	// Enabled — по умолчанию true.
+	Enabled *bool `yaml:"enabled"`
+	// Interval — период выборки из 'deleting'.
+	Interval time.Duration `yaml:"interval"`
+	// BatchMaxObjects — сколько версий разбирается за один проход.
+	BatchMaxObjects int `yaml:"batch_max_objects"`
+	// ClaimTTL — на сколько воркер занимает версию (next_try_at отодвигается
+	// на этот срок). Purge целого объекта — минуты; после падения захват
+	// истекает сам, и версию подберёт следующий прогон.
+	ClaimTTL time.Duration `yaml:"claim_ttl"`
+	// RetryBackoff — основание экспоненциальной задержки повтора (потолок
+	// сутки): сбой N откладывается на RetryBackoff * 2^N.
+	RetryBackoff time.Duration `yaml:"retry_backoff"`
+	// ShutdownGrace — сколько ждём текущий проход при остановке.
+	ShutdownGrace time.Duration `yaml:"shutdown_grace"`
+}
+
+// EnabledValue — включён ли deleter с учётом умолчания (nil = true).
+func (d Deleter) EnabledValue() bool { return d.Enabled == nil || *d.Enabled }
 
 type Metrics struct {
 	Listen string `yaml:"listen"`
@@ -567,6 +600,15 @@ func Default() *Config {
 			Interval:        time.Minute,
 			BatchMaxObjects: 1000,
 			ShutdownGrace:   30 * time.Second,
+		},
+		Deleter: Deleter{
+			Interval:        time.Minute,
+			BatchMaxObjects: 200,
+			// Purge пачки — несколько вызовов mover по минуте каждый; ttl с
+			// запасом переживает штатный проход, а после падения истекает сам.
+			ClaimTTL:      15 * time.Minute,
+			RetryBackoff:  30 * time.Second,
+			ShutdownGrace: 5 * time.Minute,
 		},
 		Metrics: Metrics{Listen: ":9464"},
 		Admin:   Admin{PathPrefix: "/admin"},
@@ -969,6 +1011,24 @@ func (c *Config) Validate() error {
 		add("janitor.shutdown_grace: %v, должно быть > 0", c.Janitor.ShutdownGrace)
 	}
 
+	if c.Deleter.EnabledValue() {
+		if c.Deleter.Interval <= 0 {
+			add("deleter.interval: %v, должно быть > 0", c.Deleter.Interval)
+		}
+		if c.Deleter.BatchMaxObjects < 1 {
+			add("deleter.batch_max_objects: %d, должно быть >= 1", c.Deleter.BatchMaxObjects)
+		}
+		if c.Deleter.ClaimTTL <= 0 {
+			add("deleter.claim_ttl: %v, должно быть > 0", c.Deleter.ClaimTTL)
+		}
+		if c.Deleter.RetryBackoff <= 0 {
+			add("deleter.retry_backoff: %v, должно быть > 0", c.Deleter.RetryBackoff)
+		}
+		if c.Deleter.ShutdownGrace <= 0 {
+			add("deleter.shutdown_grace: %v, должно быть > 0", c.Deleter.ShutdownGrace)
+		}
+	}
+
 	for _, wm := range []struct {
 		name string
 		wm   Watermark
@@ -1044,6 +1104,10 @@ func (c *Config) Validate() error {
 	if hasMigratorMover && c.Phobos.MoverClient.Cert == "" {
 		add("phobos.mover_client: cert/key/ca обязательны, в phobos.movers есть mover роли migrator — " +
 			"планировщику архивации нечем представиться (SAN-URI tapegw://scheduler, ADR-0021)")
+	}
+	if hasMigratorMover && c.Deleter.EnabledValue() && c.Phobos.DeleterClient.Cert == "" {
+		add("phobos.deleter_client: cert/key/ca обязательны, deleter включён и в phobos.movers есть mover роли migrator — " +
+			"удалителю нечем представиться (SAN-URI tapegw://deleter, M6); права на purge не должны жить на сертификате планировщика")
 	}
 
 	// Политика копий пула (предложение 0013 §2). Проверяется всё до старта:

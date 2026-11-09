@@ -25,6 +25,7 @@ import (
 	"github.com/vladsimachkov/tapegw/internal/iam"
 	"github.com/vladsimachkov/tapegw/internal/keys"
 	"github.com/vladsimachkov/tapegw/internal/meta"
+	"github.com/vladsimachkov/tapegw/internal/mover"
 	"github.com/vladsimachkov/tapegw/internal/mover/movertest"
 	"github.com/vladsimachkov/tapegw/internal/spool"
 	"github.com/vladsimachkov/tapegw/internal/testdb"
@@ -93,7 +94,9 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 
-	env := movertest.New(t, 64<<20)
+	// deleter тоже разрешён: harness гоняет и удалитель (M6), а mover по
+	// умолчанию принимает только scheduler.
+	env := movertest.New(t, 64<<20, mover.ClientScheduler, mover.ClientDeleter)
 
 	cfg := config.Default()
 	cfg.Phobos.Family = "dir"
@@ -103,6 +106,9 @@ func newHarness(t *testing.T) *harness {
 	}
 	cfg.Phobos.MoverClient = config.MoverTLS{
 		Cert: env.PKI.ClientCert, Key: env.PKI.ClientKey, CA: env.PKI.CA,
+	}
+	cfg.Phobos.DeleterClient = config.MoverTLS{
+		Cert: env.PKI.DeleterCert, Key: env.PKI.DeleterKey, CA: env.PKI.CA,
 	}
 	cfg.Migrator.BatchMaxWait = 50 * time.Millisecond
 	cfg.Migrator.ClaimTTL = 5 * time.Second
@@ -135,7 +141,11 @@ func (h *harness) putObject(t *testing.T, bucket, key string, body []byte) uuid.
 	t.Helper()
 	if err := h.be.CreateBucket(h.adminCtx(),
 		&s3.CreateBucketInput{Bucket: aws.String(bucket)}, []byte(`{}`)); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
+		// Повторный CreateBucket того же бакета — не ошибка стенда: тесты
+		// кладут в один бакет несколько объектов (пачка).
+		if !strings.Contains(err.Error(), "AlreadyOwned") && !strings.Contains(err.Error(), "AlreadyExists") {
+			t.Fatalf("CreateBucket: %v", err)
+		}
 	}
 	if _, err := h.be.PutObject(h.adminCtx(), s3response.PutObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String(key),

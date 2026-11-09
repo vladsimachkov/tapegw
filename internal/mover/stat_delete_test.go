@@ -124,3 +124,102 @@ func TestDeleteRefusedWhenStatFails(t *testing.T) {
 		t.Errorf("delete отсутствующего: %s, ждали ok", res.Code)
 	}
 }
+
+// --- purge (M6): удаление целого объекта — отдельная операция и отдельная роль.
+
+// Purge обязан удалять целый объект — в этом весь его смысл, — но только
+// клиенту с ролью deleter. Планировщик архивации его получить не должен:
+// иначе «почистить неполную копию» и «уничтожить архив» различаются только
+// аккуратностью кода, а не сертификатом.
+func TestPurgeOnlyForDeleter(t *testing.T) {
+	e := startEnvWith(t, 1<<20, mover.ClientScheduler, mover.ClientDeleter)
+
+	body := []byte("archived object")
+	op := uuid.New()
+	c := e.dial(t)
+	if _, err := c.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(body)), SHA256: sum(body), Body: bytes.NewReader(body)}); err != nil {
+		t.Fatal(err)
+	}
+
+	dc, err := e.dialWith(t, e.pki.deleterCert, e.pki.deleterKey, e.pki.ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := dc.PurgeObject(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != mover.CodeOK {
+		t.Errorf("purge от deleter: %s, ждали ok", res.Code)
+	}
+	if e.st.Has(op) {
+		t.Error("purge от deleter обязан удалить целый объект")
+	}
+}
+
+func TestPurgeDeniedForScheduler(t *testing.T) {
+	e := startEnvWith(t, 1<<20, mover.ClientScheduler, mover.ClientDeleter)
+	c := e.dial(t)
+
+	body := []byte("archived object")
+	op := uuid.New()
+	if _, err := c.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(body)), SHA256: sum(body), Body: bytes.NewReader(body)}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := c.PurgeObject(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != mover.CodeDenied {
+		t.Errorf("purge от scheduler: %s, ждали denied", res.Code)
+	}
+	if !e.st.Has(op) {
+		t.Error("объект удалён purge'ом от scheduler — роль не проверилась")
+	}
+}
+
+// Старая операция не должна разъехаться вместе с новой: delete целого объекта
+// остаётся denied даже для deleter'а — у purge для этого отдельная граница.
+func TestDeleteStillRefusesCompleteForDeleter(t *testing.T) {
+	e := startEnvWith(t, 1<<20, mover.ClientScheduler, mover.ClientDeleter)
+
+	body := []byte("archived object")
+	op := uuid.New()
+	c := e.dial(t)
+	if _, err := c.Put(mover.PutIn{Op: op, ID: op, Size: int64(len(body)), SHA256: sum(body), Body: bytes.NewReader(body)}); err != nil {
+		t.Fatal(err)
+	}
+
+	dc, err := e.dialWith(t, e.pki.deleterCert, e.pki.deleterKey, e.pki.ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := dc.DeleteObject(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != mover.CodeDenied {
+		t.Errorf("delete целого от deleter: %s, ждали denied — старая операция не должна пускать целое", res.Code)
+	}
+	if !e.st.Has(op) {
+		t.Error("delete целого от deleter удалил объект")
+	}
+}
+
+// Идемпотность для воркера, повторяющего шаг после падения:purge отсутствующего
+// объекта — успех, а не ошибка.
+func TestPurgeMissingIsSuccess(t *testing.T) {
+	e := startEnvWith(t, 1<<20, mover.ClientScheduler, mover.ClientDeleter)
+	dc, err := e.dialWith(t, e.pki.deleterCert, e.pki.deleterKey, e.pki.ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := dc.PurgeObject(uuid.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != mover.CodeOK {
+		t.Errorf("purge отсутствующего: %s, ждали ok", res.Code)
+	}
+}

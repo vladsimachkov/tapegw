@@ -140,12 +140,14 @@ func newApp(ctx context.Context, cfg *config.Config, log *slog.Logger) (*app, er
 	}
 
 	// Роли клиентов — по роли mover'а: migrator'у пишет планировщик
-	// архивации, recaller'у — планировщик восстановления. Пустой список
-	// ServerTLS отклоняет сам: «разрешили не разрешать ничего» — не режим.
+	// архивации и удаляет deleter (копии живут в архивной библиотеке, удалять
+	// их должен тот же mover, что пишет), recaller'у — планировщик
+	// восстановления. Пустой список ServerTLS отклоняет сам: «разрешили не
+	// разрешать ничего» — не режим.
 	var allowed []mover.ClientID
 	switch mover.Role(m.Role) {
 	case mover.RoleMigrator:
-		allowed = []mover.ClientID{mover.ClientScheduler}
+		allowed = []mover.ClientID{mover.ClientScheduler, mover.ClientDeleter}
 	case mover.RoleRecaller:
 		allowed = []mover.ClientID{mover.ClientRestorer}
 	default:

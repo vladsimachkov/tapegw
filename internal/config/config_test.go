@@ -609,6 +609,7 @@ func TestMoverClientRequiredForMigrator(t *testing.T) {
 		t.Errorf("mover роли migrator без сертификата планировщика не отклонён: %v", err)
 	}
 	cfg.Phobos.MoverClient = MoverTLS{Cert: "c", Key: "k", CA: "ca"}
+	cfg.Phobos.DeleterClient = MoverTLS{Cert: "d", Key: "dk", CA: "ca"}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("заполненный mover_client, а конфиг невалиден: %v", err)
 	}
@@ -621,6 +622,40 @@ func TestMoverClientRequiredForMigrator(t *testing.T) {
 	setRole(cfg2, "drive2", "recaller")
 	if err := cfg2.Validate(); err != nil {
 		t.Errorf("пул только с recaller не должен требовать mover_client: %v", err)
+	}
+}
+
+func TestDeleterClientRequired(t *testing.T) {
+	// deleter по умолчанию включён, а права на purge целого объекта не должны
+	// жить на сертификате планировщика — отдельный сертификат обязателен.
+	cfg := moversCfg()
+	setRole(cfg, "drive1", "migrator")
+	setRole(cfg, "drive2", "recaller")
+	cfg.Phobos.MoverClient = MoverTLS{Cert: "c", Key: "k", CA: "ca"}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "deleter_client") {
+		t.Errorf("включённый deleter без своего сертификата не отклонён: %v", err)
+	}
+
+	cfg.Phobos.DeleterClient = MoverTLS{Cert: "d", Key: "dk", CA: "ca"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("заполненный deleter_client, а конфиг невалиден: %v", err)
+	}
+
+	// Выключенный deleter сертификата не требует: требовать нечем не пользуемое.
+	off := false
+	cfg.Deleter.Enabled = &off
+	cfg.Phobos.DeleterClient = MoverTLS{}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("выключенный deleter не должен требовать deleter_client: %v", err)
+	}
+
+	// Только recaller-ы — удалять на ленте некому и нечего, сертификат не нужен.
+	cfg2 := moversCfg()
+	setRole(cfg2, "drive1", "recaller")
+	setRole(cfg2, "drive2", "recaller")
+	if err := cfg2.Validate(); err != nil {
+		t.Errorf("пул только с recaller не должен требовать deleter_client: %v", err)
 	}
 }
 

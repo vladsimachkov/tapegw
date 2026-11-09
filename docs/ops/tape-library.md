@@ -400,6 +400,26 @@ SELECT c.copy_name, c.version, c.copy_status, e.medium_id, e.state
  WHERE c.object_uuid = (SELECT object_uuid FROM object WHERE oid = '<oid>');
 ```
 
+### После `phobos delete` экстенты остаются: жив ли объект — по `getmd`
+
+Симптом: `phobos delete <oid>` отвечает успехом (`DELETE operation for oid ...
+succeeded`), но `phobos extent list -f json <oid>` тут же печатает строку с
+прежним размером и `state: ["sync"]` — выглядит так, будто удаление не
+сработало.
+
+Причина: `delete` снимает объект из namespace и кладёт его в deprecated-таблицу
+(так и написано в `phobos delete --help`), а экстенты deprecated-объекта
+живут, пока их не уберёт очистка. Отсюда же `phobos undelete` — из deprecated
+объект возвращается обратно.
+
+Что делать: существование объекта проверять по `phobos getmd <oid>` — у
+снятого объекта rc=2 и `No such object`. Так же устроен `Stat` tapegw:
+существование даёт `phobos_getmd`, а `extent list` служит только для размера и
+полноты (`internal/store/phobos/store.go`). Повторный `delete` уже снятого
+объекта отвечает `ENOENT`, и tapegw считает это успехом (идемпотентность шага
+deleter'а). Проверено на ci-dir 2026-11-09 (M6): тест
+`cmd/tapegw/ci_dir_delete_test.go` сверяет `getmd` до удаления и после.
+
 ---
 
 ## 8. Открытые вопросы по настройке
