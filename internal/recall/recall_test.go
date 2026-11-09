@@ -591,3 +591,139 @@ func TestRecallLeaseRenewalBlocksSecondWorker(t *testing.T) {
 		t.Error("файла нет в cache после восстановления")
 	}
 }
+
+// --- крупный объект (≥ pack.threshold) -------------------------------------
+//
+// Крупный объект — пачка из одного участника, чей поток и есть файл объекта:
+// mover отдаёт его целиком, окно экстрактора [0, file_bytes) совпадает со всем
+// потоком, и сверка идёт по ожидаемой сумме копии из archive_copies. Отдельной
+// «крупной» ветки в recaller'е нет — и тесты ниже фиксируют именно это: тот же
+// Once, та же двухуровневая проверка.
+
+// largeObject заводит архивный крупный объект: строка packs с id объекта,
+// копия под oid объекта, участник с pack_offset=0 и file_bytes = весь файл.
+func (f *fixture) largeObject(t *testing.T, plain []byte) (uuid.UUID, []byte) {
+	t.Helper()
+	ctx := f.ctx
+
+	id := uuid.New()
+	dek, wrapped, err := f.vault.NewVersionDEK(ctx, 2, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt := make([]byte, encrypt.SaltSize)
+	if _, err := rand.Read(salt); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	w, err := encrypt.NewWriter(&buf, dek, id, 1, salt, int64(len(plain)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(plain); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file := buf.Bytes()
+
+	if _, err := f.m.Pool.Exec(ctx,
+		`INSERT INTO packs (id, pool_id, kind, state, total_bytes, live_bytes, members_total, members_live, single_object)
+		 VALUES ($1, 1, 'data', 'archived', $2, $2, 1, 1, true)`, id, len(file)); err != nil {
+		t.Fatal(err)
+	}
+	label := "rl-" + uuid.NewString()[:8]
+	if _, err := f.m.Pool.Exec(ctx,
+		`INSERT INTO media (label, lifecycle, pool_id, generation, medium_type, free_bytes_cached)
+		 VALUES ($1, 'active', 1, 'L8', 'L8', 1000000)`, label); err != nil {
+		t.Fatal(err)
+	}
+	var mediaID int64
+	if err := f.m.Pool.QueryRow(ctx, `SELECT id FROM media WHERE label = $1`, label).Scan(&mediaID); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(file)
+	if _, err := f.m.RecordPackCopy(ctx, id, "main", id.String(), 1, 1, sum[:], mediaID); err != nil {
+		t.Fatal(err)
+	}
+
+	var bucketID int64
+	if err := f.m.Pool.QueryRow(ctx, `SELECT id FROM buckets WHERE name = 'rb'`).Scan(&bucketID); err != nil {
+		t.Fatal(err)
+	}
+	md5sum := md5.Sum(plain)
+	if _, err := f.m.Pool.Exec(ctx,
+		`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class, state,
+		                      landing, online_until, tenant_id, pool_id, is_current,
+		                      wrapped_dek, pack_id, pack_offset, pack_length, file_bytes)
+		 VALUES ($1,$2,'big',$3,$4,'GLACIER','archived',false, now() - interval '1 hour',
+		         2, 1, true, $5, $1, 0, $6, $6)`,
+		id, bucketID, len(plain), hex.EncodeToString(md5sum[:]), wrapped, len(file)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.Pool.Exec(ctx,
+		`INSERT INTO object_parts (version_id, part_number, plain_size, cipher_offset, salt)
+		 VALUES ($1, 1, $2, 0, $3)`, id, len(plain), salt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.RequestRestore(ctx, meta.NewTenant(2), id, 7, "Standard"); err != nil {
+		t.Fatal(err)
+	}
+	f.get.streams[id] = file
+	return id, file
+}
+
+// Крупный объект восстанавливается целиком: в cache ложится ровно поток ленты
+// (он же файл объекта), строка уходит в 'restored'.
+func TestRecallLargeObjectWholeFile(t *testing.T) {
+	f := newFixture(t)
+	plain := make([]byte, 300_000) // больше одного кадра: поток идёт не кусочками
+	if _, err := rand.Read(plain); err != nil {
+		t.Fatal(err)
+	}
+	id, file := f.largeObject(t, plain)
+
+	n, err := f.rc.Once(f.ctx)
+	if err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("восстановлено %d, ждали 1", n)
+	}
+	if got := f.cacheBytes(t, id); !bytes.Equal(got, file) {
+		t.Errorf("в cache %d байт, файл целиком — %d; крупный объект обязан ложиться в cache без вырезания",
+			len(got), len(file))
+	}
+	if st, _ := f.restoreRow(t, id); st != "restored" {
+		t.Errorf("restore в %s, ждали restored", st)
+	}
+}
+
+// Испорченный поток крупного объекта ловится по ожидаемой сумме копии из
+// archive_copies — до проверки содержимого и с правом на повтор (в отличие от
+// терминального corrupt при совпавшей сумме).
+func TestRecallLargeObjectSumMismatchRetries(t *testing.T) {
+	f := newFixture(t)
+	plain := make([]byte, 50_000)
+	if _, err := rand.Read(plain); err != nil {
+		t.Fatal(err)
+	}
+	id, file := f.largeObject(t, plain)
+
+	// Лента отдала другие байты при неизменной записанной сумме.
+	tampered := append([]byte(nil), file...)
+	tampered[len(tampered)/2] ^= 0xff
+	f.get.streams[id] = tampered
+
+	if _, err := f.rc.Once(f.ctx); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	st, attempts := f.restoreRow(t, id)
+	if st != "requested" || attempts != 1 {
+		t.Errorf("restore: %s/%d, ждали requested/1 — несовпавшая сумма это ретрай, а не терминальный отказ", st, attempts)
+	}
+	if _, err := f.cache.Open(id); err == nil {
+		t.Error("файл опубликован при несовпавшей сумме — публикация обязана идти после всех проверок")
+	}
+}

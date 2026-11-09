@@ -80,7 +80,9 @@ func TestFullRestorePath(t *testing.T) {
     role: %s
     tls: {cert: %q, key: %q, ca: %q}
     staging_dir: %q
-    buffer_bytes: 16MiB
+    # buffer_bytes — потолок одного архивного юнита: mover отвергает put больше
+    # (no_buffer). Стенд пишет крупные объекты 25 и 26 МиБ, поэтому 64MiB.
+    buffer_bytes: 64MiB
     chunk_size: 64KiB
     inactivity_timeout: 1m
     op_timeout: 5m
@@ -244,13 +246,105 @@ metrics: {listen: %q}
 	}
 	multi := append(append([]byte(nil), part1...), part2...)
 
-	// --- воркер сам доводит оба объекта до archived ---
-	for _, k := range []string{"big.bin", "multi.bin"} {
+	// --- крупный объект на границе порога и multipart больше порога ---
+	//
+	// Порог pack.threshold по умолчанию 25 MiB (в стенде не переопределён —
+	// проверяется значение из договора). Ровно 25 MiB одиночным PUT — уже
+	// крупный («меньше порога — в пачку, остальные — отдельными объектами
+	// Phobos»): на ленту уходит отдельный объект сырым файлом, а не участник
+	// пачки. Multipart 26 MiB (25+1: часть не меньше 5 MiB, последняя любая)
+	// — крупный целиком, хотя частями он меньше порога по отдельности: ветка
+	// выбирается по полному размеру, который известен на Complete.
+	big25 := make([]byte, 25<<20)
+	if _, err := rand.Read(big25); err != nil {
+		t.Fatal(err)
+	}
+	waitOK(t, "PutObject big25", func() error {
+		_, err := cli.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String("s6path"), Key: aws.String("big25.bin"),
+			Body: bytes.NewReader(big25), ContentLength: aws.Int64(int64(len(big25))),
+		})
+		return err
+	})
+
+	mpPart1 := make([]byte, 25<<20)
+	mpPart2 := make([]byte, 1<<20)
+	if _, err := rand.Read(mpPart1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(mpPart2); err != nil {
+		t.Fatal(err)
+	}
+	mp2, err := cli.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String("s6path"), Key: aws.String("bigmp.bin"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload bigmp: %v", err)
+	}
+	var parts2 []types.CompletedPart
+	for i, body := range [][]byte{mpPart1, mpPart2} {
+		num := int32(i + 1)
+		up, err := cli.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket: aws.String("s6path"), Key: aws.String("bigmp.bin"),
+			UploadId: mp2.UploadId, PartNumber: &num,
+			Body: bytes.NewReader(body), ContentLength: aws.Int64(int64(len(body))),
+		})
+		if err != nil {
+			t.Fatalf("UploadPart bigmp %d: %v", num, err)
+		}
+		parts2 = append(parts2, types.CompletedPart{PartNumber: &num, ETag: up.ETag})
+	}
+	if _, err := cli.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String("s6path"), Key: aws.String("bigmp.bin"),
+		UploadId: mp2.UploadId, MultipartUpload: &types.CompletedMultipartUpload{Parts: parts2},
+	}); err != nil {
+		t.Fatalf("CompleteMultipartUpload bigmp: %v", err)
+	}
+	bigmp := append(append([]byte(nil), mpPart1...), mpPart2...)
+
+	// --- воркер сам доводит все объекты до archived ---
+	all := []string{"big.bin", "multi.bin", "big25.bin", "bigmp.bin"}
+	for _, k := range all {
 		waitObjState(t, ctx, pool, k, "archived", 3*time.Minute)
 	}
 
-	// --- вытеснение landing (landing_min_retention=2s, janitor interval=1s) ---
+	// Крупные объекты лежат на ленте каждый своим объектом Phobos: строка
+	// packs с single_object и размещение (0, file_bytes) — не участник чужой
+	// пачки. Мелкие (big.bin, multi.bin) при этом остались в пачке: порог
+	// разводит пути ровно на границе.
+	for _, k := range []string{"big25.bin", "bigmp.bin"} {
+		var single bool
+		var off *int64
+		if err := pool.QueryRow(ctx,
+			`SELECT p.single_object, o.pack_offset
+			   FROM objects o JOIN packs p ON p.id = o.pack_id
+			  WHERE o.key = $1`, k).Scan(&single, &off); err != nil {
+			t.Fatalf("пачка крупного объекта %s: %v", k, err)
+		}
+		if !single {
+			t.Errorf("%s: single_object=false — объект ушёл в пачку, а не отдельным объектом", k)
+		}
+		if off == nil || *off != 0 {
+			t.Errorf("%s: pack_offset=%v, ждали 0 (окно = весь файл)", k, off)
+		}
+	}
+	// Мелкие объекты при этом остались пачкой (single_object=false): порог
+	// разводит пути ровно на границе, а не «всё подряд».
 	for _, k := range []string{"big.bin", "multi.bin"} {
+		var single bool
+		if err := pool.QueryRow(ctx,
+			`SELECT p.single_object
+			   FROM objects o JOIN packs p ON p.id = o.pack_id
+			  WHERE o.key = $1`, k).Scan(&single); err != nil {
+			t.Fatalf("пачка мелкого объекта %s: %v", k, err)
+		}
+		if single {
+			t.Errorf("%s: помечен крупным, а ниже порога — путь пачки сломан", k)
+		}
+	}
+
+	// --- вытеснение landing (landing_min_retention=2s, janitor interval=1s) ---
+	for _, k := range all {
 		var objID uuid.UUID
 		if err := pool.QueryRow(ctx, `SELECT id FROM objects WHERE key = $1`, k).Scan(&objID); err != nil {
 			t.Fatal(err)
@@ -258,7 +352,7 @@ metrics: {listen: %q}
 		waitFileGone(t, filepath.Join(dir, "landing", objID.String()[:2], objID.String()), time.Minute)
 	}
 	// Вытеснены — GET отвечает InvalidObjectState, а не ENOENT и не 500.
-	for _, k := range []string{"big.bin", "multi.bin"} {
+	for _, k := range all {
 		expectS3Code(t, func() error {
 			_, err := cli.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("s6path"), Key: aws.String(k)})
 			return err
@@ -266,7 +360,7 @@ metrics: {listen: %q}
 	}
 
 	// --- RestoreObject: очередь restores, recaller читает пачку в cache ---
-	for _, k := range []string{"big.bin", "multi.bin"} {
+	for _, k := range all {
 		if _, err := cli.RestoreObject(ctx, &s3.RestoreObjectInput{
 			Bucket: aws.String("s6path"), Key: aws.String(k),
 			RestoreRequest: &types.RestoreRequest{
@@ -277,7 +371,7 @@ metrics: {listen: %q}
 			t.Fatalf("RestoreObject %s: %v", k, err)
 		}
 	}
-	for _, k := range []string{"big.bin", "multi.bin"} {
+	for _, k := range all {
 		waitRestoreState(t, ctx, pool, k, "restored", 3*time.Minute)
 	}
 
@@ -294,7 +388,7 @@ metrics: {listen: %q}
 	for _, tc := range []struct {
 		key  string
 		want []byte
-	}{{"big.bin", single}, {"multi.bin", multi}} {
+	}{{"big.bin", single}, {"multi.bin", multi}, {"big25.bin", big25}, {"bigmp.bin", bigmp}} {
 		got := getS3Bytes(t, cli, ctx, tc.key)
 		wantSum := sha256.Sum256(tc.want)
 		gotSum := sha256.Sum256(got)
@@ -312,10 +406,10 @@ metrics: {listen: %q}
 	// отвечает InvalidObjectState».
 	if _, err := pool.Exec(ctx,
 		`UPDATE objects SET online_until = now() - interval '1 second'
-		 WHERE key IN ('big.bin', 'multi.bin')`); err != nil {
+		 WHERE key IN ('big.bin', 'multi.bin', 'big25.bin', 'bigmp.bin')`); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"big.bin", "multi.bin"} {
+	for _, k := range all {
 		waitNoRow(t, ctx, pool,
 			`SELECT count(*) FROM restores r JOIN objects o ON o.id = r.object_id
 			 WHERE o.key = $1`, k, time.Minute)
@@ -325,7 +419,7 @@ metrics: {listen: %q}
 		}
 		waitFileGone(t, filepath.Join(cacheDir, objID.String()[:2], objID.String()), time.Minute)
 	}
-	for _, k := range []string{"big.bin", "multi.bin"} {
+	for _, k := range all {
 		expectS3Code(t, func() error {
 			_, err := cli.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("s6path"), Key: aws.String(k)})
 			return err

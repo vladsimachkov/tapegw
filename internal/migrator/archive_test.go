@@ -62,8 +62,12 @@ type probeMover struct {
 	lastHold   bool
 	lastFromOp uuid.UUID
 	lastTags   []string
-	copyCode   mover.Code // если задан — put с from_op вернёт этот код
-	holds      int        // сколько put приходили с hold
+	// lastAttrs и lastBody — что mover реально получил: для крупного объекта
+	// это проверка «байты сырые, атрибуты семь» (ADR-0020 §1).
+	lastAttrs map[string]string
+	lastBody  []byte
+	copyCode  mover.Code // если задан — put с from_op вернёт этот код
+	holds     int        // сколько put приходили с hold
 
 	// #101: ответы на stat/delete по oid пачки.
 	statCode       mover.Code
@@ -131,6 +135,7 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 		p.holds++
 	}
 	p.lastID, p.lastTags = in.ID, append([]string(nil), in.Tags...)
+	p.lastAttrs = in.Attrs
 	if p.written == nil {
 		p.written = map[uuid.UUID]int{}
 	}
@@ -168,6 +173,7 @@ func (p *probeMover) Put(in mover.PutIn) (*mover.Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	p.lastBody = body
 	sum := sha256.Sum256(body)
 	if hex.EncodeToString(sum[:]) != in.SHA256 || int64(len(body)) != in.Size {
 		p.accept = false

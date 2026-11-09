@@ -38,6 +38,16 @@ const (
 	AttrDEK     = "tapegw.dek"
 	AttrKEK     = "tapegw.kek"
 	AttrFormat  = "tapegw.format"
+	// AttrSeq — version_seq версии. Postgres назначает его при вставке, уже
+	// после записи файла, и время из манифеста этот порядок не воспроизводит
+	// (две параллельные записи одного ключа). Без него rebuild-meta выбрал бы
+	// текущей не ту версию — см. ARCHITECTURE, «Индекс пачки и атрибуты
+	// крупных объектов», и ADR-0020 §1.
+	AttrSeq = "tapegw.seq"
+	// AttrCopy — имя спецификации копии. Копии одного объекта — самостоятельные
+	// объекты Phobos с разными oid, и без имени rebuild-meta не собрал бы,
+	// какая запись какая. Пишется и когда копия одна (ADR-0022).
+	AttrCopy = "tapegw.copy"
 )
 
 // FormatVersion — версия формата файла объекта. Читатель обязан отказать на
@@ -75,6 +85,14 @@ type Version struct {
 	KEK string
 	// Format — версия формата файла объекта.
 	Format int
+	// Seq — version_seq версии: порядок версий одного ключа, который назначает
+	// Postgres и который больше нигде на ленте не воспроизводится. Обязателен:
+	// без него rebuild-meta не отличит текущую версию при параллельных PUT.
+	Seq uint64
+	// Copy — имя спецификации копии (tapegw.copy). При разборе может
+	// отсутствовать: атрибут добавляет записывающая сторона по политике копий,
+	// а не сама версия. Пусто — «имя копии не записано».
+	Copy string
 }
 
 // Attributes — атрибуты Phobos для этой версии: ровно набор ключей
@@ -103,23 +121,32 @@ func Attributes(v Version) (map[string]string, error) {
 		AttrDEK:     base64.StdEncoding.EncodeToString(v.WrappedDEK),
 		AttrKEK:     v.KEK,
 		AttrFormat:  strconv.Itoa(f),
+		AttrSeq:     strconv.FormatUint(v.Seq, 10),
 	}, nil
 }
 
-// AttrAttributes — полный и единственный допустимый набор ключей атрибутов.
+// AttrAttributes — полный и единственный допустимый набор ключей атрибутов
+// версии (ADR-0020 §1: шесть полей). tapegw.copy в списке нет намеренно:
+// его добавляет записывающая сторона по политике копий поверх этого набора,
+// и на ленте у объекта семь атрибутов, но относятся семь только к нему
+// одному, а не к версии.
 //
 // Тест сверяет с ним результат Attributes построчно: лишняя пара «tapegw.key:
 // photos/2027/01/договор-4.pdf» появилась бы здесь как расхождение, а не
 // осталась незамеченной до первой ленты.
 var AttrAttributes = []string{
-	AttrDEK, AttrFormat, AttrKEK, AttrTenant, AttrVersion,
+	AttrDEK, AttrFormat, AttrKEK, AttrSeq, AttrTenant, AttrVersion,
 }
 
 // ParseAttributes — разобрать атрибуты, снятые с объекта Phobos. Обратная к
 // Attributes; нужна rebuild-meta, и написана строго: неизвестный ключ это
-// ошибка, а не «проигнорируем».
+// ошибка, а не «проигнорируем». tapegw.copy принимается дополнительно к
+// AttrAttributes и может отсутствовать — его пишет записывающая сторона.
 func ParseAttributes(attrs map[string]string) (Version, error) {
 	for k := range attrs {
+		if k == AttrCopy {
+			continue
+		}
 		known := false
 		for _, want := range AttrAttributes {
 			if k == want {
@@ -158,9 +185,16 @@ func ParseAttributes(attrs map[string]string) (Version, error) {
 	if len(dek) == 0 {
 		return Version{}, fmt.Errorf("archive: пустая обёртка DEK у версии %s", ver)
 	}
+	// seq обязателен (он в AttrAttributes): версия без порядка версий — это
+	// rebuild, который угадывает текущую версию по времени манифеста.
+	seq, err := strconv.ParseUint(attrs[AttrSeq], 10, 64)
+	if err != nil {
+		return Version{}, fmt.Errorf("archive: атрибут %q: %w", AttrSeq, err)
+	}
 	return Version{
 		Version: ver, Tenant: tenant, WrappedDEK: dek,
-		KEK: attrs[AttrKEK], Format: format,
+		KEK: attrs[AttrKEK], Format: format, Seq: seq,
+		Copy: attrs[AttrCopy], // может отсутствовать — пусто
 	}, nil
 }
 
