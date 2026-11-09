@@ -234,6 +234,13 @@ func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID int64,
 
 	// Object Lock. legal hold не обходит никто и никогда; GOVERNANCE обходится
 	// явным запросом, COMPLIANCE — нет.
+	//
+	// bypassed — «удаление принято с обходом срока». Оно ставится отметкой на
+	// строке (миграция 0026), потому что retain_until при обходе остаётся в
+	// будущем, а удалитель читает именно его: без отметки он считал бы такую
+	// версию заблокированной навсегда и молча держал бы данные на ленте после
+	// успешного ответа клиенту (ADR-0015, M6).
+	bypassed := false
 	locked := legalHold || (retainUntil != nil && retainUntil.After(time.Now()))
 	if locked {
 		bypassable := retentionMode != nil && *retentionMode == "GOVERNANCE" &&
@@ -241,6 +248,7 @@ func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID int64,
 		if !bypassable {
 			return ErrObjectLocked
 		}
+		bypassed = true
 	}
 
 	// Маркер удаления по versionId — стандартный способ вернуть удалённый
@@ -259,9 +267,14 @@ func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID int64,
 		if err := deleteMarkerRow(ctx, tx, verID); err != nil {
 			return fmt.Errorf("delete marker %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
 		}
-	} else if _, err := markDeleting(ctx, tx, ", retired_at = NULL",
-		"id = $1", verID); err != nil {
-		return fmt.Errorf("delete version %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
+	} else {
+		extra := ", retired_at = NULL"
+		if bypassed {
+			extra += ", retention_bypassed_at = now()"
+		}
+		if _, err := markDeleting(ctx, tx, extra, "id = $1", verID); err != nil {
+			return fmt.Errorf("delete version %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
+		}
 	}
 
 	out.IsDeleteMarker = isMarker

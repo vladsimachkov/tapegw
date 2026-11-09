@@ -35,13 +35,27 @@ import (
 // в каком состоянии» здесь важнее удобства. Держать одним фрагментом нужно,
 // потому что проверка стоит в трёх местах (выборка, состояние пачки, переход),
 // и расхождение между ними — это «одна проверка пропустила, другая нет».
+//
+// Одно исключение — уже принятый обход GOVERNANCE (ADR-0015): удаление с
+// заголовком обхода и правом s3:BypassGovernanceRetention переводит строку в
+// 'deleting', не снимая retain_until, и без отметки retention_bypassed_at
+// удалитель считал бы такую версию заблокированной вечно — клиент получил
+// успешный ответ, а данные остались на ленте. Отметку ставит deleteVersion в
+// той же транзакции, что и переход, поэтому решение об обходе здесь не
+// принимается заново: читается уже принятое. legal_hold и COMPLIANCE
+// блокируют по-прежнему — обхода у них нет.
 // alias — префикс таблицы с точкой ("" — без префикса).
 func lockedSQL(alias string) string {
-	if alias == "" {
-		return `legal_hold OR (retain_until IS NOT NULL AND retain_until > now())`
+	p := func(col string) string {
+		if alias == "" {
+			return col
+		}
+		return alias + "." + col
 	}
-	return alias + ".legal_hold OR (" + alias + ".retain_until IS NOT NULL AND " +
-		alias + ".retain_until > now())"
+	return fmt.Sprintf(`%s OR (%s IS NOT NULL AND %s > now()
+	   AND NOT (%s = 'GOVERNANCE' AND %s IS NOT NULL))`,
+		p("legal_hold"), p("retain_until"), p("retain_until"),
+		p("retention_mode"), p("retention_bypassed_at"))
 }
 
 // DeletionCandidate — версия, занятая из очереди 'deleting'.

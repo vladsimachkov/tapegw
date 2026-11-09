@@ -214,6 +214,69 @@ func TestDeleterSkipsRestoreBusy(t *testing.T) {
 	}
 }
 
+// Версия под GOVERNANCE удалена с обходом (ADR-0015): срок на строке остаётся
+// в будущем — его снимают по истечении, а не по факту досрочного удаления, — и
+// без следа обхода удалитель читал бы такой срок как вечную блокировку. Тогда
+// клиент получил успешный ответ, а байты остались на ленте и в landing
+// бессрочно. Здесь проверяется следствие: след разблокирует снятие.
+func TestDeleterRemovesGovernanceBypassed(t *testing.T) {
+	h := newHarness(t)
+	packID, ids, oid := archivedFixture(t, h, "db10", []string{"a"})
+	ctx := context.Background()
+	if _, err := h.m.Pool.Exec(ctx,
+		`UPDATE objects SET retention_mode = 'GOVERNANCE',
+		       retain_until = now() + interval '1 day'
+		  WHERE id = $1`, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.DeleteObject(ctx, meta.NewTenant(1), meta.DeleteObjectInput{
+		Bucket: "db10", Key: "a", VersionID: ids[0].String(), BypassGovernance: true,
+	}); err != nil {
+		t.Fatalf("удаление с обходом GOVERNANCE: %v", err)
+	}
+
+	ctx2, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startDeleter(t, h, ctx2)
+
+	waitFor(t, "версия с обходом ушла в deleted", func() bool { return objectState(t, h.m, ids[0]) == "deleted" })
+	waitFor(t, "пачка retired", func() bool { return packState(t, h.m, packID) == "retired" })
+	if h.env.Store.Has(oid) {
+		t.Error("обход GOVERNANCE не разблокировал снятие пачки с ленты")
+	}
+	if fileExists(h, ids[0]) {
+		t.Error("landing-файл версии с обходом остался на диске")
+	}
+}
+
+// COMPLIANCE обхода не имеет (отказ проверяет meta.TestDeleteVersionUnderLock),
+// а если срок появился уже после того, как версия встала в 'deleting',
+// удалитель обязан её пропустить: след обхода GOVERNANCE на такие строки не
+// ставится и не может их разблокировать.
+func TestDeleterSkipsComplianceInDeleting(t *testing.T) {
+	h := newHarness(t)
+	packID, ids, oid := archivedFixture(t, h, "db11", []string{"a"})
+	deleteVersion(t, h, "db11", "a")
+	if _, err := h.m.Pool.Exec(context.Background(),
+		`UPDATE objects SET retention_mode = 'COMPLIANCE',
+		       retain_until = now() + interval '1 day'
+		  WHERE id = $1`, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startDeleter(t, h, ctx)
+
+	time.Sleep(500 * time.Millisecond)
+	if objectState(t, h.m, ids[0]) != "deleting" {
+		t.Error("версия под COMPLIANCE переведена в deleted — блокировку сняли не тем")
+	}
+	if !h.env.Store.Has(oid) || packState(t, h.m, packID) != "archived" {
+		t.Error("пачка под COMPLIANCE-участником тронута")
+	}
+}
+
 // Пачку держит migrator (активный claim): ленту под его руками не трогаем.
 // Участники при этом обязаны ОСТАТЬСЯ в 'deleting' — если перевести их сейчас,
 // под пачкой не останется строк очереди, и после истечения захвата перевызывать
