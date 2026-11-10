@@ -49,7 +49,9 @@ COMMENT ON COLUMN tenants.journal_seq IS
 -- через tapegw.journal_override здесь не подходит: он сеансовый и пережил бы
 -- коммит миграции, а пережитый обход — это выключенная защита на всём
 -- соединении. Поэтому триггер на время перенумерации снимается и ставится
--- обратно: состояние после Down ровно то, что оставил Up миграции 0027.
+-- обратно. Состояние после Down — то, что оставил Up миграции 0027, и это
+-- касается не только схемы: плотные номера и счётчик на строке тенанта обязаны
+-- сойтись, иначе откат схемы оставит неработающий шлюз.
 DROP TRIGGER journal_events_append_only ON journal_events;
 
 ALTER TABLE journal_events ADD COLUMN journal_seq bigint CHECK (journal_seq > 0);
@@ -64,6 +66,21 @@ UPDATE journal_events AS je
    SET journal_seq = ranked.rn
   FROM ranked
  WHERE je.ctid = ranked.ctid;
+
+-- Счётчик тенанта обязан догнать перенумерованные номера. Пока схема жила на
+-- 0028, путь записи счётчик не трогал, и он отстаёт ровно на число событий,
+-- записанных после Up. Код же до 0028 берёт следующий номер как
+-- `journal_seq + 1` на строке тенанта: с отстающим счётчиком первое же событие
+-- получает номер, который уже занят, и падает по первичному ключу
+-- (tenant_id, journal_seq) — то есть откат схемы уронил бы все журналируемые
+-- операции шлюза, а не только миграцию.
+UPDATE tenants AS t
+   SET journal_seq = s.mx
+  FROM (SELECT tenant_id, max(journal_seq) AS mx
+          FROM journal_events
+         GROUP BY tenant_id) AS s
+ WHERE t.id = s.tenant_id
+   AND t.journal_seq < s.mx;
 
 ALTER TABLE journal_events ALTER COLUMN journal_seq SET NOT NULL;
 ALTER TABLE journal_events DROP CONSTRAINT journal_events_pkey;

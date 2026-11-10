@@ -2,6 +2,7 @@ package meta_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/vladsimachkov/tapegw/internal/meta"
@@ -74,8 +75,9 @@ func appendOnlyTriggers(t *testing.T, ctx context.Context, m *meta.Meta) int {
 
 // seedJournalEvents — данные для проверки Down: два тенанта с разным числом
 // событий. Тенант 777 нужен именно вторым: перенумерация обязана быть плотной
-// **внутри** тенанта, и на одном тенанте это не проверяется вовсе.
-func seedJournalEvents(t *testing.T, ctx context.Context, m *meta.Meta) {
+// **внутри** тенанта, и на одном тенанте это не проверяется вовсе. Возвращает id
+// бакета посева.
+func seedJournalEvents(t *testing.T, ctx context.Context, m *meta.Meta) int64 {
 	t.Helper()
 
 	// mustBucket уже оставил одно событие создания бакета — оно тоже в счёт.
@@ -107,6 +109,7 @@ func seedJournalEvents(t *testing.T, ctx context.Context, m *meta.Meta) {
 			}
 		}
 	}
+	return bucketID
 }
 
 func TestMigration0028JournalServiceId(t *testing.T) {
@@ -159,7 +162,7 @@ func TestMigration0028JournalServiceId(t *testing.T) {
 
 	// --- Данные и Down ---------------------------------------------------
 
-	seedJournalEvents(t, ctx, m)
+	bucketID := seedJournalEvents(t, ctx, m)
 	// События на месте — иначе Down проверялся бы на пустой таблице, где порядок
 	// шагов перенумерации не виден.
 	total := countRow(t, ctx, m, `SELECT count(*) FROM journal_events`)
@@ -227,6 +230,55 @@ func TestMigration0028JournalServiceId(t *testing.T) {
 	if n := countRow(t, ctx, m,
 		`SELECT count(*) FROM journal_events WHERE journal_seq IS NULL OR journal_seq <= 0`); n != 0 {
 		t.Errorf("незаполненных или нулевых номеров после Down: %d", n)
+	}
+	// CHECK «номер положительный» обязан вернуться в каталог, а не только в
+	// пересказ: без него в журнал ложится ноль, а код до 0028 выдаёт номера как
+	// `journal_seq + 1` именно от нуля.
+	if n := countRow(t, ctx, m,
+		`SELECT count(*) FROM pg_constraint c
+		   JOIN pg_class tbl ON tbl.oid = c.conrelid
+		  WHERE tbl.relname = 'journal_events' AND c.contype = 'c'
+		    AND pg_get_constraintdef(c.oid) LIKE '%journal_seq%'
+		    AND tbl.relnamespace = current_schema()::regnamespace`); n != 1 {
+		t.Errorf("CHECK на journal_seq после Down: %d, хотели 1", n)
+	}
+	// Счётчик обязан догнать номера у **всех** тенантов, а не только у того, на
+	// котором ниже что-то попробуют: проверка по данным, а не по одной строке.
+	if bad := countRow(t, ctx, m,
+		`SELECT count(*) FROM tenants t
+		   JOIN (SELECT tenant_id, max(journal_seq) AS mx
+		           FROM journal_events GROUP BY tenant_id) s ON s.tenant_id = t.id
+		  WHERE t.journal_seq <> s.mx`); bad != 0 {
+		t.Errorf("тенантов, у которых tenants.journal_seq <> max(journal_seq): %d — "+
+			"после отката первое же событие получит занятый номер", bad)
+	}
+	// И главное — что после отката работает **старый** путь записи. Пока схема
+	// жила на 0028, счётчик тенанта не писался и отстаёт на число событий;
+	// если Down его не подтянет, первое же событие получит занятый номер и
+	// упадёт по первичному ключу — откат схемы уронил бы все журналируемые
+	// операции шлюза. Прогон в транзакции с откатом, чтобы не добавить строку
+	// в таблицу, которую дальше считают.
+	if err := func() error {
+		tx, err := m.Pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var seq int64
+		if err := tx.QueryRow(ctx,
+			`UPDATE tenants SET journal_seq = journal_seq + 1
+			  WHERE id = 1 RETURNING journal_seq`).Scan(&seq); err != nil {
+			return fmt.Errorf("счётчик после Down: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO journal_events (tenant_id, journal_seq, kind, object_id, bucket_id, payload)
+			 VALUES (1, $1, 'delete_version', gen_random_uuid(), $2, '{}')`,
+			seq, bucketID); err != nil {
+			return fmt.Errorf("событие «старым кодом» после Down (seq=%d): %w", seq, err)
+		}
+		return tx.Rollback(ctx)
+	}(); err != nil {
+		t.Error(err)
 	}
 	if n := countRow(t, ctx, m, `SELECT count(*) FROM journal_events`); n != total {
 		t.Errorf("после Down событий %d, было %d: перенумерация потеряла строки", n, total)
