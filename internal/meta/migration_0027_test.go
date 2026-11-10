@@ -22,6 +22,29 @@ func TestMigration0027JournalEvents(t *testing.T) {
 	m := testdb.MigrationScratch(t, testdb.AllVersions)
 	ctx := context.Background()
 
+	// Данные для проверки Down: Down обязан пройти на заполненной таблице, а не
+	// на пустой схеме. Посев идёт до снятия 0028 и через путь кода: код пишет
+	// событие без номера (так задано миграцией 0028), и на схеме 0027, где
+	// номер обязателен, он не пройдёт — ниже номера расставляются явно.
+	mustBucket(t, m, "j27-bucket")
+	var bucketID int64
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT id FROM buckets WHERE name = 'j27-bucket'`).Scan(&bucketID); err != nil {
+		t.Fatal(err)
+	}
+	// Создание бакета — событие журнала: оно и данные, и заодно проверка, что
+	// путь кода работает на схеме из миграций, а не только на общей.
+	if n := countRow(t, ctx, m, `SELECT count(*) FROM journal_events`); n != 1 {
+		t.Fatalf("после CreateBucket событий %d, хотели 1 — посева нет", n)
+	}
+
+	// 0028 снимается до Down 0027: она убирает `journal_seq` — колонку, на
+	// которой стоит первичный ключ 0027, и без снятия тест проверял бы не схему
+	// 0027. В настоящем `goose down` порядок обратный по номерам.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0028, "Down")); err != nil {
+		t.Fatalf("снять 0028 перед Down 0027: %v", err)
+	}
+
 	// Каталог, а не «миграция вернула ноль»: goose умеет записать версию
 	// применённой, не выполнив шагов.
 	if n := columnIn(t, ctx, m, "journal_events", "journal_seq"); n != 1 {
@@ -87,20 +110,10 @@ func TestMigration0027JournalEvents(t *testing.T) {
 		t.Errorf("триггеров append-only у journal_events: %d, хотели 1", n)
 	}
 
-	// Данные для проверки Down: Down обязан пройти на заполненной таблице, а
-	// не на пустой схеме.
-	mustBucket(t, m, "j27-bucket")
-	var bucketID int64
-	if err := m.Pool.QueryRow(ctx,
-		`SELECT id FROM buckets WHERE name = 'j27-bucket'`).Scan(&bucketID); err != nil {
-		t.Fatal(err)
-	}
-	// mustBucket уже оставил одно событие (создание бакета) и поднял счётчик —
-	// это и данные, и заодно проверка, что путь кода работает на схеме из
-	// миграций, а не только на общей.
-	if n := countRow(t, ctx, m, `SELECT count(*) FROM journal_events`); n != 1 {
-		t.Fatalf("после CreateBucket событий %d, хотели 1 — посева нет", n)
-	}
+	// Ещё одно событие — уже с явным номером: на схеме 0027 номер обязан
+	// называть вызывающий. Счётчик тенанта при этом 0 (путь кода его больше не
+	// пишет), и ниже он поднимается до номера последнего события, как это делал
+	// код до 0028.
 	if _, err := m.Pool.Exec(ctx,
 		`UPDATE tenants SET journal_seq = 2 WHERE id = 1`); err != nil {
 		t.Fatal(err)
@@ -154,6 +167,13 @@ func TestMigration0027JournalEvents(t *testing.T) {
 		`INSERT INTO journal_events (tenant_id, journal_seq, kind, bucket_id, payload)
 		 VALUES (1, 3, 'delete_version', $1, '{}')`, bucketID); err == nil {
 		t.Error("удаление версии без object_id прошло: CHECK не на месте")
+	}
+
+	// Вернуть схему к тому виду, который оставил полный набор миграций. Это не
+	// уборка: Up 0028 поверх только что пересозданной 0027 таблицы — отдельный
+	// случай, которого в линейном `goose up` не бывает.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0028, "Up")); err != nil {
+		t.Fatalf("вернуть 0028 после Up 0027: %v", err)
 	}
 }
 

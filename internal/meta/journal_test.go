@@ -68,11 +68,23 @@ func journalEvents(t *testing.T, m *meta.Meta, tenant int64) []meta.JournalEvent
 	return out
 }
 
-// journalSeq — счётчик на строке тенанта.
-func journalSeq(t *testing.T, m *meta.Meta, tenant int64) int64 {
+// journalCount — число событий тенанта в таблице.
+func journalCount(t *testing.T, m *meta.Meta, tenant int64) int64 {
 	t.Helper()
-	seq, err := m.JournalSeq(context.Background(), tenant)
+	n, err := m.JournalEventCount(context.Background(), tenant)
 	if err != nil {
+		t.Fatalf("число событий тенанта %d: %v", tenant, err)
+	}
+	return n
+}
+
+// tenantJournalSeq — значение tenants.journal_seq. После поправки к ADR-0023
+// путь изменения эту колонку не пишет; тесты проверяют именно это.
+func tenantJournalSeq(t *testing.T, m *meta.Meta, tenant int64) int64 {
+	t.Helper()
+	var seq int64
+	if err := m.Pool.QueryRow(context.Background(),
+		`SELECT journal_seq FROM tenants WHERE id = $1`, tenant).Scan(&seq); err != nil {
 		t.Fatalf("journal_seq тенанта %d: %v", tenant, err)
 	}
 	return seq
@@ -361,7 +373,11 @@ func TestJournalEventIsAtomicWithChange(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			testdb.Clean(t, m)
 			tc.fix(t, m)
-			before := journalSeq(t, m, 1)
+			before := journalCount(t, m, 1)
+			var lastID int64
+			if evs := journalEvents(t, m, 1); len(evs) > 0 {
+				lastID = evs[len(evs)-1].ID
+			}
 
 			// 1. Событие записать нельзя → изменения быть не должно.
 			off := poisonJournal(t, m)
@@ -370,11 +386,8 @@ func TestJournalEventIsAtomicWithChange(t *testing.T) {
 				t.Fatal("изменение прошло с отравленным журналом — событие пишется не в той же транзакции")
 			}
 			off()
-			if got := journalSeq(t, m, 1); got != before {
-				t.Errorf("journal_seq вырос до %d на откатившейся операции: номер должен откатываться", got)
-			}
-			if n := len(journalEvents(t, m, 1)); n != int(before) {
-				t.Errorf("событий %d, ожидалось %d", n, before)
+			if got := journalCount(t, m, 1); got != before {
+				t.Errorf("событий %d после откатившейся операции, ожидалось %d", got, before)
 			}
 			tc.unchanged(t, m)
 
@@ -390,18 +403,26 @@ func TestJournalEventIsAtomicWithChange(t *testing.T) {
 			if last.Kind != tc.kind {
 				t.Errorf("kind = %q, хотели %q", last.Kind, tc.kind)
 			}
-			if last.Seq != before+1 {
-				t.Errorf("journal_seq = %d, хотели %d", last.Seq, before+1)
+			if last.ID <= lastID {
+				t.Errorf("id события %d не больше предыдущего %d: читатель идёт по id, "+
+					"и обратный порядок значил бы, что восстановление применит изменения не в том порядке",
+					last.ID, lastID)
 			}
 		})
 	}
 }
 
-// Номера обязаны быть плотными при параллельных изменениях одного тенанта:
-// именно это позволяет `rebuild-meta` читать пропуск как аварию. Один воркер с
-// другим именем здесь ничего не проверяет — счётчик проверяют несколько
-// участников одновременно.
-func TestJournalSeqIsDenseUnderConcurrency(t *testing.T) {
+// Параллельные изменения одного тенанта обязаны давать уникальные id в порядке
+// выдачи и **не трогать строку тенанта**. Второй пункт — суть поправки к
+// ADR-0023: если путь записи снова начнёт писать tenants.journal_seq, все
+// журналируемые изменения тенанта вернутся к сериализации на одной строке
+// (≈1000 в секунду и очередь за массовой операцией). Тест замера это тоже
+// покажет, но падать начнёт только на медленном диске — здесь же проверка
+// прямая и от диска не зависит.
+//
+// Один «чужой» участник с другим id проверял бы только различие id; гонка
+// живёт между участниками одного тенанта, поэтому их несколько одновременно.
+func TestJournalIdsUnderConcurrency(t *testing.T) {
 	m := testdb.Connect(t)
 	ctx := context.Background()
 	testdb.Clean(t, m)
@@ -409,7 +430,7 @@ func TestJournalSeqIsDenseUnderConcurrency(t *testing.T) {
 
 	const n = 8
 	// mustBucket уже оставил событие — сверяем прирост, а не абсолютное число.
-	before := journalSeq(t, m, 1)
+	before := journalCount(t, m, 1)
 	ids := make([]string, n)
 	for i := range ids {
 		ids[i] = insertVersion(t, m, "j-conc", fmt.Sprintf("k%d", i),
@@ -439,26 +460,173 @@ func TestJournalSeqIsDenseUnderConcurrency(t *testing.T) {
 		t.Fatalf("событий %d, хотели %d", len(events), int(before)+n)
 	}
 	seen := map[int64]bool{}
+	prev := int64(0)
 	for _, e := range events {
-		if seen[e.Seq] {
-			t.Errorf("номер %d выдан дважды", e.Seq)
+		if seen[e.ID] {
+			t.Errorf("id %d выдан дважды", e.ID)
 		}
-		seen[e.Seq] = true
+		seen[e.ID] = true
+		if e.ID <= prev {
+			t.Errorf("читатель вернул id %d после %d: порядок выдачи сломан", e.ID, prev)
+		}
+		prev = e.ID
 	}
-	// Плотность проверяем по всему диапазону: пропуск мог остаться и до нас.
-	for i := int64(1); i <= int64(len(events)); i++ {
-		if !seen[i] {
-			t.Errorf("номера %d нет — пропуск в нумерации", i)
+	if seq := tenantJournalSeq(t, m, 1); seq != 0 {
+		t.Errorf("tenants.journal_seq = %d после %d изменений: путь записи не обязан трогать "+
+			"строку тенанта — на ней сериализуются все журналируемые изменения тенанта "+
+			"(ADR-0023, поправка)", seq, n)
+	}
+}
+
+// Читатель журнала обязан выдавать события по id, а не по времени, и листать их
+// без повторов и пропусков. Это контракт `rebuild-meta`: он листает журнал
+// порциями (лимит здесь не украшение: за годы накапливаются миллионы событий) и
+// применяет их строго по порядку выдачи. Тест фиксирует сразу три вещи, которые
+// иначе обнаружились бы только на восстановлении после аварии:
+//
+//   - порядок по id, а не по `created_at`: время на разных соединениях расходится,
+//     и здесь у заведомо «более раннего» события id больше;
+//   - страница начинается строго **после** afterID: `>=` дало бы повтор каждой
+//     границы и применение одного события дважды;
+//   - события чужого тенанта в страницу не попадают.
+func TestJournalEventsAfterPagesByIdNotByTime(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+	mustBucket(t, m, "j-page")
+	var bucketID int64
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT id FROM buckets WHERE name = 'j-page'`).Scan(&bucketID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Два события с перевёрнутым временем: у второго id больше, а время раньше.
+	// Сортировка по времени поставила бы их наоборот.
+	var pair [2]int64
+	for i, at := range []string{"now() + interval '2 hour'", "now() - interval '2 hour'"} {
+		if err := m.Pool.QueryRow(ctx,
+			`INSERT INTO journal_events (tenant_id, kind, object_id, bucket_id, payload, created_at)
+			 VALUES (1, 'delete_version', gen_random_uuid(), $1, '{"key":"k"}', `+at+`)
+			 RETURNING id`, bucketID).Scan(&pair[i]); err != nil {
+			t.Fatalf("событие с %s: %v", at, err)
 		}
 	}
-	if seq := journalSeq(t, m, 1); seq != int64(len(events)) {
-		t.Errorf("journal_seq = %d, хотели %d: счётчик обязан совпадать с последним событием",
-			seq, len(events))
+	// Чужой тенант с событием: читатель обязан фильтровать по нему, а не
+	// выбирать всё подряд и радоваться порядку.
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO tenants (id, name, status, pool_id)
+		 VALUES (777, 'чужой тенант журнала', 'active', 1)
+		 ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("чужой тенант: %v", err)
+	}
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO journal_events (tenant_id, kind, object_id, bucket_id, payload)
+		 VALUES (777, 'delete_version', gen_random_uuid(), $1, '{"key":"k"}')`, bucketID); err != nil {
+		t.Fatalf("событие чужого тенанта: %v", err)
+	}
+
+	// Эталон — прямой запрос к таблице, а не тот же читатель: сверять читателя
+	// с ним же самим значит не проверять ничего. Мутация «фильтр по тенанту
+	// слабее» прошла бы зелёной, если бы ожидаемый список строил тот же код.
+	var want []int64
+	rows, err := m.Pool.Query(ctx,
+		`SELECT id FROM journal_events WHERE tenant_id = 1 ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		want = append(want, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(want) < 3 {
+		t.Fatalf("событий %d, хотели хотя бы 3 — посева нет", len(want))
+	}
+	// Время перевёрнуто относительно id — иначе тест проверяет порядок, которого
+	// и так никто не ломал. И тоже запросом к таблице: иначе мутация
+	// «сортировка по времени» ловилась бы сообщением про посев, а не про порядок.
+	var reversed bool
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT x.created_at > y.created_at
+		   FROM journal_events x, journal_events y
+		  WHERE x.id = $1 AND y.id = $2`, pair[0], pair[1]).Scan(&reversed); err != nil {
+		t.Fatal(err)
+	}
+	if !reversed {
+		t.Fatalf("посев не перевёрнут по времени: у id %d время не позже, чем у id %d",
+			pair[0], pair[1])
+	}
+
+	// Листание по две записи: ровно те же события, в том же порядке, без
+	// повторов и пропусков. Число страниц ограничено сверху сознательно: если
+	// граница включается в страницу (`>=` вместо `>`), последняя страница
+	// никогда не станет пустой, и неограниченный цикл висел бы до таймаута
+	// `go test` — красный, который ничего не объясняет.
+	var got []int64
+	for after, pages := int64(0), 0; ; pages++ {
+		if pages > len(want)+1 {
+			t.Fatalf("листание не закончилось: %d страниц при %d событий — граница "+
+				"входит в страницу повторно, и пустой страницы не будет никогда",
+				pages, len(want))
+		}
+		page, err := m.JournalEventsAfter(ctx, 1, after, 2)
+		if err != nil {
+			t.Fatalf("страница после %d: %v", after, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		if len(page) > 2 {
+			t.Fatalf("страница после %d вернула %d событий при лимите 2", after, len(page))
+		}
+		prev := after
+		for _, e := range page {
+			if e.ID <= prev {
+				t.Errorf("страница после %d вернула id %d после id %d: порядок внутри "+
+					"страницы не по порядку выдачи", after, e.ID, prev)
+			}
+			prev = e.ID
+			got = append(got, e.ID)
+		}
+		after = page[len(page)-1].ID
+	}
+	pos := map[int64]int{}
+	for i, id := range got {
+		pos[id] = i
+	}
+	// Порядок пары задаёт id, а не created_at: у id поменьше время позже.
+	if i, ok := pos[pair[0]]; ok {
+		if j, ok := pos[pair[1]]; ok && i >= j {
+			t.Errorf("событие id %d оказалось после id %d (позиции %d и %d): читатель "+
+				"сортирует не по порядку выдачи — восстановление применило бы "+
+				"изменения одного объекта не в том порядке",
+				pair[0], pair[1], i, j)
+		}
+	}
+	// Errorf, а не Fatalf: если листание врёт, полезно увидеть и это, и
+	// расхождение порядка ниже, а не получать первую строку и гадать.
+	if len(got) != len(want) {
+		t.Errorf("листом получено %d событий, в таблице %d: листание повторяет границу "+
+			"или тянет события чужого тенанта", len(got), len(want))
+	} else {
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("на позиции %d id %d, хотели %d: листание идёт не по порядку выдачи",
+					i, got[i], want[i])
+			}
+		}
 	}
 }
 
 // Смешанные изменения одного тенанта не должны ловить взаимоблокировку:
-// порядок блокировок (сначала бакет и версии, строка тенанта последней) —
+// порядок блокировок (advisory-лок ключа, затем бакет и строки versions) —
 // договорённость, а не случайность. Проверка закрытая: любая ошибка здесь —
 // провал, «похоже на гонку» не принимается.
 func TestJournalMixedWritesDoNotDeadlock(t *testing.T) {
@@ -468,7 +636,7 @@ func TestJournalMixedWritesDoNotDeadlock(t *testing.T) {
 	mustLockBucket(t, m, "j-mix")
 
 	const keys = 6
-	before := journalSeq(t, m, 1)
+	before := journalCount(t, m, 1)
 	ids := make([]string, keys)
 	for i := range ids {
 		ids[i] = insertVersion(t, m, "j-mix", fmt.Sprintf("k%d", i), versionOpts{current: true})
@@ -518,12 +686,13 @@ func TestJournalMixedWritesDoNotDeadlock(t *testing.T) {
 	}
 	seen := map[int64]bool{}
 	for _, e := range events {
-		seen[e.Seq] = true
-	}
-	for i := int64(1); i <= int64(len(events)); i++ {
-		if !seen[i] {
-			t.Errorf("пропуск в нумерации на %d", i)
+		if seen[e.ID] {
+			t.Errorf("id %d выдан дважды", e.ID)
 		}
+		seen[e.ID] = true
+	}
+	if seq := tenantJournalSeq(t, m, 1); seq != 0 {
+		t.Errorf("tenants.journal_seq = %d, хотели 0: строка тенанта в пути записи не участвует", seq)
 	}
 }
 
@@ -561,11 +730,11 @@ func TestJournalEventBelongsToRowTenant(t *testing.T) {
 	}
 	for _, e := range events {
 		if e.TenantID != 2 {
-			t.Errorf("событие %d лежит в тенанте %d", e.Seq, e.TenantID)
+			t.Errorf("событие %d лежит в тенанте %d", e.ID, e.TenantID)
 		}
 	}
-	if seq := journalSeq(t, m, 1); seq != 0 {
-		t.Errorf("у системного тенанта journal_seq = %d, хотели 0", seq)
+	if n := journalCount(t, m, 1); n != 0 {
+		t.Errorf("у системного тенанта %d событий, хотели 0", n)
 	}
 }
 
@@ -697,9 +866,16 @@ func TestJournalIsAppendOnly(t *testing.T) {
 	}
 }
 
-// Счётчик не тратит номера на откатившиеся операции — в этом весь смысл
-// счётчика на строке вместо sequence Postgres.
-func TestJournalSeqSurvivesRollback(t *testing.T) {
+// Откатившаяся транзакция не оставляет события, но служебный id уже истрачен:
+// дырка в нумерации — норма, а не потеря. Проверено на самой схеме: sequence
+// тратит значение даже когда вставку отклонил BEFORE INSERT триггер, так что
+// разрыв здесь — ожидаемое поведение, а не случайность реализации.
+//
+// Тест нужен в обратную сторону: он запрещает требовать смежности id. Плотность
+// даёт диапазон запечатанного сегмента, а не таблица событий (ADR-0023,
+// поправка), и проверка «пропусков в id» однажды посчитала бы потерянным
+// событием безобидный откат.
+func TestJournalRollbackLeavesNoEvent(t *testing.T) {
 	m := testdb.Connect(t)
 	ctx := context.Background()
 	testdb.Clean(t, m)
@@ -709,6 +885,13 @@ func TestJournalSeqSurvivesRollback(t *testing.T) {
 		insertVersion(t, m, "j-rb", "b", versionOpts{current: true}),
 	}
 
+	events := journalEvents(t, m, 1)
+	before := int64(len(events))
+	var lastID int64
+	if before > 0 {
+		lastID = events[before-1].ID
+	}
+
 	off := poisonJournal(t, m)
 	if err := m.PutObjectRetention(ctx, testTenant, "j-rb", "a", ids[0],
 		"GOVERNANCE", time.Now().Add(time.Hour)); err == nil {
@@ -716,26 +899,22 @@ func TestJournalSeqSurvivesRollback(t *testing.T) {
 	}
 	off()
 
+	if n := journalCount(t, m, 1); n != before {
+		t.Fatalf("после отката событий %d, было %d: откатившаяся транзакция оставила событие",
+			n, before)
+	}
+
 	if err := m.PutObjectRetention(ctx, testTenant, "j-rb", "b", ids[1],
 		"GOVERNANCE", time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("второе изменение: %v", err)
 	}
-	events := journalEvents(t, m, 1)
-	// mustBucket тоже оставил событие — важно, что после отката номер не
-	// пропущен, а продолжен.
-	if len(events) == 0 {
-		t.Fatal("событий нет")
+	events = journalEvents(t, m, 1)
+	if int64(len(events)) != before+1 {
+		t.Fatalf("событий %d, хотели %d", len(events), before+1)
 	}
-	max := events[len(events)-1].Seq
-	for i := int64(1); i <= max; i++ {
-		var n int
-		if err := m.Pool.QueryRow(ctx,
-			`SELECT count(*) FROM journal_events WHERE tenant_id = 1 AND journal_seq = $1`, i).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		if n != 1 {
-			t.Errorf("на номере %d событий %d — пропуск после откатившейся операции", i, n)
-		}
+	if gap := events[len(events)-1].ID - lastID; gap < 2 {
+		t.Errorf("разрыв id после отката = %d: откатившаяся транзакция не истратила "+
+			"номер, и проверка полноты больше не отличит дырку от пропуска", gap)
 	}
 }
 

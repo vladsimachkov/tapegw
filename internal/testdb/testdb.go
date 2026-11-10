@@ -269,9 +269,11 @@ func IsSeedTable(name string) bool {
 
 var SeedTables = []SeedTable{
 	{"tenant_usage", "tenant_id", ""},
-	// journal_seq в Reset обязателен: счётчик живёт на строке тенанта, и без
-	// сброса второй тест в пакете получал бы номера «в продолжение» первого —
-	// ровно та форма, в которой tenants.wrapped_key уже кусался дважды.
+	// journal_seq в Reset остаётся «на вырост»: путь изменения его больше не
+	// пишет (ADR-0023, поправка), но пишет воркер сегментов, и как только он
+	// появится, тест, запечатавший сегмент, оставил бы номер «в продолжение»
+	// предыдущего — ровно та форма, в которой tenants.wrapped_key уже кусался
+	// дважды.
 	{"tenants", "id",
 		"wrapped_key = NULL, kek_version = 1, key_destroyed_at = NULL, journal_seq = 0"},
 	{"pools", "id", ""},
