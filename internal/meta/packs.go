@@ -33,12 +33,23 @@ import (
 // extraSet — дополнительные присвоения для путей, которым нужно попутно снять
 // признак null-версии; пустая строка — обычный случай.
 func markDeleting(ctx context.Context, tx pgx.Tx, extraSet, where string, args ...any) (int64, error) {
+	ids, err := markDeletingIDs(ctx, tx, extraSet, where, args...)
+	return int64(len(ids)), err
+}
+
+// markDeletingIDs — тот же переход, но возвращает id переведённых версий.
+//
+// Нужен журналу: событие удаления обязано назвать версию, а отдельный SELECT
+// «какие строки только что ушли в deleting» был бы вторым взглядом на уже
+// изменённые данные — при гонке он вернул бы чужие строки. CTE отдаёт ровно
+// то, что перевело ЭТО обращение.
+func markDeletingIDs(ctx context.Context, tx pgx.Tx, extraSet, where string, args ...any) ([]uuid.UUID, error) {
 	q := fmt.Sprintf(`
 		WITH gone AS (
 			UPDATE objects
 			   SET is_current = false, state = 'deleting'%s
 			 WHERE %s
-			RETURNING pack_id, pack_length
+			RETURNING id, pack_id, pack_length
 		),
 		drained AS (
 			UPDATE packs p
@@ -53,13 +64,26 @@ func markDeleting(ctx context.Context, tx pgx.Tx, extraSet, where string, args .
 			 WHERE p.id = s.pack_id
 			RETURNING 1
 		)
-		SELECT count(*) FROM gone`, extraSet, where)
+		SELECT id FROM gone`, extraSet, where)
 
-	var n int64
-	if err := tx.QueryRow(ctx, q, args...).Scan(&n); err != nil {
-		return 0, fmt.Errorf("mark deleting: %w", err)
+	rows, err := tx.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("mark deleting: %w", err)
 	}
-	return n, nil
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("mark deleting: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mark deleting: %w", err)
+	}
+	return ids, nil
 }
 
 // deleteMarkerRow физически убирает строку маркера удаления.

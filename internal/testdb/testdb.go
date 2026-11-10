@@ -216,6 +216,11 @@ var CleanTables = []string{
 	// единственный способ их почистить: триггер «только на добавление» на
 	// TRUNCATE не срабатывает, а на DELETE отказывает без override.
 	"media_events", "drive_events", "archive_copies", "media", "drives",
+	// Журнал метаданных: события чистятся вместе с тенантом (FK CASCADE), но
+	// в списке обязаны быть — иначе тест, написавший событие, оставил бы его
+	// следующему прогону, а нумерация на tenants.journal_seq при этом
+	// сбрасывается.
+	"journal_events",
 }
 
 // SeedID — id строк, которые в таблицы сида кладут миграции: системный
@@ -264,7 +269,11 @@ func IsSeedTable(name string) bool {
 
 var SeedTables = []SeedTable{
 	{"tenant_usage", "tenant_id", ""},
-	{"tenants", "id", "wrapped_key = NULL, kek_version = 1, key_destroyed_at = NULL"},
+	// journal_seq в Reset обязателен: счётчик живёт на строке тенанта, и без
+	// сброса второй тест в пакете получал бы номера «в продолжение» первого —
+	// ровно та форма, в которой tenants.wrapped_key уже кусался дважды.
+	{"tenants", "id",
+		"wrapped_key = NULL, kek_version = 1, key_destroyed_at = NULL, journal_seq = 0"},
 	{"pools", "id", ""},
 }
 

@@ -67,13 +67,13 @@ func (m *Meta) DeleteObject(ctx context.Context, tenant TenantID, in DeleteObjec
 			return fmt.Errorf("advisory lock %s/%s: %w", in.Bucket, in.Key, err)
 		}
 
-		var bucketID int64
+		var bucketID, tenantID int64
 		var versioning string
 		bucketQ, bucketArgs := withTenant(
-			`SELECT id, versioning FROM buckets
+			`SELECT id, versioning, tenant_id FROM buckets
 			  WHERE name = $1 AND deleted_at IS NULL`, tenant, in.Bucket)
 		err := tx.QueryRow(ctx, bucketQ+` FOR SHARE`, bucketArgs...).
-			Scan(&bucketID, &versioning)
+			Scan(&bucketID, &versioning, &tenantID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -82,9 +82,9 @@ func (m *Meta) DeleteObject(ctx context.Context, tenant TenantID, in DeleteObjec
 		}
 
 		if in.VersionID == "" {
-			return m.deleteCurrent(ctx, tx, bucketID, in, versioning, out)
+			return m.deleteCurrent(ctx, tx, bucketID, tenantID, in, versioning, out)
 		}
-		return m.deleteVersion(ctx, tx, bucketID, in, out)
+		return m.deleteVersion(ctx, tx, bucketID, tenantID, in, out)
 	})
 	if err != nil {
 		return nil, err
@@ -93,8 +93,14 @@ func (m *Meta) DeleteObject(ctx context.Context, tenant TenantID, in DeleteObjec
 }
 
 // deleteCurrent — удаление без versionId.
-func (m *Meta) deleteCurrent(ctx context.Context, tx pgx.Tx, bucketID int64,
+func (m *Meta) deleteCurrent(ctx context.Context, tx pgx.Tx, bucketID, tenantID int64,
 	in DeleteObjectInput, versioning string, out *DeleteObjectResult) error {
+
+	// deleteVersionEvent — событие «эта версия ушла в deleting».
+	deleteVersionEvent := func(id uuid.UUID, bypass bool) error {
+		return appendEvent(ctx, tx, tenantID, JournalKindDeleteVersion, uuidPtr(id), bucketID,
+			JournalDeleteVersion{Bucket: in.Bucket, Key: in.Key, Bypass: bypass})
+	}
 
 	switch versioning {
 	case VersioningUnversioned:
@@ -103,13 +109,18 @@ func (m *Meta) deleteCurrent(ctx context.Context, tx pgx.Tx, bucketID int64,
 		//
 		// markDeleting, а не голый UPDATE: если версия лежит в пачке, её байты
 		// снимаются с живого остатка пачки этим же запросом.
-		n, err := markDeleting(ctx, tx, "",
+		ids, err := markDeletingIDs(ctx, tx, "",
 			"bucket_id = $1 AND key = $2 AND is_current", bucketID, in.Key)
 		if err != nil {
 			return fmt.Errorf("delete object %s/%s: %w", in.Bucket, in.Key, err)
 		}
-		if n == 0 {
+		if len(ids) == 0 {
 			return ErrNotFound
+		}
+		for _, id := range ids {
+			if err := deleteVersionEvent(id, false); err != nil {
+				return err
+			}
 		}
 		out.VersionID = "null"
 		return nil
@@ -125,11 +136,17 @@ func (m *Meta) deleteCurrent(ctx context.Context, tx pgx.Tx, bucketID int64,
 			bucketID, in.Key); err != nil {
 			return fmt.Errorf("retire current version of %s/%s: %w", in.Bucket, in.Key, err)
 		}
-		if _, err := markDeleting(ctx, tx, ", is_null_version = false",
-			"bucket_id = $1 AND key = $2 AND is_null_version", bucketID, in.Key); err != nil {
+		ids, err := markDeletingIDs(ctx, tx, ", is_null_version = false",
+			"bucket_id = $1 AND key = $2 AND is_null_version", bucketID, in.Key)
+		if err != nil {
 			return fmt.Errorf("replace null version of %s/%s: %w", in.Bucket, in.Key, err)
 		}
-		id, err := insertDeleteMarker(ctx, tx, bucketID, in, true)
+		for _, id := range ids {
+			if err := deleteVersionEvent(id, false); err != nil {
+				return err
+			}
+		}
+		id, err := insertDeleteMarker(ctx, tx, bucketID, tenantID, in, true)
 		if err != nil {
 			return err
 		}
@@ -144,7 +161,7 @@ func (m *Meta) deleteCurrent(ctx context.Context, tx pgx.Tx, bucketID int64,
 			  WHERE bucket_id = $1 AND key = $2 AND is_current`, bucketID, in.Key); err != nil {
 			return fmt.Errorf("retire current version of %s/%s: %w", in.Bucket, in.Key, err)
 		}
-		id, err := insertDeleteMarker(ctx, tx, bucketID, in, false)
+		id, err := insertDeleteMarker(ctx, tx, bucketID, tenantID, in, false)
 		if err != nil {
 			return err
 		}
@@ -163,7 +180,7 @@ func (m *Meta) deleteCurrent(ctx context.Context, tx pgx.Tx, bucketID int64,
 // meta.terminal_retention, и маркеры исчезли бы вместе с защитой от
 // «воскрешения». В 'deleting' маркеру делать нечего — deleter искал бы то,
 // чего не существует.
-func insertDeleteMarker(ctx context.Context, tx pgx.Tx, bucketID int64,
+func insertDeleteMarker(ctx context.Context, tx pgx.Tx, bucketID, tenantID int64,
 	in DeleteObjectInput, nullVersion bool) (string, error) {
 
 	id := uuid.New()
@@ -182,11 +199,18 @@ func insertDeleteMarker(ctx context.Context, tx pgx.Tx, bucketID int64,
 	if err != nil {
 		return "", fmt.Errorf("insert delete marker %s/%s: %w", in.Bucket, in.Key, err)
 	}
+	// Маркер — единственная запись, которая говорит «этого ключа больше нет»:
+	// на ленту он не едет, и без события восстановленный ключ выглядел бы
+	// живым.
+	if err := appendEvent(ctx, tx, tenantID, JournalKindDeleteMarker, uuidPtr(id), bucketID,
+		JournalDeleteMarker{Bucket: in.Bucket, Key: in.Key, NullVersion: nullVersion}); err != nil {
+		return "", err
+	}
 	return id.String(), nil
 }
 
 // deleteVersion — удаление конкретной версии.
-func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID int64,
+func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID, tenantID int64,
 	in DeleteObjectInput, out *DeleteObjectResult) error {
 
 	var (
@@ -267,6 +291,14 @@ func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID int64,
 		if err := deleteMarkerRow(ctx, tx, verID); err != nil {
 			return fmt.Errorf("delete marker %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
 		}
+		// Убранный маркер — событие не менее важное, чем созданный: без него
+		// применение журнала оставило бы фантомный маркер там, где клиент уже
+		// вернул объект.
+		if err := appendEvent(ctx, tx, tenantID, JournalKindDeleteMarker, uuidPtr(verID), bucketID,
+			JournalDeleteMarker{Bucket: in.Bucket, Key: in.Key,
+				NullVersion: isNull, Removed: true}); err != nil {
+			return err
+		}
 	} else {
 		extra := ", retired_at = NULL"
 		if bypassed {
@@ -274,6 +306,13 @@ func (m *Meta) deleteVersion(ctx context.Context, tx pgx.Tx, bucketID int64,
 		}
 		if _, err := markDeleting(ctx, tx, extra, "id = $1", verID); err != nil {
 			return fmt.Errorf("delete version %s/%s@%s: %w", in.Bucket, in.Key, in.VersionID, err)
+		}
+		// Отметка обхода в событии обязательна: на ленте это единственное
+		// место, где видно, что удаление было досрочным, — retention_bypassed_at
+		// до восстановления не доживёт.
+		if err := appendEvent(ctx, tx, tenantID, JournalKindDeleteVersion, uuidPtr(verID), bucketID,
+			JournalDeleteVersion{Bucket: in.Bucket, Key: in.Key, Bypass: bypassed}); err != nil {
+			return err
 		}
 	}
 

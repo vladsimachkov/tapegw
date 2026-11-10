@@ -78,32 +78,49 @@ func (m *Meta) insertBucket(ctx context.Context, tenant TenantID, name, owner st
 	if err != nil {
 		return false, err
 	}
-	tag, err := m.Pool.Exec(ctx,
-		`INSERT INTO buckets (name, owner, acl, tags, tenant_id)
-		 VALUES ($1, $2, $3, $4, $5)
-		 ON CONFLICT (name) WHERE deleted_at IS NULL DO NOTHING`,
-		name, owner, acl, tagsRaw, tenantArg)
+	// Вставка и событие — одна транзакция. До этого бакет создавался одним
+	// Pool.Exec, и «создать бакет» было операцией без события журнала:
+	// восстановленный после аварии тенант терял сам факт существования бакета,
+	// а не только его настройки.
+	err = m.inTx(ctx, func(tx pgx.Tx) error {
+		var id, tenantID int64
+		err := tx.QueryRow(ctx,
+			`INSERT INTO buckets (name, owner, acl, tags, tenant_id)
+			 VALUES ($1, $2, $3, $4, $5)
+			 ON CONFLICT (name) WHERE deleted_at IS NULL DO NOTHING
+			 RETURNING id, tenant_id`,
+			name, owner, acl, tagsRaw, tenantArg).Scan(&id, &tenantID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Конфликт по buckets_name_active: бакет уже есть.
+			//
+			// ON CONFLICT DO NOTHING без RETURNING не различает «было» и
+			// «вставилось», поэтому признак — отсутствие строки, возвращённой
+			// RETURNING.
+			var got string
+			e := tx.QueryRow(ctx,
+				`SELECT owner FROM buckets WHERE name = $1 AND deleted_at IS NULL`, name).Scan(&got)
+			if errors.Is(e, pgx.ErrNoRows) {
+				// Бакет успели удалить между INSERT и SELECT.
+				return ErrNotFound
+			}
+			if e != nil {
+				return fmt.Errorf("lookup bucket %q: %w", name, e)
+			}
+			if got != owner {
+				return ErrBucketOwnedByOther
+			}
+			existing = true
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("insert bucket %q: %w", name, err)
+		}
+		return appendBucketConfig(ctx, tx, id)
+	})
 	if err != nil {
-		return false, fmt.Errorf("insert bucket %q: %w", name, err)
+		return false, err
 	}
-	if tag.RowsAffected() > 0 {
-		return false, nil
-	}
-
-	var got string
-	err = m.Pool.QueryRow(ctx,
-		`SELECT owner FROM buckets WHERE name = $1 AND deleted_at IS NULL`, name).Scan(&got)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Бакет успели удалить между INSERT и SELECT.
-		return false, ErrNotFound
-	}
-	if err != nil {
-		return false, fmt.Errorf("lookup bucket %q: %w", name, err)
-	}
-	if got != owner {
-		return false, ErrBucketOwnedByOther
-	}
-	return true, nil
+	return existing, nil
 }
 
 // ErrBucketOwnedByOther — активный бакет с таким именем принадлежит другому
@@ -271,7 +288,9 @@ func (m *Meta) DeleteBucket(ctx context.Context, tenant TenantID, name string) e
 			`UPDATE buckets SET deleted_at = now() WHERE id = $1`, id); err != nil {
 			return fmt.Errorf("delete bucket %q: %w", name, err)
 		}
-		return nil
+		// Снимок с deleted = true: без него восстановление вернуло бы бакет,
+		// который клиент уже удалил.
+		return appendBucketConfig(ctx, tx, id)
 	})
 }
 
@@ -279,20 +298,36 @@ func (m *Meta) DeleteBucket(ctx context.Context, tenant TenantID, name string) e
 var ErrBucketNotEmpty = errors.New("meta: bucket not empty")
 
 // SetBucketACL обновляет ACL активного бакета тенанта.
+//
+// Одна транзакция с событием журнала: ACL решает, кто владелец и кому что
+// разрешено, и потерять его при восстановлении — значит вернуть бакет с чужими
+// правами.
 func (m *Meta) SetBucketACL(ctx context.Context, tenant TenantID, name string, acl []byte) error {
-	q, args := withTenant(
-		`UPDATE buckets SET acl = $2 WHERE name = $1 AND deleted_at IS NULL`, tenant, name, acl)
-	tag, err := m.Pool.Exec(ctx, q, args...)
-	if err != nil {
-		return fmt.Errorf("set acl %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return m.inTx(ctx, func(tx pgx.Tx) error {
+		var id int64
+		q, args := withTenant(
+			`SELECT id FROM buckets WHERE name = $1 AND deleted_at IS NULL`, tenant, name)
+		err := tx.QueryRow(ctx, q+` FOR UPDATE`, args...).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock bucket %q: %w", name, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE buckets SET acl = $2 WHERE id = $1`, id, acl); err != nil {
+			return fmt.Errorf("set acl %q: %w", name, err)
+		}
+		return appendBucketConfig(ctx, tx, id)
+	})
 }
 
 // SetBucketTags заменяет теги активного бакета тенанта. nil удаляет их полностью.
+//
+// События журнала здесь нет намеренно: теги не влияют ни на сохранность данных,
+// ни на доступ, и в снимок конфигурации бакета не входят (ADR-0023 п. 5).
+// Их потеря при восстановлении — косметика, а заводить из-за них отдельный вид
+// события и плодить снимки на каждое изменение значит размывать смысл журнала.
 func (m *Meta) SetBucketTags(ctx context.Context, tenant TenantID, name string, tags map[string]string) error {
 	var raw []byte
 	if tags != nil {

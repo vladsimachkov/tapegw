@@ -115,13 +115,15 @@ func (m *Meta) SetBucketVersioning(ctx context.Context, tenant TenantID, bucket,
 			}
 		}
 		if cur == status {
+			// Ничего не изменилось — события нет: журнал описывает изменения,
+			// а не каждый успешный запрос.
 			return nil
 		}
 		if _, err := tx.Exec(ctx,
 			`UPDATE buckets SET versioning = $2 WHERE id = $1`, id, status); err != nil {
 			return fmt.Errorf("set versioning of %q: %w", bucket, err)
 		}
-		return nil
+		return appendBucketConfig(ctx, tx, id)
 	})
 }
 
@@ -166,7 +168,11 @@ func (m *Meta) SetObjectLockConfig(ctx context.Context, tenant TenantID,
 			id, string(config)); err != nil {
 			return fmt.Errorf("set lock config of %q: %w", bucket, err)
 		}
-		return nil
+		// Правило retention по умолчанию живёт здесь же, в lock_config, —
+		// колонка buckets.default_retention кодом не используется. Значит без
+		// этого снимка бакет после восстановления потерял бы и лок, и срок,
+		// который должен применяться к новым объектам.
+		return appendBucketConfig(ctx, tx, id)
 	})
 }
 
