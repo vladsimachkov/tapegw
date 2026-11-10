@@ -89,7 +89,8 @@ func TestMigration0019CopySha256(t *testing.T) {
 	// порядке и возвращаем в прямом, иначе колонка исчезнет вместе с таблицей
 	// и не вернётся. 0020 первым: представление media_write_targets зависит от
 	// media, и без его снятия Down 0018 падает на «other objects depend on it».
-	for _, mig := range []string{migration0020, migration0019, migration0018} {
+	// 0027 — до 0018 по той же причине: его триггер висит на функции из 0018.
+	for _, mig := range []string{migration0027, migration0020, migration0019, migration0018} {
 		if _, err := m.Pool.Exec(ctx, section(t, mig, "Down")); err != nil {
 			t.Fatalf("Down %s: %v", mig, err)
 		}
@@ -97,7 +98,7 @@ func TestMigration0019CopySha256(t *testing.T) {
 	if n := columnIn(t, ctx, m, "archive_copies", "sha256"); n != 0 {
 		t.Errorf("после Down колонка sha256 осталась")
 	}
-	for _, mig := range []string{migration0018, migration0019, migration0020} {
+	for _, mig := range []string{migration0018, migration0019, migration0020, migration0027} {
 		if _, err := m.Pool.Exec(ctx, section(t, mig, "Up")); err != nil {
 			t.Fatalf("Up %s: %v", mig, err)
 		}

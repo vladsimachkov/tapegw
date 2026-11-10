@@ -317,14 +317,24 @@ func (m *Meta) PutObject(ctx context.Context, tenant TenantID, in PutObjectInput
 			// 2. Null-версия заменяется — та, что сейчас текущая, и та, что
 			//    перестала быть текущей раньше. Если не снять флаг здесь, новый
 			//    INSERT с is_null_version = true упрётся в objects_null_version.
-			if _, err := tx.Exec(ctx,
-				`UPDATE objects
-				    SET is_current = false,
-				        state = 'deleting',
-				        is_null_version = false
-				  WHERE bucket_id = $1 AND key = $2 AND is_null_version`,
-				bucketID, in.Key); err != nil {
+			//
+			//    markDeletingIDs, а не голый UPDATE, и это не косметика:
+			//    во-первых, запрос заодно снимает байты прежней версии с живого
+			//    остатка её пачки (голый UPDATE оставлял live_bytes завышенным
+			//    навсегда), во-вторых, замена null-версии — событие журнала,
+			//    и назвать версию оно может только по фактическому результату
+			//    UPDATE.
+			replaced, err := markDeletingIDs(ctx, tx, ", is_null_version = false",
+				"bucket_id = $1 AND key = $2 AND is_null_version", bucketID, in.Key)
+			if err != nil {
 				return fmt.Errorf("replace null version of %s/%s: %w", in.Bucket, in.Key, err)
+			}
+			for _, id := range replaced {
+				if err := appendEvent(ctx, tx, bucketTenant, JournalKindDeleteVersion,
+					uuidPtr(id), bucketID,
+					JournalDeleteVersion{Bucket: in.Bucket, Key: in.Key}); err != nil {
+					return err
+				}
 			}
 		}
 

@@ -22,18 +22,25 @@ var ErrNoBucketPolicy = errors.New("policy not set")
 // (auth.ValidatePolicyDocument), а отдавать мы обязаны ровно то, что прислал
 // клиент.
 func (m *Meta) SetBucketPolicy(ctx context.Context, tenant TenantID, bucket string, policy []byte) error {
-	q, args := withTenant(
-		`UPDATE buckets SET policy = $2
-		  WHERE name = $1 AND deleted_at IS NULL`,
-		tenant, bucket, policy)
-	tag, err := m.Pool.Exec(ctx, q, args...)
-	if err != nil {
-		return fmt.Errorf("set policy for %q: %w", bucket, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+	// Транзакция нужна ради события: политика — это права, и потерять её при
+	// восстановлении значит открыть бакет, который был закрыт (или наоборот).
+	return m.inTx(ctx, func(tx pgx.Tx) error {
+		var id int64
+		q, args := withTenant(
+			`SELECT id FROM buckets WHERE name = $1 AND deleted_at IS NULL`, tenant, bucket)
+		err := tx.QueryRow(ctx, q+` FOR UPDATE`, args...).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock bucket %q: %w", bucket, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE buckets SET policy = $2 WHERE id = $1`, id, policy); err != nil {
+			return fmt.Errorf("set policy for %q: %w", bucket, err)
+		}
+		return appendBucketConfig(ctx, tx, id)
+	})
 }
 
 // GetBucketPolicy возвращает сырые байты политики.
@@ -155,7 +162,11 @@ func (m *Meta) ChangeBucketOwner(ctx context.Context, tenant TenantID, bucket, o
 		if tag.RowsAffected() == 0 {
 			return ErrNotFound
 		}
-		return nil
+		// Снимок читает уже изменённую строку, поэтому событие попадает в
+		// журнал тенанта-получателя. Это правильно: восстановление того тенанта
+		// обязан увидеть бакет, который теперь его, а журнал прежнего владельца
+		// про чужой бакет ничего сказать не должен.
+		return appendBucketConfig(ctx, tx, bucketID)
 	})
 }
 

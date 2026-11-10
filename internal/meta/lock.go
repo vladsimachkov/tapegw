@@ -33,6 +33,10 @@ var (
 )
 
 // lockRow — версия вместе с состоянием лока бакета.
+//
+// bucketID и tenantID нужны журналу: событие обязано нести тенанта бакета, а
+// не тенанта учётки запроса (под обходом по роли это разные тенанты), и второй
+// запрос за ними был бы окном, в котором бакет уже успели изменить.
 type lockRow struct {
 	id          uuid.UUID
 	mode        *string
@@ -40,6 +44,8 @@ type lockRow struct {
 	legalHold   bool
 	isMarker    bool
 	lockEnabled bool
+	bucketID    int64
+	tenantID    int64
 }
 
 // findLockVersion ищет версию, к которой относятся retention и legal hold.
@@ -64,7 +70,8 @@ func findLockVersion(ctx context.Context, tx pgx.Tx, tenant TenantID,
 	}
 
 	base := fmt.Sprintf(`SELECT o.id, o.retention_mode::text, o.retain_until,
-			                o.legal_hold, o.is_delete_marker, b.object_lock_enabled
+			                o.legal_hold, o.is_delete_marker, b.object_lock_enabled,
+					                b.id, b.tenant_id
 			           FROM objects o
 			           JOIN buckets b ON b.id = o.bucket_id
 			          WHERE b.name = $1 AND b.deleted_at IS NULL
@@ -73,7 +80,8 @@ func findLockVersion(ctx context.Context, tx pgx.Tx, tenant TenantID,
 	q, qargs := withTenantCol(base, "b.tenant_id", tenant, args...)
 
 	err := tx.QueryRow(ctx, q+` FOR UPDATE OF o`, qargs...).
-		Scan(&row.id, &row.mode, &row.until, &row.legalHold, &row.isMarker, &row.lockEnabled)
+		Scan(&row.id, &row.mode, &row.until, &row.legalHold, &row.isMarker,
+			&row.lockEnabled, &row.bucketID, &row.tenantID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return row, ErrNoSuchVersion
 	}
@@ -117,7 +125,11 @@ func (m *Meta) PutObjectRetention(ctx context.Context, tenant TenantID,
 		if err != nil {
 			return fmt.Errorf("put retention %s/%s@%s: %w", bucket, key, versionID, err)
 		}
-		return nil
+		// Событие — здесь, в этой же транзакции. Продленный COMPLIANCE, не
+		// попавший в журнал, после восстановления снова стал бы удаляемым по
+		// старому сроку, и это не «неточность», а снятие неизменяемости.
+		return appendEvent(ctx, tx, row.tenantID, JournalKindRetention, uuidPtr(row.id), row.bucketID,
+			JournalRetention{Bucket: bucket, Key: key, Mode: mode, Until: until})
 	})
 }
 
@@ -161,7 +173,11 @@ func (m *Meta) PutObjectLegalHold(ctx context.Context, tenant TenantID,
 			`UPDATE objects SET legal_hold = $2 WHERE id = $1`, row.id, on); err != nil {
 			return fmt.Errorf("put legal hold %s/%s@%s: %w", bucket, key, versionID, err)
 		}
-		return nil
+		// Снятие legal hold — событие не меньше установки: восстановление
+		// обязано вернуть и «заморозку сняли», иначе версия навсегда останется
+		// неудаляемой.
+		return appendEvent(ctx, tx, row.tenantID, JournalKindLegalHold, uuidPtr(row.id), row.bucketID,
+			JournalLegalHold{Bucket: bucket, Key: key, On: on})
 	})
 }
 
