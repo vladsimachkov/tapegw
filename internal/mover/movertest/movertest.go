@@ -45,6 +45,10 @@ type PKI struct {
 	ClientKey    string
 	RestorerCert string
 	RestorerKey  string
+	// DeleterCert — клиентский сертификат роли deleter (SAN-URI
+	// tapegw://deleter): только ему mover отдаёт purge (M6).
+	DeleterCert string
+	DeleterKey  string
 	// BothRolesCert — клиентский сертификат с обоими SAN-URI ролей
 	// (scheduler + restorer): стенду, где один процесс tapegw подключается и к
 	// migrator-, и к recaller-mover'у, не хватает одного роли —
@@ -75,9 +79,20 @@ type Store struct {
 	exists     map[uuid.UUID]bool
 	incomplete map[uuid.UUID]bool
 	statErr    error
+	delErr     error
 	extents    []string
 	mediaByTag map[string]string
 	putBlock   chan struct{}
+}
+
+// FailDelete включает отказ удаления: следующий Delete вернёт ошибку для
+// каждого id. Тест deleter'а проверяет им «упасть после шага N» — mover
+// недоступен в момент purge, и воркер обязан оставить строку в deleting,
+// а не отметить успех.
+func (f *Store) FailDelete(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.delErr = err
 }
 
 // SetMediaByTag — выбор ленты по тегам записи, как в настоящем Phobos:
@@ -262,6 +277,10 @@ func (f *Store) Delete(_ context.Context, ids []uuid.UUID) []store.Result {
 	f.calls["delete"]++
 	out := make([]store.Result, 0, len(ids))
 	for _, id := range ids {
+		if f.delErr != nil {
+			out = append(out, store.Result{ID: id, Err: f.delErr})
+			continue
+		}
 		delete(f.data, id)
 		out = append(out, store.Result{ID: id})
 	}
@@ -514,6 +533,8 @@ func NewPKIWithDrive(t *testing.T, drive, other string) PKI {
 		[]*url.URL{mover.ClientURI(mover.ClientScheduler)}, nil)
 	p.RestorerCert, p.RestorerKey = sign(ca, caKey, "tapegw-restorer", x509.ExtKeyUsageClientAuth,
 		[]*url.URL{mover.ClientURI(mover.ClientRestorer)}, nil)
+	p.DeleterCert, p.DeleterKey = sign(ca, caKey, "tapegw-deleter", x509.ExtKeyUsageClientAuth,
+		[]*url.URL{mover.ClientURI(mover.ClientDeleter)}, nil)
 	p.BothRolesCert, p.BothRolesKey = sign(ca, caKey, "tapegw-both", x509.ExtKeyUsageClientAuth,
 		[]*url.URL{mover.ClientURI(mover.ClientScheduler), mover.ClientURI(mover.ClientRestorer)}, nil)
 

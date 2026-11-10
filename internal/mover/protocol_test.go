@@ -407,8 +407,12 @@ func TestMessageFieldsHaveNoKeys(t *testing.T) {
 		"HelloOk": {"t", "proto"},
 		// from_op — локальная передача (Ф0.4): писать копию из буфера другой
 		// операции того же mover'а.
-		"Put":      {"t", "op", "size", "sha256", "attrs", "tags", "no_split", "from_op", "hold"},
-		"Get":      {"t", "op", "id", "offset", "length"},
+		"Put":    {"t", "op", "size", "sha256", "attrs", "tags", "no_split", "from_op", "hold"},
+		"Get":    {"t", "op", "id", "offset", "length"},
+		"Stat":   {"t", "id"},
+		"Delete": {"t", "id"},
+		// purge — операция deleter'а (M6): только oid, как и у delete.
+		"Purge":    {"t", "id"},
 		"Release":  {"t", "op"},
 		"Status":   {"t", "op"},
 		"Ready":    {"t", "op", "offset", "credits"},
@@ -456,6 +460,12 @@ func lookupMessage(name string) (reflect.Type, bool) {
 		return reflect.TypeOf(mover.Release{}), true
 	case "Get":
 		return reflect.TypeOf(mover.Get{}), true
+	case "Stat":
+		return reflect.TypeOf(mover.Stat{}), true
+	case "Delete":
+		return reflect.TypeOf(mover.Delete{}), true
+	case "Purge":
+		return reflect.TypeOf(mover.Purge{}), true
 	case "Status":
 		return reflect.TypeOf(mover.Status{}), true
 	case "Ready":

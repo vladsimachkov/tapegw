@@ -18,6 +18,7 @@ type pkiPaths struct {
 	ca, serverCert, serverKey                string
 	clientCert, clientKey                    string
 	restorerCert, restorerKey                string
+	deleterCert, deleterKey                  string
 	otherDriveCert, otherDriveKey            string
 	moverAsClientCert, moverAsClientKey      string
 	noExtKeyCert, noExtKeyKey                string
@@ -44,6 +45,7 @@ func wrap(t *testing.T, e *movertest.Env) *env {
 			ca: p.CA, serverCert: p.ServerCert, serverKey: p.ServerKey,
 			clientCert: p.ClientCert, clientKey: p.ClientKey,
 			restorerCert: p.RestorerCert, restorerKey: p.RestorerKey,
+			deleterCert: p.DeleterCert, deleterKey: p.DeleterKey,
 			otherDriveCert: p.OtherDriveCert, otherDriveKey: p.OtherDriveKey,
 			moverAsClientCert: p.MoverAsClientCert, moverAsClientKey: p.MoverAsClientKey,
 			noExtKeyCert: p.NoExtKeyCert, noExtKeyKey: p.NoExtKeyKey,

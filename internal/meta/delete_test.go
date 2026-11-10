@@ -161,6 +161,86 @@ func TestDeleteVersionUnderLock(t *testing.T) {
 	}
 }
 
+// Удаление с обходом GOVERNANCE оставляет след на строке. При обходе
+// retain_until остаётся в будущем — его снимают по истечении срока, а не по
+// факту досрочного удаления, — и без отметки удалитель читал бы такой срок как
+// вечную блокировку: клиент получил успешный ответ, данные остались на ленте
+// (миграция 0026). Проверка не только колонки: именно ClaimDeletionBatch
+// обязан такую строку считать разблокированной.
+func TestDeleteVersionBypassLeavesTrace(t *testing.T) {
+	m := testdb.Connect(t)
+	testdb.Clean(t, m)
+	ctx := context.Background()
+	mustBucket(t, m, "bypass")
+	setBucketVersioning(t, m, "bypass", meta.VersioningEnabled)
+
+	future := time.Now().Add(time.Hour)
+	insert := func(key string) string {
+		var id string
+		if err := m.Pool.QueryRow(ctx,
+			`INSERT INTO objects (id, bucket_id, key, size, etag, storage_class,
+			                      state, landing, online_until, tenant_id, pool_id,
+			                      is_current, retention_mode, retain_until, wrapped_dek)
+			  VALUES (gen_random_uuid(), (SELECT id FROM buckets WHERE name = 'bypass'),
+			          $1, 1, 'etag', 'GLACIER', 'pending', true,
+			          now() + interval '1 day', 1, 1, true, 'GOVERNANCE', $2, 'x'::bytea)
+			  RETURNING id::text`, key, future).Scan(&id); err != nil {
+			t.Fatalf("вставка %s: %v", key, err)
+		}
+		return id
+	}
+
+	bypassID := insert("bypassed")
+	if _, err := m.DeleteObject(ctx, testTenant, meta.DeleteObjectInput{
+		Bucket: "bypass", Key: "bypassed", VersionID: bypassID, BypassGovernance: true,
+	}); err != nil {
+		t.Fatalf("удаление с обходом: %v", err)
+	}
+
+	plainID := insert("plain")
+	if _, err := m.DeleteObject(ctx, testTenant, meta.DeleteObjectInput{
+		Bucket: "bypass", Key: "plain", VersionID: plainID,
+	}); err == nil {
+		t.Fatal("удаление GOVERNANCE без обхода прошло — проверка lock'а сломалась")
+	}
+
+	var marked, notMarked bool
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT retention_bypassed_at IS NOT NULL FROM objects WHERE id = $1`, bypassID).
+		Scan(&marked); err != nil {
+		t.Fatal(err)
+	}
+	if !marked {
+		t.Error("обход не оставил отметки на строке")
+	}
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT retention_bypassed_at IS NOT NULL FROM objects WHERE id = $1`, plainID).
+		Scan(&notMarked); err != nil {
+		t.Fatal(err)
+	}
+	if notMarked {
+		t.Error("отметка проставлена там, где обхода не было")
+	}
+
+	// Главное следствие: удалитель такую строку разблокированной не считает.
+	cands, err := m.ClaimDeletionBatch(ctx, 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawBypassed bool
+	for _, c := range cands {
+		if c.ID.String() == bypassID && c.Locked {
+			t.Error("версия с обходом GOVERNANCE помечена заблокированной — не будет снята никогда")
+		}
+		if c.ID.String() == bypassID {
+			sawBypassed = true
+		}
+	}
+	if !sawBypassed {
+		t.Error("версия с обходом не попала в выборку удаления")
+	}
+}
+
 // После удаления текущей версии по versionId текущей становится версия с
 // максимальным version_seq из оставшихся, а не произвольная.
 func TestDeleteCurrentVersionPromotesMaxSeq(t *testing.T) {

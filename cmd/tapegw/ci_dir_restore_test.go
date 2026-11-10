@@ -134,6 +134,9 @@ phobos:
     %s: {addr: %q, node: ci, library: dirlib, role: migrator}
     %s: {addr: %q, node: ci, library: dirlib, role: recaller}
   mover_client: {cert: %q, key: %q, ca: %q}
+  # deleter включён по умолчанию, а purge целого объекта — отдельная роль
+  # сертификата (M6), на общем клиенте mover'ов её нет.
+  deleter_client: {cert: %q, key: %q, ca: %q}
 migrator:
   batch_max_wait: 1s
   claim_ttl: 30s
@@ -147,7 +150,8 @@ janitor:
 metrics: {listen: %q}
 `, kek, dsn, s3Addr, filepath.Join(dir, "landing"), cacheDir,
 		p.Drive, migratorAddr, p.OtherDrive, recallerAddr,
-		p.BothRolesCert, p.BothRolesKey, p.CA, metricsAddr))
+		p.BothRolesCert, p.BothRolesKey, p.CA,
+		p.DeleterCert, p.DeleterKey, p.CA, metricsAddr))
 	gw := startProc(t, gwBin, "-config", gwCfg)
 	waitTCP(t, s3Addr, 60*time.Second) // миграции на старте — не мгновенны
 

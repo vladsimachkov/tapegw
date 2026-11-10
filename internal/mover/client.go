@@ -343,6 +343,13 @@ func (c *Client) DeleteObject(id uuid.UUID) (*Result, error) {
 	return c.ask(Delete{Type: "delete", ID: id})
 }
 
+// PurgeObject удаляет объект целиком — операция deleter'а (M6). Обслуживается
+// только клиентом с ролью deleter; отсутствующий объект — успех, повтор после
+// падения сходится к тому же результату.
+func (c *Client) PurgeObject(id uuid.UUID) (*Result, error) {
+	return c.ask(Purge{Type: "purge", ID: id})
+}
+
 func (c *Client) ask(msg interface{}) (*Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

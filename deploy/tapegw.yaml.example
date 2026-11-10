@@ -114,6 +114,16 @@ phobos:
     key: /etc/tapegw/scheduler.key
     ca: /etc/tapegw/ca.crt
 
+  # Сертификат tapegw как клиента mover'ов для удалителя (SAN-URI
+  # tapegw://deleter, M6). Отдельный от mover_client намеренно: purge удаляет
+  # целый архивный объект, и это право не должно жить на сертификате
+  # планировщика архивации. Обязателен, если deleter включён и в movers есть
+  # хоть один migrator.
+  deleter_client:
+    cert: /etc/tapegw/deleter.crt
+    key: /etc/tapegw/deleter.key
+    ca: /etc/tapegw/ca.crt
+
   # Конфигурация процесса tapegw-mover (ADR-0021). tapegw эти поля не читает;
   # переменные выводятся как TAPEGW_PHOBOS_MOVER_*.
   mover:
@@ -183,6 +193,18 @@ janitor:
                                    # интервал клиенту не видно
   batch_max_objects: 1000          # сколько файлов снимается за проход
   shutdown_grace: 30s              # сколько ждём текущий проход при остановке
+
+deleter:
+  enabled: true                    # false — удаление выключено; пишется в лог:
+                                   # удалённые версии продолжали бы занимать
+                                   # диск и ленту, и снаружи это не видно
+  interval: 1m                     # период выборки из 'deleting'
+  batch_max_objects: 200           # сколько версий разбирается за проход
+  claim_ttl: 15m                   # на сколько воркер занимает версию; после
+                                   # падения захват истекает сам, и версию
+                                   # подберёт следующий прогон
+  retry_backoff: 30s               # основание экспоненты повтора (потолок сутки)
+  shutdown_grace: 5m               # сколько ждём текущий проход при остановке
 
 recaller:
   batch_max_objects: 500

@@ -282,6 +282,32 @@ func (s *Server) handle(conn net.Conn) {
 				}
 			}
 			_ = WriteJSON(tconn, Result{Type: "result", Op: d.ID, Code: code, State: StateDone})
+		case "purge":
+			var p Purge
+			if err := Decode(f, &p); err != nil || p.ID == uuid.Nil {
+				return
+			}
+			// Purge уничтожает целый архивный объект, поэтому его роль — не
+			// «ещё один delete», а отдельная граница: обслуживается только клиенту
+			// tapegw://deleter. Идентичность — из подтверждённого сертификата
+			// (SAN-URI), а не из сообщения: объявить себя deleter'ом в кадре мог
+			// бы кто угодно.
+			//
+			// Предпроверок здесь нет намеренно: решение «удалять можно» принимает
+			// tapegw, у которого есть БД (Object Lock, members_live, restore), а
+			// mover знает только oid. Его защита — роль сертификата. Отсутствие
+			// объекта — успех: воркер повторяет шаг после падения и обязан
+			// сходиться к тому же результату.
+			code := CodeOK
+			switch {
+			case s.clientOf(tconn) != ClientDeleter:
+				code = CodeDenied
+			default:
+				if res := s.st.Delete(context.Background(), []uuid.UUID{p.ID}); len(res) == 1 && res[0].Err != nil {
+					code = CodeIO
+				}
+			}
+			_ = WriteJSON(tconn, Result{Type: "result", Op: p.ID, Code: code, State: StateDone})
 		case "release":
 			var r Release
 			if err := Decode(f, &r); err != nil || r.Op == uuid.Nil {
