@@ -44,17 +44,21 @@ const (
 //
 // Почему блокада `FOR NO KEY UPDATE`, а не `FOR UPDATE`. У `journal_events`
 // есть FK `tenant_id → tenants`, поэтому вставка события **сама** берёт на
-// строку тенанта лок `FOR KEY SHARE` — проверено по `pg_stat_activity`: под
-// `FOR UPDATE` здоровая вставка события стоит в очереди с `wait_event =
-// transactionid`. `FOR KEY SHARE` совместим с `FOR NO KEY UPDATE` (затем этот
-// режим и придуман: обычные UPDATE не мешают проверкам FK) и конфликтует с
-// `FOR UPDATE`. То есть блокада ниже не мешает здоровому пути записи, но
-// красная на любой настоящей правке строки тенанта: plain UPDATE берёт ровно
-// `FOR NO KEY UPDATE`.
+// строку тенанта лок `FOR KEY SHARE` — видно по `pg_stat_activity`: под
+// `FOR UPDATE` здоровая вставка стоит в очереди с `wait_event = transactionid`.
+// Замерено на одной строке (вставка события, держатель на строке `tenants`
+// 8 с): обычный `UPDATE` — прошла за 2.6 мс, `FOR NO KEY UPDATE` — за 2.3 мс,
+// `FOR UPDATE` — ждала 6001 мс и упала по `lock_timeout`. То есть `FOR KEY
+// SHARE` конфликтует только с `FOR UPDATE`, а с правкой строки — нет (затем
+// `NO KEY UPDATE` и придуман: обычные UPDATE не мешают проверкам FK).
+// Соответственно блокада ниже здоровому пути не мешает, но красная на любой
+// настоящей правке строки тенанта: plain UPDATE берёт ровно `FOR NO KEY UPDATE`.
 //
-// Отсюда же честная граница свойства: строка тенанта перестала сериализовать
-// журналируемые записи **между собой** (KEY SHARE совместимы), но запись в
-// `tenants` — поворот KEK, правка лимита — задерживает их до своего коммита.
+// Граница свойства — в точности то, что измерено: строка тенанта не в очереди
+// журналируемых записей ни при каких штатных правках — ни обычный `UPDATE`
+// (поворот KEK, правка лимита), ни `FOR NO KEY UPDATE`. Задержать их способен
+// только `FOR UPDATE` на строке `tenants`; в коде шлюза его нет, и заводить не
+// следует: на строку тенанта претендуют только проверки FK.
 //
 // Два участника обязательны: свойство «не ждут друг друга» проверяется только
 // одновременно тем, кто лок держит, и тем, кто к нему лезет.
@@ -102,21 +106,28 @@ func TestJournalWriteNotBlockedByTenantRowLock(t *testing.T) {
 	// `FOR KEY SHARE`, — а такая блокада уже не замечает правку строки тенанта,
 	// и тест молча перестал бы что-либо проверять. Проба ровно в меру: `KEY
 	// SHARE`, которым здоровая вставка события проходит, её не видит.
-	probe, err := m.Pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("начать транзакцию-пробу: %v", err)
+	//
+	// Вызывается дважды — до записей и после: если транзакция-блокада умерла в
+	// середине цикла, записи проходили бы без очереди и тест стал бы зелёным,
+	// ничего не проверяя.
+	probeBlocked := func(when string) {
+		t.Helper()
+		probe, err := m.Pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("начать транзакцию-пробу (%s): %v", when, err)
+		}
+		defer probe.Rollback(ctx) // nolint:errcheck
+		_, err = probe.Exec(ctx,
+			`SELECT id FROM tenants WHERE id = $1 FOR NO KEY UPDATE NOWAIT`, lockTenant)
+		var pe *pgconn.PgError
+		if err == nil || !errors.As(err, &pe) || pe.Code != lockNotAvailable {
+			t.Fatalf("строка тенанта %d не заблокирована правкой (%s; проба вернула %v, хотели %s): "+
+				"зелёный прогон значил бы «блокады нет» — проверялось бы отсутствие "+
+				"очереди за локом, которого нет, либо лока, которого недостаточно для "+
+				"правки строки", lockTenant, when, err, lockNotAvailable)
+		}
 	}
-	defer probe.Rollback(ctx) // nolint:errcheck
-	_, err = probe.Exec(ctx,
-		`SELECT id FROM tenants WHERE id = $1 FOR NO KEY UPDATE NOWAIT`, lockTenant)
-	var pe *pgconn.PgError
-	if err == nil || !errors.As(err, &pe) || pe.Code != lockNotAvailable {
-		t.Fatalf("строка тенанта %d не заблокирована правкой (проба вернула %v, хотели %s): "+
-			"тест проверял бы отсутствие очереди за локом, которого нет, либо лока, "+
-			"которого достаточно для правки строки",
-			lockTenant, err, lockNotAvailable)
-	}
-	probe.Rollback(ctx) // nolint:errcheck
+	probeBlocked("до записей")
 
 	before := journalCount(t, m, lockTenant)
 
@@ -159,12 +170,18 @@ func TestJournalWriteNotBlockedByTenantRowLock(t *testing.T) {
 			i+1, c.name, elapsed.Round(time.Millisecond))
 	}
 
+	probeBlocked("после записей")
+
 	// Зелёный не должен означать «запись прошла, но ничего не сделала»: каждое
 	// изменение обязано оставить событие.
 	if after := journalCount(t, m, lockTenant); after-before != int64(len(cases)) {
 		t.Fatalf("событий %d, хотели %d: записи под блокадой прошли, но событий не оставили — "+
 			"тест проверял не тот путь", after-before, len(cases))
 	}
+	// Второй пояс, а не детектор: при возврате `UPDATE tenants …` краснеет
+	// прежде всего таймаут записи (проверено мутацией — с отключённой этой
+	// проверкой тест всё равно красный). В тесте замера, наоборот, она единственный
+	// ловец там, где отношение скоростей выключено.
 	if seq := tenantJournalSeq(t, m, lockTenant); seq != 0 {
 		t.Errorf("tenants.journal_seq = %d: путь записи пишет номер на строке тенанта, "+
 			"и изменения тенанта снова сериализуются на ней (ADR-0023, поправка)", seq)
