@@ -191,6 +191,78 @@ func TestLoadEnvOverridesYAML(t *testing.T) {
 	}
 }
 
+func TestJournalConfigFromYAMLAndEnv(t *testing.T) {
+	// Правило 9: числа журнала живут в конфиге, и имя переменной выводится из
+	// пути в YAML — вложенность journal.segment.* / journal.sealer.* не должна
+	// ломать ни YAML, ни TAPEGW_*.
+	path := writeConfig(t, `
+journal:
+  segment:
+    max_events: 500
+    max_bytes: 4MiB
+  sealer:
+    interval: 30s
+    sweep_interval: 10m
+`)
+	t.Setenv("TAPEGW_ROOT_ACCESS", "a")
+	t.Setenv("TAPEGW_ROOT_SECRET", "b")
+	t.Setenv("TAPEGW_IAM_KEK_FILE", "/tmp/kek.json")
+	t.Setenv("TAPEGW_JOURNAL_SEGMENT_MAX_EVENTS", "77")
+	t.Setenv("TAPEGW_JOURNAL_SEALER_TENANTS_BATCH", "3")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Journal.Segment.MaxEvents != 77 {
+		t.Errorf("max_events = %d, хотели 77 (env поверх yaml)", cfg.Journal.Segment.MaxEvents)
+	}
+	if cfg.Journal.Segment.MaxBytes != 4*MiB {
+		t.Errorf("max_bytes = %v, хотели 4MiB", cfg.Journal.Segment.MaxBytes)
+	}
+	if cfg.Journal.Sealer.Interval != 30*time.Second {
+		t.Errorf("interval = %v, хотели 30s", cfg.Journal.Sealer.Interval)
+	}
+	if cfg.Journal.Sealer.SweepInterval != 10*time.Minute {
+		t.Errorf("sweep_interval = %v, хотели 10m", cfg.Journal.Sealer.SweepInterval)
+	}
+	if cfg.Journal.Sealer.TenantsBatch != 3 {
+		t.Errorf("tenants_batch = %d, хотели 3 (env)", cfg.Journal.Sealer.TenantsBatch)
+	}
+	// Значение по умолчанию не задано ни в YAML, ни в окружении — обязан
+	// остаться дефолт, а не ноль: ноль в max_segments_per_tenant означал бы
+	// «ни одного сегмента за проход», то есть выключенный воркер без ошибки.
+	if cfg.Journal.Sealer.MaxSegmentsPerTenant != Default().Journal.Sealer.MaxSegmentsPerTenant {
+		t.Errorf("max_segments_per_tenant = %d, хотели дефолт %d",
+			cfg.Journal.Sealer.MaxSegmentsPerTenant,
+			Default().Journal.Sealer.MaxSegmentsPerTenant)
+	}
+	if !cfg.Journal.Sealer.EnabledValue() {
+		t.Error("силер выключен по умолчанию: молчание конфига должно означать «включено»")
+	}
+
+}
+
+// Нули в размерах сегмента — ошибка конфигурации, а не «сегмент пустой»:
+// воркер крутился бы на пустой выборке. Проверка не зависит от enabled, поэтому
+// ловится и при выключенном силере. Отдельный тест: в TestJournalConfigFromYAMLAndEnv
+// уже выставлен TAPEGW_JOURNAL_SEGMENT_MAX_EVENTS, и он перекрыл бы YAML.
+func TestJournalZeroSegmentIsRejected(t *testing.T) {
+	t.Setenv("TAPEGW_ROOT_ACCESS", "a")
+	t.Setenv("TAPEGW_ROOT_SECRET", "b")
+	t.Setenv("TAPEGW_IAM_KEK_FILE", "/tmp/kek.json")
+	path := writeConfig(t, `
+journal:
+  sealer:
+    enabled: false
+  segment:
+    max_events: 0
+`)
+	if _, err := Load(path); err == nil {
+		t.Error("journal.segment.max_events=0 принят: пустой сегмент означал бы вечный цикл воркера")
+	}
+}
+
 func TestLoadRequiresRoot(t *testing.T) {
 	// Без ключей versitygw не стартует, поэтому это ошибка конфигурации,
 	// а не опция.

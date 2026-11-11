@@ -242,6 +242,18 @@ func run(args []string) error {
 		logger.Warn("УДАЛЕНИЕ ВЫКЛЮЧЕНО: deleter.enabled=false — удалённые версии останутся " +
 			"на диске и на ленте, очередь deleting будет расти")
 	}
+	// Запечатывание сегментов журнала (Ж2). Выключен оно видно так же громко,
+	// как выключенная архивация: события останутся незапечатанными, на ленту не
+	// уедут, и восстановление после аварии вернёт старые сроки блокировок —
+	// ровно то, ради чего журнал и затевался.
+	var seal *worker.SealerGroup
+	if cfg.Journal.Sealer.EnabledValue() {
+		seal = worker.StartSealer(ctx, worker.SealerDeps{Cfg: cfg, Meta: pool, Log: logger})
+	} else {
+		logger.Warn("ЗАПЕЧАТЫВАНИЕ ЖУРНАЛА ВЫКЛЮЧЕНО: journal.sealer.enabled=false — события " +
+			"останутся незапечатанными, на ленту не уедут, и после аварии вернутся старые " +
+			"сроки блокировок")
+	}
 	if cfg.Metrics.Listen != "" {
 		rd, err := worker.StartReadiness(cfg.Metrics.Listen, cfg.Migrator.EnabledValue(), logger)
 		if err != nil {
@@ -273,6 +285,9 @@ func run(args []string) error {
 	}
 	if del != nil {
 		del.Wait(cfg.Deleter.ShutdownGrace)
+	}
+	if seal != nil {
+		seal.Wait(cfg.Journal.Sealer.ShutdownGrace)
 	}
 	logger.Info("stopped")
 	return nil

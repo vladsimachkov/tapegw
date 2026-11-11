@@ -181,6 +181,11 @@ func TestMigration0028JournalServiceId(t *testing.T) {
 		t.Error("UPDATE событий журнала прошёл: после 0028 журнал не append-only")
 	}
 
+	// 0029 снимается первой: её journal_segment_event ссылается на id journal_events,
+	// и без снятия Down 0028 падает на 2BP01 «other objects depend on it».
+	if _, err := m.Pool.Exec(ctx, section(t, migration0029, "Down")); err != nil {
+		t.Fatalf("снять 0029 перед 0028: %v", err)
+	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0028, "Down")); err != nil {
 		t.Fatalf("Down 0028 на таблице с данными: %v", err)
 	}
@@ -292,6 +297,10 @@ func TestMigration0028JournalServiceId(t *testing.T) {
 
 	if _, err := m.Pool.Exec(ctx, section(t, migration0028, "Up")); err != nil {
 		t.Fatalf("повторный Up 0028 на таблице с данными: %v", err)
+	}
+	// 0029 возвращается последней: её признак ссылается на id, который вернул Up 0028.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0029, "Up")); err != nil {
+		t.Fatalf("вернуть 0029 после Up 0028: %v", err)
 	}
 	if got := pkCols(t, ctx, m, "journal_events"); got != "id" {
 		t.Errorf("первичный ключ после повторного Up = (%s), хотели (id)", got)

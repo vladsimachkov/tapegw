@@ -169,6 +169,11 @@ func TestMigration0017Packs(t *testing.T) {
 	// DROP TABLE ... CASCADE в самом 0017 здесь вреден: он бы молча уносил
 	// реестр копий вместе с пачками, а это ровно то, что должно быть видно.
 	// 0021 добавляет колонки в packs — её снимаем раньше всех, кто трогает packs.
+	// 0029 — раньше 0027: признак запечатывания ссылается на journal_events, и без
+	// его снятия Down 0027 падает на 2BP01.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0029, "Down")); err != nil {
+		t.Fatalf("Down 0029 перед 0027: %v", err)
+	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0027, "Down")); err != nil {
 		t.Fatalf("Down 0027: %v", err)
 	}

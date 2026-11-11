@@ -52,6 +52,14 @@ const migration0027 = "migrations/0027_journal_events.sql"
 // проблема не возникает — она только в тестах, снимающих одну миграцию.
 const migration0028 = "migrations/0028_journal_service_id.sql"
 
+// migration0029 — сегменты журнала. Снимать её Down-ом нужно **до** Down 0028 и
+// 0027: journal_segment_event ссылается и на таблицу journal_events, и на её
+// id (первичный ключ), поэтому без снятия эти Down-ы падают на 2BP01 «other
+// objects depend on it». В настоящем `goose down` порядок обратный по номерам и
+// проблема не возникает — она только в тестах, снимающих одну миграцию, не
+// трогая остальные.
+const migration0029 = "migrations/0029_journal_segments.sql"
+
 // section вынимает из файла миграции текст Up или Down дословно: от строки
 // `-- +goose Up|Down` до следующей директивы goose или до конца файла.
 // Никакой пересборки SQL здесь нет и быть не должно.
