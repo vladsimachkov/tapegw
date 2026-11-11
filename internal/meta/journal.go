@@ -19,24 +19,25 @@ import (
 // COMPLIANCE снова станет удаляемым по старому сроку, а ключ из-под маркера —
 // живым.
 //
-// Два правила, на которых держится весь пакет, заданы не удобством:
+// Три правила, на которых держится весь пакет, заданы не удобством:
 //
 //  1. Событие пишется **в той же транзакции, что и изменение**. Отдельный шаг
 //     после коммита оставил бы окно «изменение есть, события нет», и падение в
 //     нём потеряло бы блокировку молча. Поэтому appendEvent принимает tx
 //     вызывающего и не умеет открывать свою.
-//  2. Порядок внутри тенанта даёт счётчик на строке тенанта, а не sequence
-//     Postgres: последовательность не откатывается, и откатившаяся операция
-//     оставила бы дырку, а дырка в журнале — это «потерянное событие».
+//  2. У события есть только **служебный id** из sequence; строку тенанта
+//     запись не трогает. Счётчик на строке тенанта сериализовал бы все
+//     журналируемые изменения тенанта (≈1000 в секунду и очередь за массовой
+//     операцией — см. ADR-0023, «Измерение цены»), а плотность всё равно даёт не
+//     таблица событий: плотный journal_seq выдаёт воркер сегментов при
+//     запечатывании, и пропуски служебных id от откатов — норма.
+//  3. Служебный id присваивается на вставке, то есть **после** того, как
+//     вызывающий взял блокировку строки объекта. Только поэтому порядок событий
+//     одного объекта совпадает с порядком коммита: изменения одного объекта
+//     сериализованы его строкой. Взять id до блокировки — значит дать
+//     восстановлению применить retention не в том порядке.
 //
-// Номера плотные по построению, и `rebuild-meta` вправе читать любой пропуск
-// как аварию, а не как потерянное событие.
-//
-// Про правило 2 есть поправка: оно описывает сегодняшнее состояние кода, а на Ж2
-// способ выдачи номера меняется (служебный id при записи, плотный номер — на
-// запечатывании сегмента). Основание, условия и цену перехода читать в
-// docs/adr/0023-journal-events-same-tx.md, раздел «Измерение цены» — там же
-// перечислено, что обязано измениться вместе с этим.
+// Порядок событий разных объектов при восстановлении не важен.
 
 // Виды событий — значения enum journal_event_kind (миграция 0027).
 const (
@@ -127,8 +128,10 @@ type JournalBucketConfig struct {
 
 // JournalEvent — строка journal_events.
 type JournalEvent struct {
+	// ID — служебный id: порядок выдачи, а не плотный номер. Дырки в нём
+	// нормальны (откатившаяся транзакция), плотный journal_seq даёт сегмент.
+	ID        int64
 	TenantID  int64
-	Seq       int64
 	Kind      string
 	ObjectID  *uuid.UUID
 	BucketID  int64
@@ -176,24 +179,21 @@ func uuidPtr(id uuid.UUID) *uuid.UUID { return &id }
 
 // appendEvent вставляет событие журнала в транзакцию изменения.
 //
-// Номер выдаётся здесь же и обязательно под блокировкой строки тенанта:
+// id выдаёт схема (`GENERATED ALWAYS AS IDENTITY`) на самой вставке, и это не
+// мелочь, а условие корректности: вставка всегда идёт после того, как
+// вызывающий заблокировал строку объекта, поэтому для одного объекта порядок id
+// совпадает с порядком коммитов. Вызвать nextval раньше блокировки — значит
+// получить события одного объекта в порядке, отличном от порядка изменений, и
+// восстановление применит retention не в том порядке.
 //
-//	UPDATE tenants SET journal_seq = journal_seq + 1 ... RETURNING
-//
-// Это не «обновить счётчик», а способ взять строку на запись: два параллельных
-// изменения одного тенанта сериализуются на этой строке и получают соседние
-// номера, а откатившееся изменение откатывает и номер — дырки не возникает.
-// Sequence Postgres на этом месте выглядит эквивалентом и не является им:
-// nextval не откатывается, и откатившаяся операция оставила бы пропуск, а
-// пропуск в журнале rebuild-meta обязан читать как потерю события.
+// Строку тенанта запись больше не трогает: плотный номер даёт воркер сегментов
+// при запечатывании, а не таблица событий. Пропуски в служебных id от
+// откатившихся транзакций — норма, потерянным событием они не считаются.
 //
 // tenant обязан браться из строки (бакета или версии), а не из учётки запроса:
 // под обходом по роли страж отдаёт «все тенанты», и событие уехало бы в
 // тенанта, которого нет (та же форма ошибки, что с DEK на PR #127).
-//
-// Порядок блокировок: строка тенанта всегда берётся последней — после
-// advisory-лока ключа, бакета и строк objects. Все места журнала следуют ему,
-// иначе два изменения одного ключа обменяются локами и встанут в тупик.
+// Несуществующий тенант здесь отклоняет внешний ключ journal_events.tenant_id.
 func appendEvent(ctx context.Context, tx pgx.Tx, tenant int64, kind string,
 	objectID *uuid.UUID, bucketID int64, payload any) error {
 
@@ -202,21 +202,10 @@ func appendEvent(ctx context.Context, tx pgx.Tx, tenant int64, kind string,
 		return fmt.Errorf("journal payload %s: %w", kind, err)
 	}
 
-	var seq int64
-	err = tx.QueryRow(ctx,
-		`UPDATE tenants SET journal_seq = journal_seq + 1
-		  WHERE id = $1 RETURNING journal_seq`, tenant).Scan(&seq)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("journal seq: тенант %d не найден", tenant)
-	}
-	if err != nil {
-		return fmt.Errorf("journal seq tenant %d: %w", tenant, err)
-	}
-
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO journal_events (tenant_id, journal_seq, kind, object_id, bucket_id, payload)
-		 VALUES ($1, $2, $3::journal_event_kind, $4, $5, $6::jsonb)`,
-		tenant, seq, kind, objectID, bucketID, string(raw)); err != nil {
+		`INSERT INTO journal_events (tenant_id, kind, object_id, bucket_id, payload)
+		 VALUES ($1, $2::journal_event_kind, $3, $4, $5::jsonb)`,
+		tenant, kind, objectID, bucketID, string(raw)); err != nil {
 		return fmt.Errorf("journal event %s: %w", kind, err)
 	}
 	return nil
@@ -265,22 +254,31 @@ func appendBucketConfig(ctx context.Context, tx pgx.Tx, bucketID int64) error {
 	return appendEvent(ctx, tx, cfg.OwnerTenant, JournalKindBucketConfig, nil, bucketID, cfg)
 }
 
-// JournalEventsAfter читает события тенанта по порядку после afterSeq.
+// JournalEventsAfter читает события тенанта по порядку выдачи id, после
+// afterID (0 — с самого начала).
 //
 // Этим же читает себя будет `rebuild-meta`, и лимт здесь не украшение: журнал
 // за годы — это миллионы событий, и применять их надо порциями.
+//
+// Порядок — по id, а не по времени: время на разных соединениях расходится, а id
+// для одного объекта совпадает с порядком коммитов (см. appendEvent).
 func (m *Meta) JournalEventsAfter(ctx context.Context, tenant int64,
-	afterSeq int64, limit int) ([]JournalEvent, error) {
+	afterID int64, limit int) ([]JournalEvent, error) {
 
 	if limit <= 0 {
+		// Правило 9: когда читатель начнёт употребляться в проде, размер страницы
+		// уезжает в конфиг (`journal.read_batch` с TAPEGW_JOURNAL_READ_BATCH).
+		// Сейчас JournalEventsAfter вызывают только тесты — настраивать нечего,
+		// и заводить поле конфига без потребителя значит плодить неиспроверяемую
+		// настройку.
 		limit = 1000
 	}
 	rows, err := m.Pool.Query(ctx,
-		`SELECT tenant_id, journal_seq, kind::text, object_id, bucket_id, payload, created_at
+		`SELECT id, tenant_id, kind::text, object_id, bucket_id, payload, created_at
 		   FROM journal_events
-		  WHERE tenant_id = $1 AND journal_seq > $2
-		  ORDER BY journal_seq
-		  LIMIT $3`, tenant, afterSeq, limit)
+		  WHERE tenant_id = $1 AND id > $2
+		  ORDER BY id
+		  LIMIT $3`, tenant, afterID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("journal events tenant %d: %w", tenant, err)
 	}
@@ -289,7 +287,7 @@ func (m *Meta) JournalEventsAfter(ctx context.Context, tenant int64,
 	var out []JournalEvent
 	for rows.Next() {
 		var e JournalEvent
-		if err := rows.Scan(&e.TenantID, &e.Seq, &e.Kind, &e.ObjectID,
+		if err := rows.Scan(&e.ID, &e.TenantID, &e.Kind, &e.ObjectID,
 			&e.BucketID, &e.Payload, &e.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan journal event: %w", err)
 		}
@@ -301,17 +299,24 @@ func (m *Meta) JournalEventsAfter(ctx context.Context, tenant int64,
 	return out, nil
 }
 
-// JournalSeq — текущий номер последнего события тенанта. Нужен тестам и
-// воркеру сегментов: закрытый сегмент обязан захватывать ровно диапазон до
-// этого номера включительно.
-func (m *Meta) JournalSeq(ctx context.Context, tenant int64) (int64, error) {
-	var seq int64
-	err := m.Pool.QueryRow(ctx, `SELECT journal_seq FROM tenants WHERE id = $1`, tenant).Scan(&seq)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, ErrNotFound
+// JournalEventCount — число событий тенанта в таблице.
+//
+// Нужен не для отчёта, а как опора проверки полноты: воркер сегментов обязан
+// показать, что ни одно видимое закоммиченное событие не осталось за
+// сегментами, а смежность диапазонов сама по себе ничего не доказывает —
+// номера раздаёт тот, кто сам отобрал события (ADR-0023, поправка, п. 5).
+//
+// Но не в этом виде: count(*) считает все события тенанта, а журнал до Ж2 ничем
+// не очищается, — на тенанте с миллионами событий это полный скан индекса на
+// каждый цикл запечатывания. Воркеру сверка нужна не по всей таблице, а по
+// диапазону-кандидату: max(id) против рубежа запечатанного и число событий
+// внутри этого диапазона. Сейчас функцию зовут только тесты; брать её за основу
+// проверки воркеру нельзя.
+func (m *Meta) JournalEventCount(ctx context.Context, tenant int64) (int64, error) {
+	var n int64
+	if err := m.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM journal_events WHERE tenant_id = $1`, tenant).Scan(&n); err != nil {
+		return 0, fmt.Errorf("journal event count tenant %d: %w", tenant, err)
 	}
-	if err != nil {
-		return 0, fmt.Errorf("journal seq tenant %d: %w", tenant, err)
-	}
-	return seq, nil
+	return n, nil
 }
