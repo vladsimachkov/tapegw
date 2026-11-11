@@ -96,15 +96,29 @@ for leftover in "$(ls -t "${TMPDIR:-/tmp}"/mutate-backup-?????? 2>/dev/null || t
 	rm -f "$leftover" "$leftover.name"
 done
 
+# Логи прогонов после мутации. Восстанавливать там нечего, но прерванный запуск
+# оставляет в /tmp файл размером с вывод тестов, поэтому убираем и осколки.
+# Шаблон так же узкий, как у копий: ровно шесть символов, которые пишет mktemp.
+for stale in "${TMPDIR:-/tmp}"/mutate-test-??????; do
+	if [ -f "$stale" ]; then
+		rm -f "$stale"
+	fi
+done
+
 backup=$(mktemp "${TMPDIR:-/tmp}/mutate-backup-XXXXXX")
 cp "$file" "$backup"
 # Восстанавливаем из копии при любом выходе — по ошибке тестов, по Ctrl-C, по
 # чему угодно. git checkout здесь не используется намеренно.
 printf '%s' "$file" > "$backup.name"
 
+# Вывод прогона после мутации; создаётся позже (в mktemp рядом с прогоном), но
+# объявляется здесь, чтобы trap чистил его при любом выходе — иначе после каждого
+# прогона в /tmp оставался файл размером с лог тестов.
+log=""
+
 restore() {
 	cp "$backup" "$file"
-	rm -f "$backup" "$backup.name"
+	rm -f "$backup" "$backup.name" ${log:+"$log"}
 	echo "--- восстановлено из копии ---"
 }
 trap restore EXIT INT TERM
