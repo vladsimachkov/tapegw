@@ -10,12 +10,33 @@ import (
 
 // Запечатывание сегментов журнала (миграция 0029, ADR-0023 п. 3–5).
 //
-// Событие после 0028 носит только служебный id, а плотный номер, по которому
-// rebuild-meta применяет журнал по порядку и видит пропуск, даёт диапазон
-// запечатанного сегмента. Здесь учётная часть: выбрать не запечатанные события
-// тенанта, выдать им следующий кусок плотной нумерации и оставить признак
-// «запечатано» в journal_segment_event. Сам объект сегмента (шифротекст под TEK
-// тенанта, очередь mover'у, пачки журнала) — следующий шаг.
+// Событие после 0028 носит только служебный id. Плотный номер даёт диапазон
+// запечатанного сегмента, и назначение у него одно: по нему rebuild-meta видит
+// **пропуск** (диапазоны одного тенанта обязаны составлять ряд 1..n). Порядок же
+// применения — это id события: только он совпадает с порядком коммитов одного
+// объекта, и ниже объяснено, когда плотный порядок с ним расходится. Здесь
+// учётная часть: выбрать не запечатанные события тенанта, выдать им следующий
+// кусок плотной нумерации и оставить признак «запечатано» в
+// journal_segment_event. Сам объект сегмента (шифротекст под TEK тенанта,
+// очередь mover'у, пачки журнала) — следующий шаг.
+//
+// Почему порядок применения — id, а не плотный номер.
+//
+// Каждое журналируемое изменение берёт блокировку строки объекта (или бакета) до
+// вставки события, поэтому второй участник того же объекта получает id позже и
+// закоммитится позже: id и порядок коммитов для одного объекта совпадают
+// (ADR-0023 п. 2). Разные объекты при восстановлении переставляться могут.
+//
+// Плотный порядок этого совпадения не даёт, и вот когда именно он расходится:
+// опоздавшее событие (чья транзакция была в полёте во время запечатывания)
+// печатается в следующий сегмент, то есть получает плотный номер **больше**, чем
+// у событий с бОльшими id, запечатанных раньше. Если такое событие и более
+// позднее событие относятся к одному объекту, плотный порядок для этого объекта
+// обратен порядку коммитов, и применение по плотному номеру вернуло бы старое
+// состояние поверх нового. Контрпример с разбором — в ADR-0023 и в тесте
+// TestSealStragglerInvertsDenseOrder; колонки event_id_first / event_id_last
+// сегмента существуют затем, чтобы заметить такую перестановку по каталогу
+// сегментов, не раскрывая их содержимое.
 //
 // Как выборка устроена и почему именно так.
 //
@@ -31,16 +52,10 @@ import (
 // не заметить — не коммитившая транзакция просто не отдаёт строку. Отсюда и
 // «опоздавшие»: событие, чья транзакция была в полёте во время запечатывания,
 // становится видно позже, и id у него **ниже** рубежа — обычный ход его не
-// найдёт. Для порядка событий это безразлично (см. комментарий
-// SealJournalStragglers), но событие обязано когда-нибудь запечататься, иначе
-// проверка полноты при восстановлении будет падать вечно, — для этого и есть
-// отдельная редкая проверка ниже рубежа.
-//
-// Порядок событий одного объекта при этом не страдает: каждое журналируемое
-// изменение берёт блокировку строки объекта (или бакета) до вставки события,
-// поэтому второй участник получит id позже и закоммитится позже — id и порядок
-// коммитов для одного объекта совпадают (ADR-0023 п. 2). Разные объекты при
-// восстановлении переставляться могут.
+// найдёт. Событие обязано когда-нибудь запечататься, иначе проверка полноты при
+// восстановлении будет падать вечно, — для этого и есть отдельная редкая
+// проверка ниже рубежа (SealJournalStragglers). То, что она печатает его позже
+// соседей с бОльшими id, и есть та перестановка плотного порядка из абзаца выше.
 
 // SealedSegment — один запечатанный сегмент.
 type SealedSegment struct {
@@ -50,6 +65,12 @@ type SealedSegment struct {
 	SeqFirst   int64
 	SeqLast    int64
 	EventCount int
+	// Границы id событий сегмента. Плотный диапазон сторожит полноту, а порядок
+	// применения — это id, и по этим двум полям видно, совпадает ли одно с другим:
+	// если у сегмента EventIDFirst меньше EventIDLast предыдущего, плотный порядок
+	// расходится с порядком id (опоздавшие), и применять надо по id.
+	EventIDFirst int64
+	EventIDLast  int64
 }
 
 // SealLimits — условия закрытия сегмента (config.JournalSegment).
@@ -195,11 +216,14 @@ func (m *Meta) SealJournalTenant(ctx context.Context, tenant int64, lim SealLimi
 	}
 	// Изоляция — умолчальная READ COMMITTED, и это не недосмотр: рубеж читается
 	// после advisory-лока, и второму силеру обязан быть виден сегмент первого.
-	// При REPEATABLE READ снимок берётся на первом запросе, ещё до ожидания лока,
-	// — лок перестал бы защищать, и второй силер вторично запечатал бы те же
-	// события. Цена умолчания — окно между выборкой и проверкой полноты (см.
-	// sealEvents), оно самозакрывающееся: красный сегмент отменяется целиком и
-	// следующий проход берёт окно заново.
+	// При REPEATABLE READ снимок берётся на первом запросе, ещё до ожидания лока
+	// (проверено двумя сессиями psql), — лок перестал бы защищать: второй силер
+	// увидел бы мир до коммита первого и взял бы те же события. Молча они бы не
+	// задвоились — признаки схлопнулись бы в UNIQUE (event_id) и транзакция
+	// отменилась, — но сериализация лока превратилась бы в красные прогоны. Цена
+	// умолчания — окно между выборкой и проверкой полноты (см. sealEvents), оно
+	// самозакрывающееся: красный сегмент отменяется целиком и следующий проход
+	// берёт окно заново.
 	tx, err := m.Pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("meta: начать запечатывание: %w", err)
@@ -234,18 +258,22 @@ func (m *Meta) SealJournalTenant(ctx context.Context, tenant int64, lim SealLimi
 // SealJournalStragglers — запечатывает события **ниже** рубежа тенанта: те,
 // чьи транзакции были в полёте, когда их диапазон уже ушёл в сегмент.
 //
-// Порядок при этом не страдает, и это не «авось»: каждое журналируемое изменение
-// держит блокировку строки объекта (или бакета) до вставки события, поэтому
-// опоздавшее событие не может относиться к тому же объекту, что и уже
-// запечатанное с большим id, — иначе второй участник ждал бы эту блокировку и
-// получил бы id позже. Значит переставляются только разные объекты, а их
-// порядок при восстановлении не важен (ADR-0023 п. 2 и п. 6).
-//
-// Дороже обычного хода: окно — вся история тенанта, поэтому вызывается редко
+// Проход дороже обычного: окно — вся история тенанта, поэтому вызывается редко
 // (journal.sealer.sweep_interval), а не на каждом тике.
-func (m *Meta) SealJournalStragglers(ctx context.Context, tenant int64, batch int) (*SealedSegment, error) {
-	if batch < 1 {
-		return nil, fmt.Errorf("meta: батч опоздавших %d, должно быть >= 1", batch)
+//
+// Про порядок, честно: сегмент опоздавших получает плотный номер в конец
+// нумерации, хотя его id ниже рубежа, — и если того же объекта уже успели
+// запечатать событие с бОльшим id, плотный порядок для этого объекта обратен
+// порядку коммитов. Здесь это не чинится: силер не может отличить безвредного
+// опоздавшего от опасного, не сканируя историю, а порядок применения держится
+// на id события (шапка файла), где он верен по построению.
+//
+// Лимиты сегмента те же, что у обычного хода: без реза по байтам сегмент
+// опоздавших мог бы вырасти до всей истории тенанта, а max_events прохода
+// (journal.sealer.sweep_batch) ограничен сверху отдельно.
+func (m *Meta) SealJournalStragglers(ctx context.Context, tenant int64, maxEvents int, maxBytes int64) (*SealedSegment, error) {
+	if maxEvents < 1 || maxBytes < 1 {
+		return nil, fmt.Errorf("meta: лимиты опоздавших %d/%d, должны быть >= 1", maxEvents, maxBytes)
 	}
 	tx, err := m.Pool.Begin(ctx)
 	if err != nil {
@@ -264,7 +292,7 @@ func (m *Meta) SealJournalStragglers(ctx context.Context, tenant int64, batch in
 		// Сегментов нет — нечего и искать: ниже нуля id не бывает.
 		return nil, nil
 	}
-	cands, err := sealQuery(ctx, tx, sealStragglersSQL, tenant, wm, batch)
+	cands, err := sealQuery(ctx, tx, sealStragglersSQL, tenant, wm, maxEvents)
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +301,7 @@ func (m *Meta) SealJournalStragglers(ctx context.Context, tenant int64, batch in
 	}
 	// Окно проверки — вся история до рубежа: здесь это та же цена, что у самой
 	// выборки, и она сознательно принимается за редкий проход.
-	seg, err := sealEvents(ctx, tx, tenant, 0, cands)
+	seg, err := sealEvents(ctx, tx, tenant, 0, cutByBytes(cands, maxBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -339,6 +367,24 @@ func cutByBytes(cands []sealCandidate, maxBytes int64) []sealCandidate {
 	return cands
 }
 
+// sealWindowCheck — решение проверки полноты: сколько незапечатанных событий
+// оказалось в окне против сколько взято. Равны — окно закрыто целиком; не равны
+// — сегмент отменяется целиком.
+//
+// Отдельная функция, а не `if` внутри sealEvents, не ради красоты: решение
+// можно проверить без БД (seal_window_test.go). Чего это не покрывает — честно
+// записано в ADR-0023: мутация «результат проверки проигнорирован в месте
+// вызова» остаётся зелёной, потому что шва между выборкой и проверкой нет.
+func sealWindowCheck(skipped int64, taken int, tenant, lowerBound, maxID int64) error {
+	if skipped == int64(taken) {
+		return nil
+	}
+	return fmt.Errorf("meta: тенант %d: в окне (%d, %d] незапечатанных событий %d, взято %d — "+
+		"отбор потерял событие либо оно закоммитилось после выборки; сегмент отменён, "+
+		"следующий проход возьмёт окно заново",
+		tenant, lowerBound, maxID, skipped, taken)
+}
+
 // sealEvents — выдаёт плотные номера, заводит сегмент и ставит признаки.
 // lowerBound — нижняя граница окна, из которого брали id (рубеж обычного хода
 // или ноль для опоздавших); проверка «ничего не пропущено» берёт то же окно.
@@ -347,7 +393,9 @@ func sealEvents(ctx context.Context, tx pgx.Tx, tenant, lowerBound int64, taken 
 	for i, c := range taken {
 		ids[i] = c.id
 	}
-	maxID := ids[len(ids)-1]
+	// Выборка всегда упорядочена по id и берётся префиксом, поэтому границы —
+	// это первый и последний элемент, а не min/max по массиву.
+	minID, maxID := ids[0], ids[len(ids)-1]
 
 	// Разрыв в нумерации событий внутри окна означал бы, что отбор потерял
 	// строку, — а потерянное событие не увидит уже никто.
@@ -363,11 +411,8 @@ func sealEvents(ctx context.Context, tx pgx.Tx, tenant, lowerBound int64, taken 
 	if err := tx.QueryRow(ctx, sealSkippedSQL, tenant, lowerBound, maxID).Scan(&skipped); err != nil {
 		return nil, fmt.Errorf("meta: проверка полноты выборки тенанта %d: %w", tenant, err)
 	}
-	if skipped != int64(len(ids)) {
-		return nil, fmt.Errorf("meta: тенант %d: в окне (%d, %d] незапечатанных событий %d, взято %d — "+
-			"отбор потерял событие либо оно закоммитилось после выборки; сегмент отменён, "+
-			"следующий проход возьмёт окно заново",
-			tenant, lowerBound, maxID, skipped, len(ids))
+	if err := sealWindowCheck(skipped, len(ids), tenant, lowerBound, maxID); err != nil {
+		return nil, err
 	}
 
 	// Плотный номер выдаёт силер: одна строка tenants на сегмент, и только здесь.
@@ -381,12 +426,14 @@ func sealEvents(ctx context.Context, tx pgx.Tx, tenant, lowerBound int64, taken 
 	seg := SealedSegment{
 		TenantID: tenant, SeqFirst: seqLast - int64(len(ids)) + 1,
 		SeqLast: seqLast, EventCount: len(ids),
+		EventIDFirst: minID, EventIDLast: maxID,
 	}
 
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last)
-		 VALUES ($1, $2, $3, $4, $5) RETURNING id, uuid`,
-		tenant, seg.SeqFirst, seg.SeqLast, seg.EventCount, maxID).
+		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count,
+		                              event_id_last, event_id_first)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, uuid`,
+		tenant, seg.SeqFirst, seg.SeqLast, seg.EventCount, maxID, minID).
 		Scan(&seg.ID, &seg.UUID); err != nil {
 		return nil, fmt.Errorf("meta: завести сегмент тенанта %d: %w", tenant, err)
 	}
@@ -414,10 +461,13 @@ func sealEvents(ctx context.Context, tx pgx.Tx, tenant, lowerBound int64, taken 
 }
 
 // JournalSegments — сегменты тенанта по порядку плотных номеров: так же их
-// пройдёт rebuild-meta, проверяя смежность диапазонов.
+// пройдёт rebuild-meta. Смежность диапазонов он сверяет по SeqFirst/SeqLast
+// (полнота), а порядок применения берёт по id событий; по EventIDFirst/EventIDLast
+// видно, совпадает ли плотный порядок с id-порядком (шапка файла).
 func (m *Meta) JournalSegments(ctx context.Context, tenant int64) ([]SealedSegment, error) {
 	rows, err := m.Pool.Query(ctx,
-		`SELECT id, uuid, tenant_id, seq_first, seq_last, event_count
+		`SELECT id, uuid, tenant_id, seq_first, seq_last, event_count,
+		        event_id_first, event_id_last
 		   FROM journal_segments WHERE tenant_id = $1 ORDER BY seq_first`, tenant)
 	if err != nil {
 		return nil, fmt.Errorf("meta: сегменты тенанта %d: %w", tenant, err)
@@ -427,7 +477,8 @@ func (m *Meta) JournalSegments(ctx context.Context, tenant int64) ([]SealedSegme
 	var out []SealedSegment
 	for rows.Next() {
 		var s SealedSegment
-		if err := rows.Scan(&s.ID, &s.UUID, &s.TenantID, &s.SeqFirst, &s.SeqLast, &s.EventCount); err != nil {
+		if err := rows.Scan(&s.ID, &s.UUID, &s.TenantID, &s.SeqFirst, &s.SeqLast,
+			&s.EventCount, &s.EventIDFirst, &s.EventIDLast); err != nil {
 			return nil, fmt.Errorf("meta: сегменты тенанта %d: %w", tenant, err)
 		}
 		out = append(out, s)

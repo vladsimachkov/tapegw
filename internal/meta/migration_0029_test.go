@@ -104,8 +104,9 @@ func seedSegments(t *testing.T, ctx context.Context, m *meta.Meta, tenant int64)
 	}
 	var seg int64
 	if err := m.Pool.QueryRow(ctx,
-		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last)
-		 VALUES ($1, 1, 3, 3, $2) RETURNING id`, tenant, ids[2]).Scan(&seg); err != nil {
+		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count,
+		                              event_id_last, event_id_first)
+		 VALUES ($1, 1, 3, 3, $2, $3) RETURNING id`, tenant, ids[2], ids[0]).Scan(&seg); err != nil {
 		t.Fatalf("сегмент: %v", err)
 	}
 	for _, id := range ids {
@@ -187,6 +188,22 @@ func TestMigration0029JournalSegments(t *testing.T) {
 	if !dense {
 		t.Errorf("в CHECK journal_segments нет сверки диапазона с числом событий: %s", checks)
 	}
+	// Границы id сегмента: по ним видно, совпадает ли плотный порядок с
+	// id-порядком, то есть можно ли применять сегменты склейкой (ADR-0023,
+	// поправка от 2026-11-11).
+	if n := columnIn(t, ctx, m, "journal_segments", "event_id_first"); n != 1 {
+		t.Error("journal_segments.event_id_first отсутствует: перестановку плотного " +
+			"порядка нечем будет заметить")
+	}
+	orderCheck := false
+	for _, c := range strings.Split(checks, ";") {
+		if strings.Contains(c, "event_id_first") && strings.Contains(c, "event_id_last") {
+			orderCheck = true
+		}
+	}
+	if !orderCheck {
+		t.Errorf("в CHECK journal_segments нет сверки event_id_first с event_id_last: %s", checks)
+	}
 	if n := tableTriggers(t, ctx, m, "journal_segment_event"); n != 1 {
 		t.Errorf("триггеров у journal_segment_event: %d, хотели 1 («только на добавление»)", n)
 	}
@@ -207,16 +224,24 @@ func TestMigration0029JournalSegments(t *testing.T) {
 
 	// Подставной id сегмента невозможен (identity ALWAYS).
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO journal_segments (id, tenant_id, seq_first, seq_last, event_count, event_id_last)
-		 VALUES (1, $1, 100, 100, 1, 1)`, tenant); err == nil {
+		`INSERT INTO journal_segments (id, tenant_id, seq_first, seq_last, event_count,
+		                              event_id_last, event_id_first)
+		 VALUES (1, $1, 100, 100, 1, 1, 1)`, tenant); err == nil {
 		t.Error("подставной id сегмента прошёл: identity не ALWAYS")
 	}
 	// Диапазон обязан равняться числу событий — по нему rebuild-meta сверяет
 	// смежность и видит пропуск.
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last)
-		 VALUES ($1, 30, 32, 2, 999)`, tenant); err == nil {
+		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last, event_id_first)
+		 VALUES ($1, 30, 32, 2, 999, 1)`, tenant); err == nil {
 		t.Error("сегмент с диапазоном 30..32 и двумя событиями прошёл: CHECK на плотность не работает")
+	}
+	// «Минимальный id больше максимального» бывает только посчитанным не по
+	// сегменту — а на этих двух колонках держится вывод о порядке применения.
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last, event_id_first)
+		 VALUES ($1, 40, 40, 1, 999, 1000)`, tenant); err == nil {
+		t.Error("сегмент с event_id_first > event_id_last прошёл: CHECK по границам id не работает")
 	}
 	for _, bad := range []struct {
 		what                            string
@@ -227,15 +252,15 @@ func TestMigration0029JournalSegments(t *testing.T) {
 		{"event_count = 0", 20, 20, 0, 1},
 	} {
 		if _, err := m.Pool.Exec(ctx,
-			`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last)
-			 VALUES ($1, $2, $3, $4, $5)`, tenant, bad.first, bad.last, bad.count, bad.eventIDLast); err == nil {
+			`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last, event_id_first)
+			 VALUES ($1, $2, $3, $4, $5, 1)`, tenant, bad.first, bad.last, bad.count, bad.eventIDLast); err == nil {
 			t.Errorf("сегмент с %s прошёл: CHECK не на месте", bad.what)
 		}
 	}
 	// Два сегмента одного тенанта не могут начинаться с одного номера.
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last)
-		 VALUES ($1, 1, 1, 1, 999)`, tenant); err == nil {
+		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last, event_id_first)
+		 VALUES ($1, 1, 1, 1, 999, 1)`, tenant); err == nil {
 		t.Error("второй сегмент с тем же seq_first прошёл: плотный номер могли бы выдать дважды")
 	}
 	// uuid сегмента — AAD шифрования: он выдаётся схемой и не повторяется.
@@ -248,8 +273,9 @@ func TestMigration0029JournalSegments(t *testing.T) {
 		t.Error("uuid сегмента пустой: его обязана выдавать схема")
 	}
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last, uuid)
-		 VALUES ($1, 50, 50, 1, 999, $2::uuid)`, tenant, segUUID); err == nil {
+		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last,
+		                              event_id_first, uuid)
+		 VALUES ($1, 50, 50, 1, 999, 1, $2::uuid)`, tenant, segUUID); err == nil {
 		t.Error("второй сегмент с тем же uuid прошёл: uuid не UNIQUE, и шифротекст одного " +
 			"сегмента подошёл бы другому")
 	}
@@ -257,8 +283,8 @@ func TestMigration0029JournalSegments(t *testing.T) {
 	// ткнуть тем же событием в тот же сегмент, сработает первичный ключ, а не
 	// UNIQUE (event_id), и проверка ловила бы не то ограничение.
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last)
-		 VALUES ($1, 10, 10, 1, 999)`, tenant); err != nil {
+		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last, event_id_first)
+		 VALUES ($1, 10, 10, 1, 999, 1)`, tenant); err != nil {
 		t.Fatalf("второй сегмент: %v", err)
 	}
 	if _, err := m.Pool.Exec(ctx,
@@ -289,8 +315,8 @@ func TestMigration0029JournalSegments(t *testing.T) {
 			t.Fatalf("тенант %d: %v", doomed, err)
 		}
 		if _, err := m.Pool.Exec(ctx,
-			`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last)
-			 VALUES ($1, 1, 1, 1, 0)`, doomed); err != nil {
+			`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last, event_id_first)
+			 VALUES ($1, 1, 1, 1, 0, 0)`, doomed); err != nil {
 			t.Fatalf("сегмент обречённого тенанта: %v", err)
 		}
 		if _, err := m.Pool.Exec(ctx, `DELETE FROM tenants WHERE id = $1`, doomed); err != nil {

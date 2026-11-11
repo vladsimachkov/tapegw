@@ -2,8 +2,8 @@
 -- Сегменты журнала метаданных (ADR-0023 п. 3–5, ADR-0020 §3) — Ж2 шаг 2.
 --
 -- Событие после 0028 носит только служебный id с дырками от откатов. Плотный
--- номер, по которому rebuild-meta применяет журнал по порядку и видит пропуск,
--- даёт **диапазон запечатанного сегмента**: воркер запечатывания берёт
+-- номер — то, по чему rebuild-meta видит пропуск, — даёт **диапазон
+-- запечатанного сегмента**: воркер запечатывания берёт
 -- не запечатанные события тенанта, выдаёт им следующий кусок плотной нумерации
 -- и оставляет признак «уже запечатано» — отдельной таблицей, потому что
 -- помечать UPDATE-ом само событие нельзя (ADR-0023 п. 4: UPDATE противоречит
@@ -26,14 +26,23 @@ CREATE TABLE journal_segments (
   -- это и есть контроль пропуска, по нему rebuild-meta сверяет смежность
   -- диапазонов одного тенанта и на дырке останавливается, а не применяет
   -- неполный журнал молча.
-  seq_first     bigint NOT NULL CHECK (seq_first > 0),
-  seq_last      bigint NOT NULL CHECK (seq_last >= seq_first),
-  event_count   int    NOT NULL CHECK (event_count > 0),
+  seq_first      bigint NOT NULL CHECK (seq_first > 0),
+  seq_last       bigint NOT NULL CHECK (seq_last >= seq_first),
+  event_count    int    NOT NULL CHECK (event_count > 0),
   CHECK (seq_last - seq_first + 1 = event_count),
   -- Самый большой id события в сегменте. По нему следующий цикл понимает,
   -- откуда читать («события дальше рубежа»), и по нему же ищет опоздавших.
-  event_id_last bigint NOT NULL,
-  created_at    timestamptz NOT NULL DEFAULT now(),
+  event_id_last  bigint NOT NULL,
+  -- Самый маленький id события в сегменте. Плотный порядок совпадает с порядком
+  -- id не всегда: опоздавшее событие (id ниже рубежа) печатается в следующий
+  -- сегмент и получает номер позже событий с бОльшими id, а для одного объекта
+  -- id — это и есть порядок коммитов. Применять журнал надо по id, а эти две
+  -- колонки позволяют заметить перестановку одним запросом по каталогу
+  -- сегментов, не раскрывая их содержимое: перестановка есть, если у сегмента
+  -- event_id_first меньше event_id_last предыдущего (ADR-0023, поправка от
+  -- 2026-11-11, контрпример — там же).
+  event_id_first bigint NOT NULL CHECK (event_id_first <= event_id_last),
+  created_at     timestamptz NOT NULL DEFAULT now(),
   -- Два сегмента одного тенанта не могут начинаться с одного номера: это
   -- означало бы, что плотный номер выдали дважды. Ключ держит это схемой, а не
   -- воркером — как UNIQUE (event_id) ниже.
@@ -48,6 +57,9 @@ COMMENT ON COLUMN journal_segments.seq_first IS
     'первый плотный номер диапазона сегмента; выдаёт воркер запечатывания (ADR-0023, поправка)';
 COMMENT ON COLUMN journal_segments.event_id_last IS
     'максимальный journal_events.id в сегменте; рубеж следующей выборки и поиска опоздавших';
+COMMENT ON COLUMN journal_segments.event_id_first IS
+    'минимальный journal_events.id в сегменте; по паре с event_id_last видно, '
+    'идут ли сегменты в порядке id (порядок применения журнала)';
 
 CREATE TABLE journal_segment_event (
   segment_id bigint NOT NULL REFERENCES journal_segments (id),

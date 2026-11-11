@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vladsimachkov/tapegw/internal/meta"
 	"github.com/vladsimachkov/tapegw/internal/testdb"
@@ -325,7 +326,7 @@ func TestSealStragglerIsFoundOnlyBySweep(t *testing.T) {
 	testdb.Clean(t, m)
 
 	// До первого сегмента искать опоздавших негде: рубежа нет.
-	if seg, err := m.SealJournalStragglers(ctx, 1, 100); err != nil || seg != nil {
+	if seg, err := m.SealJournalStragglers(ctx, 1, 100, 1<<20); err != nil || seg != nil {
 		t.Fatalf("проверка опоздавших без сегментов: seg=%v err=%v, хотели nil/nil", seg, err)
 	}
 
@@ -380,7 +381,7 @@ func TestSealStragglerIsFoundOnlyBySweep(t *testing.T) {
 		t.Fatalf("проверка опоздавших не позвала тенанта: %v (err=%v)", ids, err)
 	}
 
-	straggler, err := m.SealJournalStragglers(ctx, 1, 100)
+	straggler, err := m.SealJournalStragglers(ctx, 1, 100, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,6 +407,187 @@ func TestSealStragglerIsFoundOnlyBySweep(t *testing.T) {
 	}
 	if ids, err := m.JournalTenantsWithStragglers(ctx, 10); err != nil || sealListed(t, ids, 1) {
 		t.Errorf("после запечатывания тенант всё ещё в списке опоздавших: %v (err=%v)", ids, err)
+	}
+}
+
+// TestSealStragglerInvertsDenseOrder — плотный порядок НЕ обязан совпадать с
+// порядком коммитов одного объекта, и тест это фиксирует, а не чинит.
+//
+// Интерлевация целиком из реального пути изменения: T1 не может вставить своё
+// событие того же объекта, пока T2 держит его блокировку, — поэтому id(E1) >
+// id(E2), а коммит E1 позже коммита E2.
+//
+//	T2: изменил объект U, вставил E2, держится.
+//	Силер: E2 не виден, печатает F (другой объект), рубеж уходит за id(E2).
+//	T2 коммитит E2 — оно опоздавшее, id ниже рубежа.
+//	T1: то же изменение того же U → E1, id дальше рубежа.
+//	Силер печатает E1, затем проверка опоздавших печатает E2.
+//
+// Итог для объекта U: плотный порядок E1, E2 при порядке коммитов E2, E1.
+// Значит применять журнал надо по id события, а плотный диапазон сторожит
+// полноту (ADR-0023, поправка от 2026-11-11). Если этот тест покраснеет «в лучшую
+// сторону» — значит опоздавшие перестали печататься позже соседей; тогда править
+// надо ADR, а не тест.
+func TestSealStragglerInvertsDenseOrder(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	// Событие про конкретный объект: kind 'retention' обязан назвать версию
+	// (CHECK из 0027), объект здесь и играет версию.
+	seedObjectEvent := func(object uuid.UUID, what string) int64 {
+		t.Helper()
+		var id int64
+		if err := m.Pool.QueryRow(ctx,
+			`INSERT INTO journal_events (tenant_id, kind, object_id, bucket_id, payload)
+			 VALUES (1, 'retention', $1, 1, $2::jsonb) RETURNING id`,
+			object, fmt.Sprintf(`{"what":%q}`, what)).Scan(&id); err != nil {
+			t.Fatalf("событие про объект %s: %v", object, err)
+		}
+		return id
+	}
+
+	objectU, objectF := uuid.New(), uuid.New()
+	lim := meta.SealLimits{MaxEvents: 10, MaxBytes: 1 << 20}
+
+	// T2: изменение объекта U, событие E2, транзакция держится.
+	slow, err := m.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = slow.Rollback(ctx) }() //nolint:errcheck // после commit откатывать нечего
+	var e2 int64
+	if err := slow.QueryRow(ctx,
+		`INSERT INTO journal_events (tenant_id, kind, object_id, bucket_id, payload)
+		 VALUES (1, 'retention', $1, 1, '{"what":"E2"}') RETURNING id`, objectU).Scan(&e2); err != nil {
+		t.Fatal(err)
+	}
+	// F — событие другого объекта, закоммичено: силер его видит, E2 — ещё нет.
+	f := seedObjectEvent(objectF, "F")
+
+	first, err := m.SealJournalTenant(ctx, 1, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == nil || sealedIDs(t, m, first.ID)[0] != f {
+		t.Fatalf("первый сегмент %+v, хотели одно событие %d", first, f)
+	}
+	if wm := sealWatermarkOf(t, m, 1); e2 >= wm {
+		t.Fatalf("посев неверный: E2=%d не ниже рубежа %d", e2, wm)
+	}
+
+	if err := slow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e1 := seedObjectEvent(objectU, "E1")
+
+	second, err := m.SealJournalTenant(ctx, 1, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == nil || sealedIDs(t, m, second.ID)[0] != e1 {
+		t.Fatalf("второй сегмент %+v, хотели одно событие %d", second, e1)
+	}
+	third, err := m.SealJournalStragglers(ctx, 1, 100, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third == nil || sealedIDs(t, m, third.ID)[0] != e2 {
+		t.Fatalf("сегмент опоздавших %+v, хотели одно событие %d", third, e2)
+	}
+
+	// Порядок id = порядок коммитов для объекта U: E2 раньше E1.
+	if !(e2 < f && f < e1) {
+		t.Fatalf("посев неверный: id E2=%d, F=%d, E1=%d — хотели E2 < F < E1", e2, f, e1)
+	}
+	// Плотный порядок для того же объекта обратен: E1 получил номер 2, E2 — 3.
+	if second.SeqFirst != 2 || third.SeqFirst != 3 {
+		t.Fatalf("плотные номера: E1=%d, E2=%d, хотели 2 и 3", second.SeqFirst, third.SeqFirst)
+	}
+
+	segs, err := m.JournalSegments(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Полнота не пострадала: ряд 1..3 без дырок, незапечатанных нет.
+	checkDense(t, segs, 3)
+	if n := sealUnsealed(t, m, 1); n != 0 {
+		t.Errorf("незапечатанных событий %d, хотели 0", n)
+	}
+	// Правило «заметить перестановку по каталогу сегментов»: сегмент продолжает
+	// id-порядок предыдущего, если его event_id_first больше event_id_last
+	// предыдущего. Здесь так у первой пары и не так у второй — по этому признаку
+	// rebuild-meta и поймёт, что применять надо по id, а не по плотному номеру.
+	if !(segs[0].EventIDLast < segs[1].EventIDFirst) {
+		t.Errorf("сегменты 1 и 2 идут не в id-порядке: %d..%d, затем %d..%d",
+			segs[0].EventIDFirst, segs[0].EventIDLast, segs[1].EventIDFirst, segs[1].EventIDLast)
+	}
+	if segs[2].EventIDFirst > segs[1].EventIDLast {
+		t.Error("сегмент опоздавших неотличим от обычного по границам id: " +
+			"перестановку плотного порядка будет нечем заметить")
+	}
+}
+
+// TestSealStragglersCutByBytes — сегмент опоздавших режется по байтам так же,
+// как обычный: без реза он вырос бы до всей истории тенанта, а окно проверки —
+// именно вся история.
+func TestSealStragglersCutByBytes(t *testing.T) {
+	m := testdb.Connect(t)
+	ctx := context.Background()
+	testdb.Clean(t, m)
+
+	// Два опоздавших: id израсходованы, коммита нет. Размер заведомо больше
+	// порога реза ниже, чтобы один сегмент двух таких не вместил.
+	tx1, err := m.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx1.Rollback(ctx) }() //nolint:errcheck // после commit откатывать нечего
+	tx2, err := m.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx2.Rollback(ctx) }() //nolint:errcheck // после commit откатывать нечего
+	big := fmt.Sprintf(`{"pad":"%s"}`, strings.Repeat("x", 4096))
+	for _, tx := range []pgx.Tx{tx1, tx2} {
+		var id int64
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO journal_events (tenant_id, kind, bucket_id, payload)
+			 VALUES (1, 'bucket_config', 1, $1::jsonb) RETURNING id`, big).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Рубеж задаёт обычный сегмент из одного маленького события.
+	sealSeed(t, m, 1, 1)
+	if _, err := m.SealJournalTenant(ctx, 1, meta.SealLimits{MaxEvents: 1, MaxBytes: 1 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx1.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Порог меньше веса одного события: рез обязан оставить ровно одно, а не
+	// всё, что влезло бы по числу (sweep_batch здесь велик).
+	seg, err := m.SealJournalStragglers(ctx, 1, 100, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seg == nil || seg.EventCount != 1 {
+		t.Fatalf("сегмент опоздавших %+v, хотели ровно одно событие при малом max_bytes", seg)
+	}
+	second, err := m.SealJournalStragglers(ctx, 1, 100, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == nil || second.EventCount != 1 {
+		t.Fatalf("второй сегмент опоздавших %+v, хотели второе событие", second)
+	}
+	if n := sealUnsealed(t, m, 1); n != 0 {
+		t.Errorf("незапечатанных событий %d, хотели 0", n)
 	}
 }
 
@@ -498,8 +680,8 @@ func TestSealRollsBackWholeTransaction(t *testing.T) {
 	// Сегмент-призрак: первый плотный номер занят, рубеж нулевой — силер возьмётся
 	// выдавать тот же номер и обязан упасть на UNIQUE (tenant_id, seq_first).
 	if _, err := m.Pool.Exec(ctx,
-		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last)
-		 VALUES (1, 1, 1, 1, 0)`); err != nil {
+		`INSERT INTO journal_segments (tenant_id, seq_first, seq_last, event_count, event_id_last, event_id_first)
+		 VALUES (1, 1, 1, 1, 0, 0)`); err != nil {
 		t.Fatalf("сегмент-призрак: %v", err)
 	}
 
@@ -538,8 +720,12 @@ func TestSealTenantsAreListedOnlyWithWork(t *testing.T) {
 	if _, err := m.SealJournalTenant(ctx, 1, meta.SealLimits{MaxEvents: 0, MaxBytes: 10}); err == nil {
 		t.Error("запечатывание с MaxEvents=0 прошло: лимит обязан быть >= 1")
 	}
-	if _, err := m.SealJournalStragglers(ctx, 1, 0); err == nil {
+	if _, err := m.SealJournalStragglers(ctx, 1, 0, 1<<20); err == nil {
 		t.Error("проверка опоздавших с батчем 0 прошла: limit обязан быть >= 1")
+	}
+	if _, err := m.SealJournalStragglers(ctx, 1, 10, 0); err == nil {
+		t.Error("проверка опоздавших с max_bytes=0 прошла: сегмент опоздавших " +
+			"режется по байтам так же, как обычный")
 	}
 
 	other := sealTenantExtra(t, m)

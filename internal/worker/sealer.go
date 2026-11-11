@@ -140,8 +140,9 @@ func sealOnce(ctx context.Context, deps SealerDeps, log *slog.Logger) {
 }
 
 // sweepOnce — проверка опоздавших. Находка здесь не авария, а штатная редкость:
-// событие, чья транзакция шла слишком долго, запечатывается позже соседей.
-// Порядок одного объекта от этого не меняется (см. комментарий SealJournalStragglers).
+// событие, чья транзакция шла слишком долго, запечатывается позже соседей и
+// получает плотный номер после них. Порядок применения от этого не портится — он
+// держится на id события, а не на плотном номере (шапка internal/meta/seal.go).
 func sweepOnce(ctx context.Context, deps SealerDeps, log *slog.Logger) {
 	cfg := deps.Cfg
 	tenants, err := deps.Meta.JournalTenantsWithStragglers(ctx, cfg.Journal.Sealer.TenantsBatch)
@@ -154,7 +155,8 @@ func sweepOnce(ctx context.Context, deps SealerDeps, log *slog.Logger) {
 			return
 		}
 		for i := 0; i < cfg.Journal.Sealer.MaxSegmentsPerTenant; i++ {
-			seg, err := deps.Meta.SealJournalStragglers(ctx, tenant, cfg.Journal.Sealer.SweepBatch)
+			seg, err := deps.Meta.SealJournalStragglers(ctx, tenant,
+				cfg.Journal.Sealer.SweepBatch, int64(cfg.Journal.Segment.MaxBytes))
 			if err != nil {
 				log.Error("sealer: проверка опоздавших",
 					slog.Int64("tenant", tenant), slog.String("err", err.Error()))
@@ -163,9 +165,13 @@ func sweepOnce(ctx context.Context, deps SealerDeps, log *slog.Logger) {
 			if seg == nil {
 				break
 			}
+			// event_id_first ниже рубежа — это и есть след перестановки: плотный
+			// номер выдан позже, чем у событий с бОльшими id.
 			log.Warn("sealer: опоздавшее событие запечатано отдельно",
 				slog.Int64("tenant", tenant), slog.Int64("segment", seg.ID),
 				slog.Int64("seq_first", seg.SeqFirst), slog.Int64("seq_last", seg.SeqLast),
+				slog.Int64("event_id_first", seg.EventIDFirst),
+				slog.Int64("event_id_last", seg.EventIDLast),
 				slog.Int("events", seg.EventCount))
 		}
 	}
