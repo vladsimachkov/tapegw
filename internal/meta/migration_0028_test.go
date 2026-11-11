@@ -21,6 +21,10 @@ import (
 // такой Down ничего не проверяет, поэтому данные сеются до, а плотность
 // проверяется после — и по двум тенантам, потому что на одном «плотно внутри
 // тенанта» и «просто по порядку» неразличимы.
+//
+// Порядок уже записанных событий при обратном ходе (Up по заполненной таблице)
+// сторожит отдельный тест ниже: там посев идёт вперемешку, а здесь — по порядку
+// номеров, и проверка порядка прошла бы в нём сама у себя.
 
 // indexCols — колонки индекса в порядке индексирования, через запятую. Пустая
 // строка означает «индекса нет»: COALESCE здесь затем, чтобы отсутствующий
@@ -319,5 +323,101 @@ func TestMigration0028JournalServiceId(t *testing.T) {
 	if n := countRow(t, ctx, m,
 		`SELECT count(*) FROM journal_events WHERE tenant_id = 777`); n != 4 {
 		t.Errorf("событий второго тенанта %d, хотели 4", n)
+	}
+}
+
+// TestMigration0028UpKeepsJournalSeqOrder — Up обязан раздавать id уже
+// записанным событиям в порядке прежнего journal_seq, а не в порядке
+// физического расположения строк.
+//
+// Почему тест отдельный: TestMigration0028JournalServiceId сеет события по
+// порядку номеров, и там физический порядок совпадает с порядком номеров —
+// проверка порядка прошла бы в нём даже без CLUSTER в миграции. Здесь посев
+// идёт вперемешку (3, 1, 2), и тест сначала убеждается, что перемешивание
+// состоялось: иначе зелёный цвет означал бы «проверяли порядок, которого нет».
+//
+// Что ломается без порядка: до 0028 события читались по journal_seq, после — по
+// id. Штатный путь вставки сериализован блокировкой строки тенанта, поэтому там
+// порядки совпадают; расходятся они у строк, вставленных не по номерам, — ручная
+// правка журнала (tapegw.journal_override, на которую указывает HINT триггера)
+// либо восстановление из дампа в другом порядке вставки. Тогда rebuild-meta
+// применит изменения одного объекта в ином порядке: продление retention раньше
+// удаления той же версии, например.
+func TestMigration0028UpKeepsJournalSeqOrder(t *testing.T) {
+	// Схема ровно до 0027: Up применяется к таблице, где journal_seq ещё есть, —
+	// так же, как при первом накатывании миграции на живую базу.
+	m := testdb.MigrationScratch(t, 27)
+	ctx := context.Background()
+
+	if _, err := m.Pool.Exec(ctx,
+		`INSERT INTO tenants (id, name, status, pool_id)
+		 VALUES (777, 'тестовый тенант 0028', 'active', 1)
+		 ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("второй тенант: %v", err)
+	}
+
+	// Посев вперемешку: порядок вставки и порядок номеров не совпадают. Тег
+	// кладётся в payload, чтобы строку можно было опознать после Up, когда
+	// journal_seq уже удалена.
+	for _, s := range []struct {
+		tenant int64
+		seqs   []int64
+	}{{1, []int64{3, 1, 2}}, {777, []int64{2, 1}}} {
+		for _, seq := range s.seqs {
+			if _, err := m.Pool.Exec(ctx,
+				`INSERT INTO journal_events (tenant_id, journal_seq, kind, bucket_id, payload)
+				 VALUES ($1, $2, 'bucket_config', 1, jsonb_build_object('tag', $2::bigint::text))`,
+				s.tenant, seq); err != nil {
+				t.Fatalf("событие тенанта %d с номером %d: %v", s.tenant, seq, err)
+			}
+		}
+	}
+
+	// tagsIn — теги событий тенанта в указанном порядке. orderBy — литерал этого
+	// файла, а не ввод вызывающего: подстановка в SQL здесь только своя.
+	tagsIn := func(orderBy string, tenant int64) string {
+		t.Helper()
+		var s string
+		if err := m.Pool.QueryRow(ctx,
+			`SELECT string_agg(jsonb_extract_path_text(payload, 'tag'), ',' ORDER BY `+orderBy+`)
+			   FROM journal_events WHERE tenant_id = $1`, tenant).Scan(&s); err != nil {
+			t.Fatalf("порядок по %s: %v", orderBy, err)
+		}
+		return s
+	}
+
+	wants := []struct {
+		tenant int64
+		bySeq  string
+	}{{1, "1,2,3"}, {777, "1,2"}}
+
+	for _, w := range wants {
+		if got := tagsIn("journal_seq", w.tenant); got != w.bySeq {
+			t.Fatalf("порядок по journal_seq у тенанта %d = %q, хотели %q — посев неверный",
+				w.tenant, got, w.bySeq)
+		}
+		// Контроль контроля: физический порядок обязан отличаться, иначе
+		// «порядок сохранён» ниже ничего не проверяет.
+		if phys := tagsIn("ctid", w.tenant); phys == w.bySeq {
+			t.Fatalf("у тенанта %d физический порядок (%s) совпал с порядком номеров: "+
+				"посев не перемешал строки, и тест проверял порядок, которого нет",
+				w.tenant, phys)
+		}
+	}
+
+	if _, err := m.Pool.Exec(ctx, section(t, migration0028, "Up")); err != nil {
+		t.Fatalf("Up 0028 на перемешанной таблице: %v", err)
+	}
+
+	for _, w := range wants {
+		if got := tagsIn("id", w.tenant); got != w.bySeq {
+			t.Errorf("порядок событий тенанта %d по id = %q, а по прежним номерам был %q: "+
+				"Up раздаёт id порядком физического расположения строк, и rebuild-meta "+
+				"применит эти изменения не в той последовательности, в какой их читали "+
+				"по journal_seq (в Up обязан стоять CLUSTER)", w.tenant, got, w.bySeq)
+		}
+	}
+	if n := countRow(t, ctx, m, `SELECT count(DISTINCT id) FROM journal_events`); n != 5 {
+		t.Errorf("различных id: %d, событий 5 — перемешанный посев пережил Up не полностью", n)
 	}
 }

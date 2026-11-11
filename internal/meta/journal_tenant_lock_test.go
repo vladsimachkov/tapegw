@@ -87,7 +87,7 @@ func TestJournalWriteNotBlockedByTenantRowLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("начать транзакцию-блокаду: %v", err)
 	}
-	defer blocker.Rollback(ctx) // nolint:errcheck
+	defer blocker.Rollback(ctx) //nolint:errcheck // блокада снимается и так, в конце теста
 	var locked int64
 	// Scan, а не Exec: `SELECT … FOR UPDATE` по несуществующей строке не ошибка,
 	// и молча заблокировав ноль строк, тест стал бы зелёным ничего не проверяя.
@@ -116,7 +116,7 @@ func TestJournalWriteNotBlockedByTenantRowLock(t *testing.T) {
 		if err != nil {
 			t.Fatalf("начать транзакцию-пробу (%s): %v", when, err)
 		}
-		defer probe.Rollback(ctx) // nolint:errcheck
+		defer probe.Rollback(ctx) //nolint:errcheck // проба ничего не меняет, откат не важен
 		_, err = probe.Exec(ctx,
 			`SELECT id FROM tenants WHERE id = $1 FOR NO KEY UPDATE NOWAIT`, lockTenant)
 		var pe *pgconn.PgError
