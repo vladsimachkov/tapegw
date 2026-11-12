@@ -37,10 +37,13 @@ type Config struct {
 	Recaller Worker  `yaml:"recaller"`
 	Janitor  Janitor `yaml:"janitor"`
 	Deleter  Deleter `yaml:"deleter"`
-	Metrics  Metrics `yaml:"metrics"`
-	Admin    Admin   `yaml:"admin"`
-	Logging  Logging `yaml:"logging"`
-	Root     Root    `yaml:"root"`
+	// Journal — журнал метаданных: размеры сегментов запечатывания и воркер,
+	// который эти сегменты закрывает (ADR-0023).
+	Journal Journal `yaml:"journal"`
+	Metrics Metrics `yaml:"metrics"`
+	Admin   Admin   `yaml:"admin"`
+	Logging Logging `yaml:"logging"`
+	Root    Root    `yaml:"root"`
 	// Pools — политика записи пулов по имени (pools.name в БД). Пусто =
 	// единственный пул пишет одну копию с тегом пула (историческое поведение
 	// среза). См. PoolWrite.
@@ -368,6 +371,61 @@ type Worker struct {
 // EnabledValue — включён ли воркер с учётом умолчания (nil = true).
 func (w Worker) EnabledValue() bool { return w.Enabled == nil || *w.Enabled }
 
+// Journal — журнал метаданных (ADR-0023): как режутся сегменты и как часто их
+// запечатывает воркер.
+type Journal struct {
+	Segment JournalSegment `yaml:"segment"`
+	Sealer  JournalSealer  `yaml:"sealer"`
+}
+
+// JournalSegment — условия закрытия одного сегмента: по числу событий или по
+// объёму, и только. Своего таймера у сегмента нет (ARCHITECTURE, Ж2): окно
+// «событие → лента» задаёт закрытие пачки журнала, второй таймер поверх первого
+// сделал бы окно непонятной формы.
+type JournalSegment struct {
+	// MaxEvents — сколько событий максимум в одном сегменте.
+	MaxEvents int `yaml:"max_events"`
+	// MaxBytes — сколько максимум весит содержимое сегмента. Считается по
+	// payload событий (сумма octet_length), а не по шифротексту: порог про
+	// содержимое, а не про то, сколько займёт AES. Действует и на сегменты
+	// опоздавших: без него такой сегмент вырос бы до всей истории тенанта.
+	MaxBytes ByteSize `yaml:"max_bytes"`
+}
+
+// JournalSealer — воркер запечатывания сегментов журнала.
+type JournalSealer struct {
+	// Enabled — по умолчанию true. Выключённый силер означает, что события
+	// журнала копятся незапечатанными: на ленту они не уедут, и восстановление
+	// после аварии вернёт старое состояние блокировок. Поэтому выключение
+	// пишется в лог громко, как у остальных воркеров.
+	Enabled *bool `yaml:"enabled"`
+	// Interval — период прохода. Запечатывание не спешит: событие уже записано
+	// в БД в транзакции изменения, силер только переводит его в сегмент.
+	Interval time.Duration `yaml:"interval"`
+	// TenantsBatch — сколько тенантов обслуживается за один проход.
+	TenantsBatch int `yaml:"tenants_batch"`
+	// SweepInterval — как часто искать «опоздавших»: события, которые на момент
+	// запечатывания были ещё не видны (транзакция в полёте) и потому остались ни
+	// в одном сегменте. Обычный ход читает только события дальше рубежа, так что
+	// без такой проверки опоздавший лежал бы незапечатанным вечно.
+	SweepInterval time.Duration `yaml:"sweep_interval"`
+	// SweepBatch — сколько опоздавших событий берётся за одну проверку. Это
+	// верхняя граница по числу; по объёму сегмент опоздавших режется тем же
+	// journal.segment.max_bytes, что и обычный.
+	SweepBatch int `yaml:"sweep_batch"`
+	// MaxSegmentsPerTenant — сколько сегментов одного тенанта делается за один
+	// проход (и в обычном ходе, и в проверке опоздавших). Ограничение нужно,
+	// чтобы один тенант с огромным backlog не отдал весь проход остальным:
+	// остаток допечатается следующим тиком, он никуда не делся.
+	MaxSegmentsPerTenant int `yaml:"max_segments_per_tenant"`
+	// ShutdownGrace — сколько ждём текущий проход при остановке. Проход —
+	// несколько запросов в Postgres, он долог только на заблокированной схеме.
+	ShutdownGrace time.Duration `yaml:"shutdown_grace"`
+}
+
+// EnabledValue — включён ли силер с учётом умолчания (nil = true).
+func (j JournalSealer) EnabledValue() bool { return j.Enabled == nil || *j.Enabled }
+
 // Janitor — фоновый вытеснитель дисковой копии. S3 — только вытеснение по
 // истечении online_until (ADR-0004); watermark-вытеснение и сборка сирот —
 // отдельные пункты плана.
@@ -609,6 +667,23 @@ func Default() *Config {
 			ClaimTTL:      15 * time.Minute,
 			RetryBackoff:  30 * time.Second,
 			ShutdownGrace: 5 * time.Minute,
+		},
+		Journal: Journal{
+			Segment: JournalSegment{
+				// Событие — несколько сотен байт payload; 10000 событий это
+				// единицы мегабайт, то есть сегмент режется по числу, а
+				// объём — страховка от событий с большой политикой бакета.
+				MaxEvents: 10000,
+				MaxBytes:  16 * MiB,
+			},
+			Sealer: JournalSealer{
+				Interval:             5 * time.Minute,
+				TenantsBatch:         50,
+				SweepInterval:        time.Hour,
+				SweepBatch:           1000,
+				MaxSegmentsPerTenant: 10,
+				ShutdownGrace:        30 * time.Second,
+			},
 		},
 		Metrics: Metrics{Listen: ":9464"},
 		Admin:   Admin{PathPrefix: "/admin"},
@@ -1009,6 +1084,38 @@ func (c *Config) Validate() error {
 	}
 	if c.Janitor.ShutdownGrace <= 0 {
 		add("janitor.shutdown_grace: %v, должно быть > 0", c.Janitor.ShutdownGrace)
+	}
+
+	// Размеры сегмента проверяются всегда, а не только при включённом силере:
+	// сегменты однажды начнёт запечатывать кто-то другой (следующий шаг —
+	// запись объекта), а ноль в пороге означал бы «сегмент пустой» — бесконечный
+	// цикл воркера на пустой выборке.
+	if c.Journal.Segment.MaxEvents < 1 {
+		add("journal.segment.max_events: %d, должно быть >= 1", c.Journal.Segment.MaxEvents)
+	}
+	if c.Journal.Segment.MaxBytes < 1 {
+		add("journal.segment.max_bytes: %v, должно быть >= 1", c.Journal.Segment.MaxBytes)
+	}
+	if c.Journal.Sealer.EnabledValue() {
+		if c.Journal.Sealer.Interval <= 0 {
+			add("journal.sealer.interval: %v, должно быть > 0", c.Journal.Sealer.Interval)
+		}
+		if c.Journal.Sealer.TenantsBatch < 1 {
+			add("journal.sealer.tenants_batch: %d, должно быть >= 1", c.Journal.Sealer.TenantsBatch)
+		}
+		if c.Journal.Sealer.SweepInterval <= 0 {
+			add("journal.sealer.sweep_interval: %v, должно быть > 0", c.Journal.Sealer.SweepInterval)
+		}
+		if c.Journal.Sealer.SweepBatch < 1 {
+			add("journal.sealer.sweep_batch: %d, должно быть >= 1", c.Journal.Sealer.SweepBatch)
+		}
+		if c.Journal.Sealer.MaxSegmentsPerTenant < 1 {
+			add("journal.sealer.max_segments_per_tenant: %d, должно быть >= 1",
+				c.Journal.Sealer.MaxSegmentsPerTenant)
+		}
+		if c.Journal.Sealer.ShutdownGrace <= 0 {
+			add("journal.sealer.shutdown_grace: %v, должно быть > 0", c.Journal.Sealer.ShutdownGrace)
+		}
 	}
 
 	if c.Deleter.EnabledValue() {

@@ -317,6 +317,10 @@ func TestMigration0018MediaRegistry(t *testing.T) {
 	// 0021 добавляет колонки в packs — её снимаем раньше всех, кто трогает packs.
 	// 0027 вешает на функцию из 0018 свой триггер — снимаем его первым, иначе
 	// Down 0018 падает на «cannot drop function … other objects depend on it».
+	// 0029 — до 0027: признак запечатывания ссылается на journal_events.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0029, "Down")); err != nil {
+		t.Fatalf("Down 0029 перед 0027: %v", err)
+	}
 	if _, err := m.Pool.Exec(ctx, section(t, migration0027, "Down")); err != nil {
 		t.Fatalf("Down 0027: %v", err)
 	}
@@ -352,10 +356,14 @@ func TestMigration0018MediaRegistry(t *testing.T) {
 	if _, err := m.Pool.Exec(ctx, section(t, migration0019, "Up")); err != nil {
 		t.Fatalf("повторный Up 0019 после 0018: %v", err)
 	}
-	// 0027 — последним: его триггеру нужна функция, которую вернул 0018.
+	// 0027 — последним из старых: его триггеру нужна функция, которую вернул 0018.
 	if _, err := m.Pool.Exec(ctx, section(t, migration0027, "Up")); err != nil {
 		t.Fatalf("Up 0027: %v", err)
 	}
+	// 0029 здесь не возвращается: её Up требует id у journal_events, а этот id
+	// возвращает 0028 — которую в этом тесте и не снимали. Схема после Up 0027 и
+	// так смешанная (таблица из 0027 поверх применённой 0028), и остаётся такой до
+	// удаления одноразовой схемы.
 	// Триггер обязан вернуться вместе со схемой: Down/Up без него — это
 	// «журнал снова только на добавление» только на словах.
 	if err := m.Pool.QueryRow(ctx,

@@ -38,6 +38,12 @@ func TestMigration0027JournalEvents(t *testing.T) {
 		t.Fatalf("после CreateBucket событий %d, хотели 1 — посева нет", n)
 	}
 
+	// 0029 снимается раньше всех: её journal_segment_event ссылается и на таблицу
+	// journal_events, и на её id, поэтому без снятия первый же Down ниже падает
+	// на 2BP01.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0029, "Down")); err != nil {
+		t.Fatalf("снять 0029 перед 0028: %v", err)
+	}
 	// 0028 снимается до Down 0027: она убирает `journal_seq` — колонку, на
 	// которой стоит первичный ключ 0027, и без снятия тест проверял бы не схему
 	// 0027. В настоящем `goose down` порядок обратный по номерам.
@@ -174,6 +180,10 @@ func TestMigration0027JournalEvents(t *testing.T) {
 	// случай, которого в линейном `goose up` не бывает.
 	if _, err := m.Pool.Exec(ctx, section(t, migration0028, "Up")); err != nil {
 		t.Fatalf("вернуть 0028 после Up 0027: %v", err)
+	}
+	// 0029 — последней: её признак ссылается на id, который вернул Up 0028.
+	if _, err := m.Pool.Exec(ctx, section(t, migration0029, "Up")); err != nil {
+		t.Fatalf("вернуть 0029 после Up 0028: %v", err)
 	}
 }
 

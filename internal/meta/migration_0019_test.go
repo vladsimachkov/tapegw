@@ -87,10 +87,11 @@ func TestMigration0019CopySha256(t *testing.T) {
 	// Down и повторный Up — текстом файла и на наполненной таблице (правило 11).
 	// 0019 зависит от archive_copies, а 0018 — от packs: снимаем в обратном
 	// порядке и возвращаем в прямом, иначе колонка исчезнет вместе с таблицей
-	// и не вернётся. 0020 первым: представление media_write_targets зависит от
-	// media, и без его снятия Down 0018 падает на «other objects depend on it».
+	// и не вернётся. 0020 — раньше 0018: представление media_write_targets зависит
+	// от media, и без его снятия Down 0018 падает на «other objects depend on it».
 	// 0027 — до 0018 по той же причине: его триггер висит на функции из 0018.
-	for _, mig := range []string{migration0027, migration0020, migration0019, migration0018} {
+	// 0029 — до 0027: признак запечатывания ссылается на journal_events.
+	for _, mig := range []string{migration0029, migration0027, migration0020, migration0019, migration0018} {
 		if _, err := m.Pool.Exec(ctx, section(t, mig, "Down")); err != nil {
 			t.Fatalf("Down %s: %v", mig, err)
 		}
@@ -103,6 +104,9 @@ func TestMigration0019CopySha256(t *testing.T) {
 			t.Fatalf("Up %s: %v", mig, err)
 		}
 	}
+	// 0029 обратно здесь не возвращается: её Up требует id у journal_events, а id
+	// возвращает 0028, которую в этом тесте не снимали. Одноразовая схема всё
+	// равно удаляется, а смешанной она остаётся и без этого.
 	if n := columnIn(t, ctx, m, "archive_copies", "sha256"); n != 1 {
 		t.Errorf("после Up колонка sha256 не вернулась")
 	}
